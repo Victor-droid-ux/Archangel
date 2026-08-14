@@ -1,0 +1,971 @@
+// backend/src/services/db.service.ts
+
+import { MongoClient, Db, Collection } from "mongodb";
+import { getLogger } from "../utils/logger.js";
+import crypto from "crypto";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const MONGO_URI = process.env.MONGO_URI || "";
+const MONGO_DB_NAME = process.env.MONGO_DB_NAME || "archangel";
+
+const log = getLogger("db.service");
+
+/* ---------------------------------------
+   TYPE DEFINITIONS
+---------------------------------------- */
+export type TradeRecord = {
+  id: string;
+  type: "buy" | "sell";
+  token: string;
+  inputMint?: string;
+  outputMint?: string;
+  amountLamports: number;
+  amountSol: number;
+  price?: number;
+  pnl?: number; // percent decimal ex: 0.02 means +2%
+  pnlSol?: number; // absolute SOL PnL
+  wallet?: string;
+  simulated?: boolean;
+  signature?: string | null;
+  timestamp: Date;
+  route?: "jupiter";
+};
+
+export type StatsDoc = {
+  _id?: string;
+  portfolioValue: number;
+  totalProfitSol: number;
+  totalProfitPercent: number;
+  openTrades: number;
+  tradeVolumeSol: number;
+  winRate: number;
+  lastUpdated: Date;
+};
+
+// Mirrors frontend/hooks/useConfig.ts's TradingConfig data fields exactly —
+// field names must match 1:1 so loadConfigFromAPI() can apply the response
+// straight into the zustand store with no translation layer (the previous
+// stub returned autoMode/manualAmountSol, which don't match the store's
+// autoTrade/amount fields and silently no-op'd).
+export type UserSettings = {
+  wallet: string;
+  amount?: number;
+  slippage?: number;
+  takeProfit?: number;
+  stopLoss?: number;
+  autoTrade?: boolean;
+  dexRoute?: string;
+  selectedToken?: string;
+  updatedAt: Date;
+};
+
+export type PortfolioPnL = {
+  totalInvestedSol: number;
+  totalReturnedSol: number;
+  unrealizedPnlSol: number;
+  realizedPnlSol: number;
+  totalPnlSol: number;
+  totalPnlPercent: number;
+  winningTrades: number;
+  losingTrades: number;
+  totalTrades: number;
+  winRate: number;
+  averageWinSol: number;
+  averageLossSol: number;
+  largestWinSol: number;
+  largestLossSol: number;
+  openPositionsValue: number;
+  closedPositionsValue: number;
+  roi: number; // Return on Investment %
+};
+
+export type TokenPnL = {
+  token: string;
+  symbol?: string;
+  totalBought: number; // SOL spent
+  totalSold: number; // SOL received
+  remainingTokens: number;
+  averageBuyPrice: number;
+  currentValue?: number;
+  pnlSol: number;
+  pnlPercent: number;
+  trades: number;
+  status: "open" | "closed";
+};
+
+export type WatchlistToken = {
+  _id?: string;
+  mint: string;
+  symbol?: string;
+  name?: string;
+  addedAt: Date;
+  userId?: string; // For multi-user support
+  priceAlert?: {
+    targetPrice: number; // Alert when price reaches this
+    condition: "above" | "below";
+    triggered?: boolean;
+  };
+  notes?: string;
+};
+
+// Token lifecycle states for new trade rules (Jupiter-only: no separate
+// bonding-curve/graduation stages — a token is discovered, confirmed tradable, or acted on)
+export type TokenLifecycleState =
+  | "DISCOVERED"
+  | "TRADABLE"
+  | "SECURITY_VERIFIED"
+  | "BOUGHT"
+  | "PARTIALLY_SOLD"
+  | "FULLY_EXITED"
+  | "BLACKLISTED";
+
+export type TokenState = {
+  _id?: string;
+  mint: string;
+  symbol?: string;
+  name?: string;
+  state: TokenLifecycleState;
+  source: "jupiter" | "other";
+
+  marketCapUSD?: number;
+  buyVolume?: number;
+  sellVolume?: number;
+
+  // Jupiter tradability metrics
+  jupiterTradable?: boolean;
+  liquidityUSD?: number;
+  liquiditySOL?: number;
+  poolAddress?: string;
+  creatorAddress?: string; // token dev/creator wallet, used by emergencyExit's creator-sell trigger
+
+  // Security checks
+  mintAuthority?: string | null;
+  freezeAuthority?: string | null;
+  creatorHoldings?: number;
+  top3WalletsCombined?: number;
+  lpRemoved?: boolean;
+
+  // Timestamps
+  detectedAt: Date;
+  confirmedTradableAt?: Date;
+  boughtAt?: Date;
+  exitedAt?: Date;
+  blacklistedAt?: Date;
+
+  // Blacklist reason
+  blacklistReason?: string;
+
+  updatedAt: Date;
+};
+
+// --- Old Token Analytics Extensions ---
+export type TokenPriceHistory = {
+  timestamp: Date;
+  price: number;
+  liquidityUSD?: number;
+  volumeUSD?: number;
+};
+
+export type TokenAnalytics = {
+  priceChange1h?: number;
+  priceChange24h?: number;
+  priceChange7d?: number;
+  volume1h?: number;
+  volume24h?: number;
+  volume7d?: number;
+  liquidityHistory?: TokenPriceHistory[];
+};
+
+export type TokenSignal = {
+  type: "momentum" | "mean-reversion" | "breakout" | "custom";
+  description: string;
+  triggeredAt: Date;
+  params?: Record<string, any>;
+};
+
+// Extend TokenState for old token analytics
+export type OldTokenState = TokenState & {
+  priceHistory?: TokenPriceHistory[];
+  analytics?: TokenAnalytics;
+  signals?: TokenSignal[];
+  isOldToken?: boolean; // Flag for old token universe
+};
+
+/* ---------------------------------------
+   CONNECTION
+---------------------------------------- */
+export type PositionMetadata = {
+  token: string;
+  highestPnlPct?: number;
+  trailingActivated?: boolean;
+  soldAt40?: boolean;
+  soldAt80?: boolean;
+  soldAt150?: boolean;
+  remainingPct?: number;
+  firstTrancheEntry?: number;
+  secondTrancheEntry?: number;
+  updatedAt: Date;
+};
+
+let client: MongoClient | null = null;
+let db: Db | null = null;
+let tradesCol: Collection<TradeRecord> | null = null;
+let statsCol: Collection<StatsDoc> | null = null;
+let watchlistCol: Collection<WatchlistToken> | null = null;
+let positionMetadataCol: Collection<PositionMetadata> | null = null;
+let tokenStateCol: Collection<TokenState> | null = null;
+let userSettingsCol: Collection<UserSettings> | null = null;
+
+export async function connect() {
+  if (client && db) return db;
+  if (!MONGO_URI) throw new Error("MONGO_URI missing");
+  client = new MongoClient(MONGO_URI);
+  await client.connect();
+  db = client.db(MONGO_DB_NAME);
+  tradesCol = db.collection<TradeRecord>("trades");
+  statsCol = db.collection<StatsDoc>("stats");
+  watchlistCol = db.collection<WatchlistToken>("watchlist");
+  positionMetadataCol = db.collection<PositionMetadata>("positionMetadata");
+  tokenStateCol = db.collection<TokenState>("tokenStates");
+  userSettingsCol = db.collection<UserSettings>("userSettings");
+  // New collection for old token analytics (optional, or store in tokenStates)
+  // const oldTokenStateCol = db.collection<OldTokenState>("oldTokenStates");
+  await tradesCol.createIndex({ timestamp: -1 });
+  await watchlistCol.createIndex({ mint: 1 });
+  await watchlistCol.createIndex({ userId: 1 });
+  await positionMetadataCol.createIndex({ token: 1 }, { unique: true });
+  await tokenStateCol.createIndex({ mint: 1 }, { unique: true });
+  await tokenStateCol.createIndex({ state: 1 });
+  await tokenStateCol.createIndex({ updatedAt: -1 });
+  await userSettingsCol.createIndex({ wallet: 1 }, { unique: true });
+  // ensure stats doc exists
+  const existing = await statsCol.findOne({});
+  if (!existing) {
+    await statsCol.insertOne({
+      portfolioValue: 0,
+      totalProfitSol: 0,
+      totalProfitPercent: 0,
+      openTrades: 0,
+      tradeVolumeSol: 0,
+      winRate: 0,
+      lastUpdated: new Date(),
+    });
+  }
+  log.info("Connected to MongoDB");
+  return db;
+}
+
+export async function addTrade(
+  tr: Omit<
+    Partial<TradeRecord>,
+    "amountSol" | "amountLamports" | "timestamp"
+  > & { amount: number; timestamp?: Date | string }
+) {
+  if (!db) await connect();
+  const timestamp = tr.timestamp ? new Date(tr.timestamp as any) : new Date();
+  const lamports = Number(tr.amount || 0);
+  const amountSol = lamports / 1e9;
+
+  // normalize pnl passed in various formats
+  let pnlPercent =
+    typeof tr.pnl === "number"
+      ? Math.abs(tr.pnl) <= 1
+        ? tr.pnl
+        : tr.pnl / 100
+      : 0;
+  const pnlSol = amountSol * pnlPercent;
+
+  const record: TradeRecord = {
+    id: (tr.id as string) || crypto.randomUUID(),
+    type: (tr.type as "buy" | "sell") || "buy",
+    token: (tr.token as string) || "UNKNOWN",
+    amountLamports: lamports,
+    amountSol,
+    signature: tr.signature ?? null,
+    timestamp,
+    ...(tr.inputMint !== undefined && { inputMint: tr.inputMint }),
+    ...(tr.outputMint !== undefined && { outputMint: tr.outputMint }),
+    ...(tr.price !== undefined && { price: tr.price }),
+    ...(pnlPercent !== 0 && { pnl: pnlPercent }),
+    ...(pnlSol !== 0 && { pnlSol }),
+    ...(tr.wallet !== undefined && { wallet: tr.wallet }),
+    ...(tr.simulated !== undefined && { simulated: tr.simulated }),
+  };
+
+  await tradesCol!.insertOne(record);
+
+  // Simulated trades don't represent real capital and must never contaminate
+  // the persistent, cumulative stats shown on the dashboard (tradeVolumeSol/
+  // totalProfitSol/openTrades are $inc'd forever, never reset, so even one
+  // simulated trade slipping through here permanently inflates real numbers).
+  if (!record.simulated) {
+    // atomic stats update — openTrades is intentionally NOT $inc'd here (see
+    // getStats(), which computes it live from actual current positions). A
+    // running +1/-1 counter drifts from reality over time (e.g. dust-sized
+    // "sells" against an already-closed position still decrement it) and,
+    // unlike a live count, has no way to self-correct.
+    const updated = await statsCol!.findOneAndUpdate(
+      {},
+      {
+        $inc: {
+          tradeVolumeSol: amountSol,
+          totalProfitSol: pnlSol,
+        },
+        $set: { lastUpdated: new Date() },
+      },
+      { returnDocument: "after" }
+    );
+
+    // recompute winRate & percent (real trades only, same reasoning as above)
+    const recent = await tradesCol!
+      .find({ pnl: { $exists: true }, simulated: { $ne: true } })
+      .sort({ timestamp: -1 })
+      .limit(500)
+      .toArray();
+    const wins = recent.filter((r) => (r.pnl ?? 0) > 0).length;
+    const winRate = recent.length ? (wins / recent.length) * 100 : 0;
+    const statsDoc = updated!;
+    const totalProfitPercent = statsDoc.tradeVolumeSol
+      ? statsDoc.totalProfitSol / statsDoc.tradeVolumeSol
+      : 0;
+
+    await statsCol!.updateOne(
+      {},
+      {
+        $set: {
+          winRate,
+          totalProfitPercent,
+          portfolioValue: (statsDoc.portfolioValue || 0) + pnlSol,
+        },
+      }
+    );
+  }
+
+  return record;
+}
+
+// includeSimulated defaults to false — the same reasoning as getPositions():
+// simulated trades don't represent real capital and must not silently
+// contaminate real-money aggregates (daily-loss circuit breaker, PnL display,
+// win rate). Callers that genuinely want the full picture (e.g. an admin
+// audit view) can opt in explicitly.
+export async function getTrades(limit = 50, includeSimulated = false) {
+  if (!db) await connect();
+  const filter = includeSimulated ? {} : { simulated: { $ne: true } };
+  return tradesCol!.find(filter).sort({ timestamp: -1 }).limit(limit).toArray();
+}
+
+// Same floor used by monitor.service.ts to decide a position is economically
+// closed despite floating-point residue leaving netSol at a tiny nonzero value.
+const POSITION_DUST_THRESHOLD_SOL = Number(
+  process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
+);
+
+export async function getStats() {
+  if (!db) await connect();
+  const doc = await statsCol!.findOne({});
+  if (!doc) throw new Error("Stats missing");
+
+  const positions = await getPositions();
+  const openTrades = positions.filter(
+    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL
+  ).length;
+
+  return { ...doc, openTrades };
+}
+
+export type Position = {
+  token: string;
+  netSol: number;
+  avgBuyPrice?: number;
+  highestPnlPct?: number;
+  trailingActivated?: boolean;
+  soldAt40?: boolean; // Track if 30% sold at +40% profit
+  soldAt80?: boolean; // Track if 30% sold at +80% profit
+  soldAt150?: boolean; // Track if 30% sold at +150% profit
+  remainingPct?: number; // Track remaining position percentage (starts at 100)
+  firstTrancheEntry?: number; // Timestamp of first 60% buy
+  secondTrancheEntry?: number; // Timestamp of second 40% buy
+  firstBuyAt?: Date; // Earliest buy fill for this token — used for the SL grace period
+};
+
+export async function getPositions(): Promise<Position[]> {
+  if (!db) await connect();
+  const agg = await tradesCol!
+    .aggregate([
+      // Simulated trades don't represent real capital at risk and must never
+      // count against MAX_OPEN_POSITIONS / risk-management position sizing.
+      { $match: { simulated: { $ne: true } } },
+      {
+        $group: {
+          _id: "$token",
+          bought: {
+            $sum: { $cond: [{ $eq: ["$type", "buy"] }, "$amountLamports", 0] },
+          },
+          sold: {
+            $sum: { $cond: [{ $eq: ["$type", "sell"] }, "$amountLamports", 0] },
+          },
+          // Token quantity received per buy fill, so avgBuyPrice below can be
+          // weighted by how much was actually spent at each price rather than
+          // averaging the price fields themselves. A plain $avg treats a 60%
+          // tranche and a 40% tranche at different prices as equally
+          // important, which biases the recorded cost basis away from what
+          // was actually paid — and that biased number is what
+          // monitor.service.ts's tiered take-profit and trailing-stop logic
+          // fires against.
+          buyTokenQty: {
+            $sum: {
+              $cond: [
+                {
+                  $and: [
+                    { $eq: ["$type", "buy"] },
+                    { $gt: ["$price", 0] },
+                  ],
+                },
+                { $divide: ["$amountLamports", "$price"] },
+                0,
+              ],
+            },
+          },
+          firstBuyAt: {
+            $min: { $cond: [{ $eq: ["$type", "buy"] }, "$timestamp", null] },
+          },
+        },
+      },
+      {
+        $project: {
+          token: "$_id",
+          netSol: { $divide: [{ $subtract: ["$bought", "$sold"] }, 1e9] },
+          avgBuyPrice: {
+            $cond: [
+              { $gt: ["$buyTokenQty", 0] },
+              { $divide: ["$bought", "$buyTokenQty"] },
+              null,
+            ],
+          },
+          firstBuyAt: 1,
+          _id: 0,
+        },
+      },
+    ])
+    .toArray();
+
+  // Merge with position metadata — tranche/tier fields included so
+  // frontend/components/trading/TrancheProgress.tsx has real data to render
+  // instead of permanently-undefined props.
+  const positions = agg as Position[];
+  for (const pos of positions) {
+    const metadata = await positionMetadataCol!.findOne({ token: pos.token });
+    if (metadata) {
+      if (metadata.highestPnlPct !== undefined) {
+        pos.highestPnlPct = metadata.highestPnlPct;
+      }
+      if (metadata.trailingActivated !== undefined) {
+        pos.trailingActivated = metadata.trailingActivated;
+      }
+      if (metadata.soldAt40 !== undefined) pos.soldAt40 = metadata.soldAt40;
+      if (metadata.soldAt80 !== undefined) pos.soldAt80 = metadata.soldAt80;
+      if (metadata.soldAt150 !== undefined) pos.soldAt150 = metadata.soldAt150;
+      if (metadata.remainingPct !== undefined) {
+        pos.remainingPct = metadata.remainingPct;
+      }
+      if (metadata.firstTrancheEntry !== undefined) {
+        pos.firstTrancheEntry = metadata.firstTrancheEntry;
+      }
+      if (metadata.secondTrancheEntry !== undefined) {
+        pos.secondTrancheEntry = metadata.secondTrancheEntry;
+      }
+    }
+  }
+
+  return positions;
+}
+
+export async function updatePositionMetadata(
+  token: string,
+  updates: Partial<Omit<PositionMetadata, "token" | "updatedAt">>
+): Promise<void> {
+  if (!db) await connect();
+  await positionMetadataCol!.updateOne(
+    { token },
+    {
+      $set: {
+        ...updates,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: { token },
+    },
+    { upsert: true }
+  );
+}
+
+export async function updateStats(updates: Partial<StatsDoc>) {
+  if (!db) await connect();
+  const out = await statsCol!.findOneAndUpdate(
+    {},
+    { $set: { ...updates, lastUpdated: new Date() } },
+    { returnDocument: "after" }
+  );
+  // openTrades is never trustworthy from the stored document alone — it's a
+  // point-in-time snapshot from whenever it was last $set (often never, since
+  // most callers only touch portfolioValue/totalProfitSol/etc). Any caller
+  // that broadcasts this return value (e.g. stats.route.ts's stats:update)
+  // must get a figure that matches live positions, the same way getStats()
+  // does, or the frontend can receive a stale/zero count that a `?? prev`
+  // merge won't catch since 0 is not null/undefined.
+  const positions = await getPositions();
+  const openTrades = positions.filter(
+    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL
+  ).length;
+  return { ...out!, openTrades };
+}
+
+/* ---------------------------------------
+   WATCHLIST FUNCTIONS
+---------------------------------------- */
+export async function addToWatchlist(
+  token: Omit<WatchlistToken, "_id" | "addedAt">
+) {
+  if (!db) await connect();
+
+  // Check if already exists
+  const filter: any = { mint: token.mint };
+  if (token.userId) filter.userId = token.userId;
+
+  const existing = await watchlistCol!.findOne(filter);
+  if (existing) {
+    return { success: false, error: "Token already in watchlist", existing };
+  }
+
+  const doc: WatchlistToken = {
+    ...token,
+    addedAt: new Date(),
+  };
+
+  const result = await watchlistCol!.insertOne(doc as any);
+  return { success: true, id: result.insertedId, doc };
+}
+
+export async function getWatchlist(userId?: string) {
+  if (!db) await connect();
+  const filter = userId ? { userId } : {};
+  return watchlistCol!.find(filter).sort({ addedAt: -1 }).toArray();
+}
+
+export async function removeFromWatchlist(mint: string, userId?: string) {
+  if (!db) await connect();
+  const filter: any = { mint };
+  if (userId) filter.userId = userId;
+
+  const result = await watchlistCol!.deleteOne(filter);
+  return {
+    success: result.deletedCount > 0,
+    deletedCount: result.deletedCount,
+  };
+}
+
+export async function updateWatchlistAlert(
+  mint: string,
+  priceAlert: WatchlistToken["priceAlert"],
+  userId?: string
+) {
+  if (!db) await connect();
+  const filter: any = { mint };
+  if (userId) filter.userId = userId;
+
+  const update: any = { $set: { priceAlert } };
+  const result = await watchlistCol!.updateOne(filter, update);
+  return {
+    success: result.modifiedCount > 0,
+    modifiedCount: result.modifiedCount,
+  };
+}
+
+/* ---------------------------------------
+   PORTFOLIO P&L TRACKING
+---------------------------------------- */
+
+/**
+ * Calculate comprehensive portfolio P&L
+ */
+export async function getPortfolioPnL(): Promise<PortfolioPnL> {
+  if (!db) await connect();
+
+  // Same reasoning as getPositions()/getTrades(): paper/simulated trades must
+  // not contaminate real realized-PnL, win-rate, or invested-SOL figures —
+  // this is what the dashboard actually displays to you.
+  const trades = await tradesCol!
+    .find({ simulated: { $ne: true } })
+    .sort({ timestamp: 1 })
+    .toArray();
+
+  let totalInvestedSol = 0;
+  let totalReturnedSol = 0;
+  let realizedPnlSol = 0;
+  let winningTrades = 0;
+  let losingTrades = 0;
+  let totalWinSol = 0;
+  let totalLossSol = 0;
+  let largestWinSol = 0;
+  let largestLossSol = 0;
+
+  for (const trade of trades) {
+    if (trade.type === "buy") {
+      totalInvestedSol += trade.amountSol;
+    } else if (trade.type === "sell") {
+      totalReturnedSol += trade.amountSol;
+
+      if (trade.pnlSol) {
+        realizedPnlSol += trade.pnlSol;
+
+        if (trade.pnlSol > 0) {
+          winningTrades++;
+          totalWinSol += trade.pnlSol;
+          largestWinSol = Math.max(largestWinSol, trade.pnlSol);
+        } else if (trade.pnlSol < 0) {
+          losingTrades++;
+          totalLossSol += Math.abs(trade.pnlSol);
+          largestLossSol = Math.max(largestLossSol, Math.abs(trade.pnlSol));
+        }
+      }
+    }
+  }
+
+  // Get current open positions value
+  const positions = await getPositions();
+  let unrealizedPnlSol = 0;
+  let openPositionsValue = 0;
+
+  for (const pos of positions) {
+    openPositionsValue += pos.netSol;
+    // Unrealized P&L would require current prices - placeholder for now
+  }
+
+  const totalTrades = winningTrades + losingTrades;
+  const winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0;
+  const averageWinSol = winningTrades > 0 ? totalWinSol / winningTrades : 0;
+  const averageLossSol = losingTrades > 0 ? totalLossSol / losingTrades : 0;
+
+  const totalPnlSol = realizedPnlSol + unrealizedPnlSol;
+  const totalPnlPercent =
+    totalInvestedSol > 0 ? (totalPnlSol / totalInvestedSol) * 100 : 0;
+
+  const roi =
+    totalInvestedSol > 0
+      ? ((totalReturnedSol - totalInvestedSol) / totalInvestedSol) * 100
+      : 0;
+
+  return {
+    totalInvestedSol,
+    totalReturnedSol,
+    unrealizedPnlSol,
+    realizedPnlSol,
+    totalPnlSol,
+    totalPnlPercent,
+    winningTrades,
+    losingTrades,
+    totalTrades,
+    winRate,
+    averageWinSol,
+    averageLossSol,
+    largestWinSol,
+    largestLossSol,
+    openPositionsValue,
+    closedPositionsValue: totalReturnedSol,
+    roi,
+  };
+}
+
+/**
+ * Get P&L breakdown by token
+ */
+export async function getTokenPnL(): Promise<TokenPnL[]> {
+  if (!db) await connect();
+
+  const trades = await tradesCol!
+    .find({ simulated: { $ne: true } })
+    .sort({ timestamp: 1 })
+    .toArray();
+  const tokenMap = new Map<
+    string,
+    {
+      totalBought: number;
+      totalSold: number;
+      buyCount: number;
+      sellCount: number;
+      symbol?: string;
+    }
+  >();
+
+  for (const trade of trades) {
+    const token = trade.token;
+    if (!tokenMap.has(token)) {
+      tokenMap.set(token, {
+        totalBought: 0,
+        totalSold: 0,
+        buyCount: 0,
+        sellCount: 0,
+      });
+    }
+
+    const data = tokenMap.get(token)!;
+    if (trade.type === "buy") {
+      data.totalBought += trade.amountSol;
+      data.buyCount++;
+    } else if (trade.type === "sell") {
+      data.totalSold += trade.amountSol;
+      data.sellCount++;
+    }
+  }
+
+  const tokenPnLs: TokenPnL[] = [];
+
+  for (const [token, data] of tokenMap.entries()) {
+    const pnlSol = data.totalSold - data.totalBought;
+    const pnlPercent =
+      data.totalBought > 0 ? (pnlSol / data.totalBought) * 100 : 0;
+
+    const averageBuyPrice =
+      data.buyCount > 0 ? data.totalBought / data.buyCount : 0;
+
+    const status = data.totalSold >= data.totalBought ? "closed" : "open";
+    const remainingTokens = data.totalBought - data.totalSold;
+
+    tokenPnLs.push({
+      token,
+      symbol: token.substring(0, 8) + "...",
+      totalBought: data.totalBought,
+      totalSold: data.totalSold,
+      remainingTokens,
+      averageBuyPrice,
+      pnlSol,
+      pnlPercent,
+      trades: data.buyCount + data.sellCount,
+      status,
+    });
+  }
+
+  // Sort by absolute P&L (largest gains/losses first)
+  return tokenPnLs.sort((a, b) => Math.abs(b.pnlSol) - Math.abs(a.pnlSol));
+}
+
+/**
+ * Get P&L history over time (daily aggregation)
+ */
+export async function getPnLHistory(days: number = 30): Promise<
+  Array<{
+    date: string;
+    realizedPnlSol: number;
+    tradeCount: number;
+    winRate: number;
+  }>
+> {
+  if (!db) await connect();
+
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - days);
+
+  const trades = await tradesCol!
+    .find({
+      timestamp: { $gte: startDate },
+      type: "sell",
+      simulated: { $ne: true },
+    })
+    .sort({ timestamp: 1 })
+    .toArray();
+
+  const dailyMap = new Map<
+    string,
+    {
+      pnl: number;
+      wins: number;
+      losses: number;
+    }
+  >();
+
+  for (const trade of trades) {
+    const dateKey = trade.timestamp.toISOString().split("T")[0];
+    if (!dateKey) continue;
+
+    if (!dailyMap.has(dateKey)) {
+      dailyMap.set(dateKey, { pnl: 0, wins: 0, losses: 0 });
+    }
+
+    const day = dailyMap.get(dateKey)!;
+    day.pnl += trade.pnlSol || 0;
+
+    if (trade.pnlSol && trade.pnlSol > 0) day.wins++;
+    else if (trade.pnlSol && trade.pnlSol < 0) day.losses++;
+  }
+
+  const history = Array.from(dailyMap.entries()).map(([date, data]) => {
+    const total = data.wins + data.losses;
+    return {
+      date,
+      realizedPnlSol: data.pnl,
+      tradeCount: total,
+      winRate: total > 0 ? (data.wins / total) * 100 : 0,
+    };
+  });
+
+  return history.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/**
+ * Token State Management (for new trade rules)
+ */
+export async function upsertTokenState(
+  tokenState: Omit<TokenState, "_id" | "updatedAt">
+): Promise<void> {
+  if (!db) await connect();
+
+  // Separate detectedAt from other fields to avoid MongoDB conflict
+  const { detectedAt, ...updateFields } = tokenState;
+
+  await tokenStateCol!.updateOne(
+    { mint: tokenState.mint },
+    {
+      $set: {
+        ...updateFields,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: {
+        detectedAt: detectedAt || new Date(),
+      },
+    },
+    { upsert: true }
+  );
+}
+
+export async function getTokenState(mint: string): Promise<TokenState | null> {
+  if (!db) await connect();
+  return await tokenStateCol!.findOne({ mint });
+}
+
+export async function getTokensByState(
+  state: TokenLifecycleState
+): Promise<TokenState[]> {
+  if (!db) await connect();
+  return await tokenStateCol!.find({ state }).sort({ updatedAt: -1 }).toArray();
+}
+
+export async function getTokensByStates(
+  states: TokenLifecycleState[],
+  options?: {
+    limit?: number;
+    minCreatedAt?: Date;
+    hasPool?: boolean;
+  }
+): Promise<TokenState[]> {
+  if (!db) await connect();
+
+  const filter: any = { state: { $in: states } };
+
+  if (options?.minCreatedAt) {
+    filter.detectedAt = { $gte: options.minCreatedAt };
+  }
+
+  if (options?.hasPool) {
+    filter.poolAddress = { $exists: true, $ne: null };
+  }
+
+  let query = tokenStateCol!.find(filter).sort({ updatedAt: -1 });
+
+  if (options?.limit) {
+    query = query.limit(options.limit);
+  }
+
+  return await query.toArray();
+}
+
+export async function updateTokenState(
+  mint: string,
+  updates: Partial<Omit<TokenState, "_id" | "mint">>
+): Promise<void> {
+  if (!db) await connect();
+  await tokenStateCol!.updateOne(
+    { mint },
+    {
+      $set: {
+        ...updates,
+        updatedAt: new Date(),
+      },
+    }
+  );
+}
+
+export async function blacklistToken(
+  mint: string,
+  reason: string
+): Promise<void> {
+  if (!db) await connect();
+  await tokenStateCol!.updateOne(
+    { mint },
+    {
+      $set: {
+        state: "BLACKLISTED",
+        blacklistedAt: new Date(),
+        blacklistReason: reason,
+        updatedAt: new Date(),
+      },
+    }
+  );
+}
+
+export async function getUserSettings(
+  wallet: string
+): Promise<UserSettings | null> {
+  if (!db) await connect();
+  return userSettingsCol!.findOne({ wallet });
+}
+
+export async function saveUserSettings(
+  wallet: string,
+  settings: Omit<UserSettings, "wallet" | "updatedAt">
+): Promise<UserSettings> {
+  if (!db) await connect();
+  const result = await userSettingsCol!.findOneAndUpdate(
+    { wallet },
+    {
+      $set: { ...settings, updatedAt: new Date() },
+      $setOnInsert: { wallet },
+    },
+    { upsert: true, returnDocument: "after" }
+  );
+  return result!;
+}
+
+export async function close() {
+  if (client) {
+    await client.close();
+    client = null;
+  }
+}
+
+export default {
+  connect,
+  addTrade,
+  getTrades,
+  getStats,
+  getPositions,
+  updateStats,
+  updatePositionMetadata,
+  addToWatchlist,
+  getWatchlist,
+  removeFromWatchlist,
+  updateWatchlistAlert,
+  getPortfolioPnL,
+  getTokenPnL,
+  getPnLHistory,
+  upsertTokenState,
+  getTokenState,
+  getTokensByState,
+  getTokensByStates,
+  updateTokenState,
+  blacklistToken,
+  getUserSettings,
+  saveUserSettings,
+  close,
+};

@@ -1,0 +1,60 @@
+# GitHub Actions workflow for deploying Backend to Azure App Service
+name: Deploy Backend to Azure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+  workflow_dispatch:
+
+env:
+  AZURE_WEBAPP_NAME: archangel-bot-backend
+  AZURE_WEBAPP_PACKAGE_PATH: "./backend"
+  NODE_VERSION: "18.x"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: Build application
+        run: |
+          cd backend
+          npm run build
+
+      - name: Create deployment package
+        run: |
+          cd backend
+          mkdir -p deploy
+          cp -r dist package.json package-lock.json deploy/
+          cd deploy
+          npm ci --production
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_BACKEND_PUBLISH_PROFILE }}
+          package: ./backend/deploy
+
+      - name: Verify deployment
+        run: |
+          sleep 30
+          curl -f https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/ || exit 1

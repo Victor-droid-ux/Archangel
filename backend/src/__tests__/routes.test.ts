@@ -1,0 +1,188 @@
+// backend/src/__tests__/routes.test.ts
+// Integration tests for key HTTP routes via supertest against a real
+// createApp() instance and a real in-memory MongoDB. Routes that depend on
+// live external APIs (Jupiter price data) are mocked so the suite stays
+// fast and doesn't require network access to pass.
+import request from "supertest";
+import { startTestDb, stopTestDb } from "./testDb.js";
+
+jest.mock("../services/jupiter.service.js", () => ({
+  __esModule: true,
+  getSolPriceUsd: jest.fn().mockResolvedValue(200),
+  getJupiterTokenInfo: jest.fn().mockResolvedValue({ usdPrice: 0.4 }),
+  SOL_MINT: "So11111111111111111111111111111111111111112",
+  default: {
+    getSolPriceUsd: jest.fn().mockResolvedValue(200),
+    getTokenInfo: jest.fn().mockResolvedValue({ usdPrice: 0.4 }),
+  },
+}));
+
+let app: import("express").Express;
+let dbService: Awaited<ReturnType<typeof startTestDb>>;
+
+beforeAll(async () => {
+  dbService = await startTestDb();
+  const { createApp } = await import("../app.js");
+  app = createApp();
+}, 300000);
+
+afterAll(async () => {
+  await stopTestDb();
+});
+
+describe("GET /api/tokens/sol-price", () => {
+  it("returns the live (mocked) SOL/USD price", async () => {
+    const res = await request(app).get("/api/tokens/sol-price");
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.price).toBe(200);
+  });
+});
+
+describe("GET /api/positions", () => {
+  it("returns an empty list when nothing is held", async () => {
+    const res = await request(app).get("/api/positions");
+    expect(res.statusCode).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.positions).toEqual([]);
+  });
+
+  it("enriches a real position with live price and a correctly-signed unrealized PnL", async () => {
+    await dbService.addTrade({
+      type: "buy",
+      token: "MINT_ROUTE_POSITION",
+      amount: 1_000_000_000, // 1 SOL
+      price: 0.001, // avgBuyPrice in SOL
+    });
+
+    const res = await request(app).get("/api/positions");
+    expect(res.statusCode).toBe(200);
+    const pos = res.body.positions.find(
+      (p: any) => p.token === "MINT_ROUTE_POSITION"
+    );
+    expect(pos).toBeDefined();
+
+    // Mocked current price: 0.4 USD / 200 USD-per-SOL = 0.002 SOL, double the
+    // 0.001 SOL avgBuyPrice, so this position should show as up ~100%.
+    expect(pos.currentPrice).toBeCloseTo(0.002, 9);
+    expect(pos.unrealizedPnlPct).toBeCloseTo(1.0, 6);
+    expect(pos.unrealizedPnlSol).toBeGreaterThan(0);
+  });
+});
+
+describe("POST /api/trade/calculate-risk", () => {
+  it("rejects a missing balance", async () => {
+    const res = await request(app).post("/api/trade/calculate-risk").send({});
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("computes riskAmount from an explicit riskPercent", async () => {
+    const res = await request(app)
+      .post("/api/trade/calculate-risk")
+      .send({ balance: 10, riskPercent: 5 });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.riskAmount).toBeCloseTo(0.5, 6);
+    expect(res.body.data.amountLamports).toBe(500_000_000);
+  });
+
+  it("defaults to 1% of balance when nothing is specified", async () => {
+    const res = await request(app)
+      .post("/api/trade/calculate-risk")
+      .send({ balance: 10 });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.riskPercent).toBeCloseTo(1, 6);
+    expect(res.body.data.riskAmount).toBeCloseTo(0.1, 6);
+  });
+
+  it("caps the calculated amount at the full balance", async () => {
+    const res = await request(app)
+      .post("/api/trade/calculate-risk")
+      .send({ balance: 1, riskAmount: 5 });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.riskAmount).toBe(1);
+    expect(res.body.data.riskPercent).toBe(100);
+  });
+});
+
+describe("POST/GET /api/user/settings — real persistence round-trip", () => {
+  const wallet = "RouteTestWallet33333333333333333333333333";
+
+  it("400s without a wallet", async () => {
+    const res = await request(app)
+      .post("/api/user/settings")
+      .send({ autoMode: true });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("saves settings for a wallet and reads them back unchanged", async () => {
+    const saveRes = await request(app).post("/api/user/settings").send({
+      wallet,
+      amount: 0.3,
+      slippage: 3,
+      takeProfit: 20,
+      stopLoss: 8,
+      autoTrade: true,
+      dexRoute: "Jupiter",
+    });
+    expect(saveRes.statusCode).toBe(200);
+    expect(saveRes.body.success).toBe(true);
+
+    const loadRes = await request(app).get(
+      `/api/user/settings?wallet=${wallet}`
+    );
+    expect(loadRes.statusCode).toBe(200);
+    expect(loadRes.body.data.amount).toBe(0.3);
+    expect(loadRes.body.data.autoTrade).toBe(true);
+  });
+
+  it("400s a GET without a wallet query param", async () => {
+    const res = await request(app).get("/api/user/settings");
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("Watchlist routes", () => {
+  const mint = "RouteTestMint4444444444444444444444444444";
+
+  it("adds, lists, and deletes a token via HTTP", async () => {
+    const addRes = await request(app)
+      .post("/api/watchlist")
+      .send({ mint, symbol: "RTM" });
+    expect(addRes.statusCode).toBe(200);
+    expect(addRes.body.success).toBe(true);
+
+    const listRes = await request(app).get("/api/watchlist");
+    expect(listRes.statusCode).toBe(200);
+    expect(listRes.body.tokens.some((t: any) => t.mint === mint)).toBe(true);
+
+    const delRes = await request(app).delete(`/api/watchlist/${mint}`);
+    expect(delRes.statusCode).toBe(200);
+    expect(delRes.body.success).toBe(true);
+  });
+
+  it("400s adding a token with no mint", async () => {
+    const res = await request(app).post("/api/watchlist").send({});
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("404s deleting a mint that was never watched", async () => {
+    const res = await request(app).delete(
+      "/api/watchlist/NeverWatchedMint555555555555555555555555"
+    );
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("sets a price alert with a valid condition and rejects an invalid one", async () => {
+    await request(app).post("/api/watchlist").send({ mint, symbol: "RTM" });
+
+    const bad = await request(app)
+      .patch(`/api/watchlist/${mint}/alert`)
+      .send({ targetPrice: 1, condition: "sideways" });
+    expect(bad.statusCode).toBe(400);
+
+    const good = await request(app)
+      .patch(`/api/watchlist/${mint}/alert`)
+      .send({ targetPrice: 1, condition: "above" });
+    expect(good.statusCode).toBe(200);
+  });
+});
