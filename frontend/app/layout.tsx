@@ -1,3 +1,4 @@
+import "@lib/cryptoPolyfill";
 import "./globals.css";
 import localFont from "next/font/local";
 import Navbar from "@components/layout/navbar";
