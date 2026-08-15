@@ -45,3 +45,5 @@ logs/
 # --- Coverage / Tests ---
 coverage/
 **/coverage/
+playwright-report/
+test-results/
