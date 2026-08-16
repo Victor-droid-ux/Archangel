@@ -3,6 +3,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { TerminalSquare } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useSocket } from "@hooks/useSocket";
@@ -20,21 +21,38 @@ type TradeRow = {
 
 export const LiveTrades: React.FC = () => {
   const { lastMessage, connected } = useSocket();
+  const { publicKey } = useSolanaWallet();
   const router = useRouter();
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const feedRef = useRef<HTMLDivElement | null>(null);
 
-  // Backfill recent real trades on mount — this feed is otherwise purely
-  // socket-event-driven, so a freshly-loaded page shows nothing for trades
-  // that happened before it was opened (e.g. positions already held).
+  // Clear the instant the connected wallet changes, before the backfill
+  // re-fetch below even starts — otherwise the previous wallet's feed stays
+  // on screen for the round-trip it takes to load the new wallet's own.
+  useEffect(() => {
+    setTrades([]);
+  }, [publicKey]);
+
+  // Backfill recent real trades on mount (and again on wallet change) — this
+  // feed is otherwise purely socket-event-driven, so a freshly-loaded page
+  // shows nothing for trades that happened before it was opened (e.g.
+  // positions already held). Scoped to the connected wallet: without a
+  // wallet param the backend can't tell this apart from an internal caller
+  // that legitimately needs everything, and would return every wallet's
+  // manual trades mixed together.
   useEffect(() => {
     let mounted = true;
+    const walletParam = publicKey
+      ? `&wallet=${encodeURIComponent(publicKey.toString())}`
+      : "";
     (async () => {
       try {
         const res = await fetcher<{ success: boolean; trades: any[] }>(
-          "/api/trade/history?limit=50"
+          `/api/trade/history?limit=50${walletParam}`
         );
         if (!mounted || !res?.success || !Array.isArray(res.trades)) return;
+        // No need to clear here — the dedicated effect above already
+        // cleared trades the instant publicKey changed.
         const rows: TradeRow[] = res.trades.map((t) => ({
           id: t.id,
           token: t.token ?? "",
@@ -62,7 +80,7 @@ export const LiveTrades: React.FC = () => {
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [publicKey]);
 
   useEffect(() => {
     if (!lastMessage) return;

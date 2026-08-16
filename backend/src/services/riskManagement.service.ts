@@ -3,7 +3,13 @@
  *
  * POSITION SIZING: Risk Engine
  * - Max 2% risk per trade
- * - Max 3 open positions
+ * - No arbitrary cap on simultaneous open positions by default (was
+ *   hardcoded to 3 — that number had no basis in an actual risk model, it
+ *   just silently stopped the bot from taking new qualifying trades once 3
+ *   were open). Real protection against overexposure still comes from the
+ *   per-trade risk-percent sizing and the daily-loss circuit breaker below,
+ *   both of which remain fully enforced. Set MAX_OPEN_POSITIONS in .env if
+ *   you actually want a cap.
  * - Max 6% daily loss
  * - Bot stops trading when limits hit
  */
@@ -16,7 +22,10 @@ const log = getLogger("riskManagement");
 
 // Configuration (can be overridden by environment variables)
 const MAX_RISK_PER_TRADE_PCT = Number(process.env.MAX_RISK_PER_TRADE_PCT ?? 2); // 2%
-const MAX_OPEN_POSITIONS = Number(process.env.MAX_OPEN_POSITIONS ?? 3); // 3 positions
+// Unset/0 means "no cap" — the number of *qualifying* trades the bot can
+// hold is bounded by real risk controls (position sizing, daily-loss limit,
+// wallet balance), not by an arbitrary count.
+const MAX_OPEN_POSITIONS = Number(process.env.MAX_OPEN_POSITIONS ?? 0);
 const MAX_DAILY_LOSS_PCT = Number(process.env.MAX_DAILY_LOSS_PCT ?? 6); // 6%
 
 interface RiskCheckResult {
@@ -38,12 +47,14 @@ export async function canExecuteTrade(
   walletAddress: string
 ): Promise<RiskCheckResult> {
   try {
-    // Get current positions
-    const positions = await dbService.getPositions();
+    // Scoped to this specific wallet — each user's exposure/risk state must
+    // be independent. Without walletAddress here, one user's open positions
+    // would count against (and could block) every other user's trades.
+    const positions = await dbService.getPositions(walletAddress);
     const openPositions = positions.filter((p) => p.netSol > 0).length;
 
-    // Check max open positions
-    if (openPositions >= MAX_OPEN_POSITIONS) {
+    // Check max open positions (0/unset = no cap)
+    if (MAX_OPEN_POSITIONS > 0 && openPositions >= MAX_OPEN_POSITIONS) {
       log.warn(
         `Trade blocked: Max ${MAX_OPEN_POSITIONS} open positions reached (current: ${openPositions})`
       );
@@ -60,7 +71,7 @@ export async function canExecuteTrade(
     }
 
     // Calculate daily loss
-    const dailyLoss = await calculateDailyLoss();
+    const dailyLoss = await calculateDailyLoss(walletAddress);
     // Position sizing must be based on actual wallet equity, not on money
     // already committed to positions (dbService.getPortfolioPnL().totalInvestedSol
     // is a running sum of past buys — with few/no trades yet that's ~0, which made
@@ -150,14 +161,15 @@ export async function canExecuteTrade(
 }
 
 /**
- * Calculate total loss for today
+ * Calculate total loss for today, scoped to one wallet — otherwise one
+ * user's losses would trip the daily-loss circuit breaker for everyone.
  */
-async function calculateDailyLoss(): Promise<number> {
+async function calculateDailyLoss(walletAddress: string): Promise<number> {
   try {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
 
-    const trades = await dbService.getTrades();
+    const trades = await dbService.getTrades(500, false, walletAddress);
 
     // Filter trades from today
     const todayTrades = trades.filter(
@@ -188,18 +200,19 @@ export async function getRiskStatus(walletAddress: string): Promise<{
   tradingAllowed: boolean;
   portfolioValue: number;
 }> {
-  const positions = await dbService.getPositions();
+  const positions = await dbService.getPositions(walletAddress);
   const openPositions = positions.filter((p) => p.netSol > 0).length;
 
   // Same fix as canExecuteTrade: live wallet balance, not a fake fallback of
   // 100 SOL for a cumulative-invested figure that's ~0 with few/no trades yet.
   const portfolioValue = await getBalanceInSol(walletAddress);
 
-  const dailyLossSol = await calculateDailyLoss();
+  const dailyLossSol = await calculateDailyLoss(walletAddress);
   const dailyLossPct = (dailyLossSol / portfolioValue) * 100;
 
   const tradingAllowed =
-    openPositions < MAX_OPEN_POSITIONS && dailyLossPct < MAX_DAILY_LOSS_PCT;
+    (MAX_OPEN_POSITIONS <= 0 || openPositions < MAX_OPEN_POSITIONS) &&
+    dailyLossPct < MAX_DAILY_LOSS_PCT;
 
   return {
     openPositions,

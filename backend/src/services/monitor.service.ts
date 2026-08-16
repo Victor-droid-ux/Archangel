@@ -10,9 +10,32 @@ import { getLogger } from "../utils/logger.js";
 import notify from "./notifications/notify.service.js";
 import { Server } from "socket.io";
 import crypto from "crypto";
-import { Connection, Commitment, PublicKey } from "@solana/web3.js";
+import { Connection, Commitment, Keypair, PublicKey } from "@solana/web3.js";
 import { checkAllEmergencyTriggers } from "./emergencyExit.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
+import userWalletService from "./userWallet.service.js";
+import { loadKeypairFromEnv } from "./solana.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
+
+const OPERATOR_WALLET =
+  process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
+
+/**
+ * Resolves the keypair that can actually sign a sell for a given position's
+ * owner wallet — the single admin keypair for the operator's own positions,
+ * or that specific user's decrypted custodial hot-wallet keypair otherwise.
+ * Positions bought under a wallet with no matching signer (e.g. a user
+ * record that's since been removed) can't be sold automatically — logged
+ * loudly rather than silently skipped, since that needs a human to notice.
+ */
+async function resolveSignerForPosition(
+  ownerWallet: string
+): Promise<Keypair | null> {
+  if (ownerWallet === OPERATOR_WALLET) {
+    return loadKeypairFromEnv();
+  }
+  return userWalletService.getUserWalletKeypair(ownerWallet);
+}
 
 const log = getLogger("monitor");
 
@@ -254,14 +277,16 @@ export function startPositionMonitor(
             newHighest > highestPnl ||
             trailingActive !== pos.trailingActivated
           ) {
-            await dbService.updatePositionMetadata(tokenMint, {
+            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
               highestPnlPct: newHighest,
               trailingActivated: trailingActive,
             });
 
-            // Emit trailing stop status to frontend
-            io.emit("position:trailingUpdate", {
+            // Emit trailing stop status to frontend — only this position's
+            // own owner wallet (or everyone, for the shared operator bot).
+            emitToWalletOrGlobal(io, pos.wallet, "position:trailingUpdate", {
               token: tokenMint,
+              wallet: pos.wallet,
               currentPnlPct: pnlPercent,
               highestPnlPct: newHighest,
               trailingActivated: trailingActive,
@@ -295,14 +320,13 @@ export function startPositionMonitor(
               "🚨 EMERGENCY EXIT TRIGGERED - SELLING ALL IMMEDIATELY!"
             );
 
-            // Emergency sell ALL tokens immediately
+            // Emergency sell ALL tokens immediately — using THIS position's
+            // own owner wallet, not a fixed backend wallet, since positions
+            // can now belong to any of many custodial hot wallets.
             const useRealSwap = process.env.USE_REAL_SWAP === "true";
-            const backendWallet =
-              process.env.BACKEND_RECEIVER_WALLET ||
-              process.env.SERVER_PUBLIC_KEY ||
-              "";
+            const emergencySigner = await resolveSignerForPosition(pos.wallet);
 
-            if (useRealSwap && backendWallet) {
+            if (useRealSwap && emergencySigner) {
               // addTrade's `amount` field is SOL lamports, not the token amount
               // being sold — fetch a real quote to know actual SOL proceeds
               // rather than recording the raw token unit count (which silently
@@ -317,8 +341,9 @@ export function startPositionMonitor(
                 inputMint: tokenMint,
                 outputMint: SOL_MINT,
                 amount: fullAmountBase,
-                userPublicKey: backendWallet,
+                userPublicKey: emergencySigner.publicKey.toBase58(),
                 slippageBps: 1000, // High slippage for emergency
+                signer: emergencySigner,
               });
 
               if (emergencySwap.success) {
@@ -331,7 +356,7 @@ export function startPositionMonitor(
                   amount: Number(emergencyQuote?.outAmount ?? 0),
                   price: currentPrice,
                   pnl: pnlPercent,
-                  wallet: backendWallet,
+                  wallet: pos.wallet,
                   simulated: false,
                   signature: emergencySwap.signature ?? null,
                   timestamp: new Date(),
@@ -343,9 +368,9 @@ export function startPositionMonitor(
                 // live P&L poll loop, otherwise it keeps polling Birdeye for
                 // a token we no longer hold, forever (pnlTracker.service.ts's
                 // stopTracking is never called automatically).
-                pnlTrackerService.stopTracking(tokenMint);
+                pnlTrackerService.stopTracking(tokenMint, pos.wallet);
 
-                io.emit("tradeFeed", {
+                emitToWalletOrGlobal(io, pos.wallet, "tradeFeed", {
                   ...emergencyTrade,
                   auto: true,
                   reason: "emergency_exit",
@@ -387,7 +412,7 @@ export function startPositionMonitor(
             shouldSellTiered = true;
             sellPercent = TIER_SELL_PCT;
             tierReason = `Tier 1: +${(TIER1_PROFIT_PCT * 100).toFixed(0)}% profit`;
-            await dbService.updatePositionMetadata(tokenMint, {
+            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
               soldAt40: true,
               remainingPct: remainingPct - TIER_SELL_PCT,
             });
@@ -399,7 +424,7 @@ export function startPositionMonitor(
             shouldSellTiered = true;
             sellPercent = TIER_SELL_PCT;
             tierReason = `Tier 2: +${(TIER2_PROFIT_PCT * 100).toFixed(0)}% profit`;
-            await dbService.updatePositionMetadata(tokenMint, {
+            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
               soldAt80: true,
               remainingPct: remainingPct - TIER_SELL_PCT,
             });
@@ -411,7 +436,7 @@ export function startPositionMonitor(
             shouldSellTiered = true;
             sellPercent = TIER_SELL_PCT;
             tierReason = `Tier 3: +${(TIER3_PROFIT_PCT * 100).toFixed(0)}% profit`;
-            await dbService.updatePositionMetadata(tokenMint, {
+            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
               soldAt150: true,
               remainingPct: remainingPct - TIER_SELL_PCT,
             });
@@ -437,12 +462,9 @@ export function startPositionMonitor(
             const useRealSwap = process.env.USE_REAL_SWAP === "true";
 
             if (useRealSwap) {
-              const backendWallet =
-                process.env.BACKEND_RECEIVER_WALLET ||
-                process.env.SERVER_PUBLIC_KEY ||
-                "";
+              const tieredSigner = await resolveSignerForPosition(pos.wallet);
 
-              if (backendWallet) {
+              if (tieredSigner) {
                 // See emergency-exit block above: addTrade's `amount` is SOL
                 // lamports, so record the quoted SOL proceeds, not the token
                 // amount sold.
@@ -456,8 +478,9 @@ export function startPositionMonitor(
                   inputMint: tokenMint,
                   outputMint: SOL_MINT,
                   amount: sellAmountBase,
-                  userPublicKey: backendWallet,
+                  userPublicKey: tieredSigner.publicKey.toBase58(),
                   slippageBps: Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
+                  signer: tieredSigner,
                 });
 
                 if (tieredSwap.success) {
@@ -470,7 +493,7 @@ export function startPositionMonitor(
                     amount: Number(tieredQuote?.outAmount ?? 0),
                     price: currentPrice,
                     pnl: pnlPercent,
-                    wallet: backendWallet,
+                    wallet: pos.wallet,
                     simulated: false,
                     signature: tieredSwap.signature ?? null,
                     timestamp: new Date(),
@@ -478,7 +501,7 @@ export function startPositionMonitor(
 
                   await dbService.addTrade(tieredTrade);
 
-                  io.emit("tradeFeed", {
+                  emitToWalletOrGlobal(io, pos.wallet, "tradeFeed", {
                     ...tieredTrade,
                     auto: true,
                     reason: "tiered_profit",
@@ -547,19 +570,16 @@ export function startPositionMonitor(
             let finalSellSolAmount = 0;
 
             if (useRealSwap) {
-              const backendWallet =
-                process.env.BACKEND_RECEIVER_WALLET ||
-                process.env.SERVER_PUBLIC_KEY ||
-                "";
+              const finalSigner = await resolveSignerForPosition(pos.wallet);
 
-              if (!backendWallet) {
+              if (!finalSigner) {
                 log.error(
-                  { tokenMint },
-                  "USE_REAL_SWAP=true but BACKEND_RECEIVER_WALLET / SERVER_PUBLIC_KEY is not set"
+                  { tokenMint, wallet: pos.wallet },
+                  "USE_REAL_SWAP=true but no signer could be resolved for this position's wallet"
                 );
                 swapRes = {
                   success: false,
-                  error: "Missing backend wallet for auto-sell",
+                  error: "Missing signer for auto-sell",
                 };
               } else {
                 // Verify balance before selling (should have tokens)
@@ -584,8 +604,9 @@ export function startPositionMonitor(
                   inputMint: tokenMint,
                   outputMint: SOL_MINT,
                   amount: sellAmountBase,
-                  userPublicKey: backendWallet,
+                  userPublicKey: finalSigner.publicKey.toBase58(),
                   slippageBps: Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
+                  signer: finalSigner,
                 });
               }
             } else {
@@ -633,32 +654,30 @@ export function startPositionMonitor(
               amount: finalSellSolAmount, // SOL lamports received, not tokens sold
               price: currentPrice, // SOL per token
               pnl: pnlPercent, // decimal (0.12 = +12%)
-              wallet:
-                process.env.BACKEND_RECEIVER_WALLET ||
-                process.env.SERVER_PUBLIC_KEY ||
-                "",
+              wallet: pos.wallet,
               simulated: !useRealSwap,
               signature: swapRes.signature ?? null,
               timestamp: new Date(),
             };
 
             // Update position metadata to mark as fully exited
-            await dbService.updatePositionMetadata(tokenMint, {
+            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
               remainingPct: 0,
             });
 
             // Position fully closed — stop the live P&L poll loop for it (see
             // the emergency-exit call site above for why this matters).
-            pnlTrackerService.stopTracking(tokenMint);
+            pnlTrackerService.stopTracking(tokenMint, pos.wallet);
 
             // Persist and let db.service compute updated stats
             const saved = await dbService.addTrade(tradeRecord);
 
             // Emit rich tradeFeed event for frontend PnL
-            io.emit("tradeFeed", {
+            emitToWalletOrGlobal(io, pos.wallet, "tradeFeed", {
               id: saved.id,
               type: saved.type,
               token: saved.token,
+              wallet: pos.wallet,
               amount: saved.amountLamports,
               amountSol: saved.amountSol,
               price: saved.price,

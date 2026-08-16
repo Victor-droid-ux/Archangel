@@ -5,6 +5,7 @@ import {
   getJupiterTokenInfo,
   getSolPriceUsd,
 } from "./jupiter.service.js";
+import { Keypair } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
 
 const LOG = getLogger("tranche-buyer");
@@ -33,7 +34,8 @@ async function executeTranche(
   decimals: number,
   useReal: boolean,
   simLabel: string,
-  logLabel: string
+  logLabel: string,
+  signer?: Keypair
 ): Promise<TrancheResult> {
   try {
     const lamports = Math.floor(trancheSol * 1e9);
@@ -62,6 +64,7 @@ async function executeTranche(
           amount: lamports,
           userPublicKey: wallet,
           slippageBps: slippagePct * 100,
+          ...(signer ? { signer } : {}),
         })
       : { success: true as const, signature: `sim-${simLabel}-${Date.now()}` };
 
@@ -92,7 +95,8 @@ export async function executeFirstTranche(
   totalBuySol: number,
   wallet: string,
   useReal: boolean,
-  decimals: number = 9
+  decimals: number = 9,
+  signer?: Keypair
 ): Promise<TrancheResult> {
   return executeTranche(
     mint,
@@ -101,7 +105,8 @@ export async function executeFirstTranche(
     decimals,
     useReal,
     "tranche1",
-    "first tranche (60%)"
+    "first tranche (60%)",
+    signer
   );
 }
 
@@ -113,7 +118,8 @@ export async function executeSecondTranche(
   totalBuySol: number,
   wallet: string,
   useReal: boolean,
-  decimals: number = 9
+  decimals: number = 9,
+  signer?: Keypair
 ): Promise<TrancheResult> {
   return executeTranche(
     mint,
@@ -122,7 +128,8 @@ export async function executeSecondTranche(
     decimals,
     useReal,
     "tranche2",
-    "second tranche (40%)"
+    "second tranche (40%)",
+    signer
   );
 }
 
@@ -135,7 +142,8 @@ export async function executeTestSell(
   tokenQty: number,
   decimals: number,
   wallet: string,
-  useReal: boolean
+  useReal: boolean,
+  signer?: Keypair
 ): Promise<{ success: boolean; error?: string }> {
   try {
     const testSellQty = tokenQty * TEST_SELL_PCT;
@@ -168,6 +176,7 @@ export async function executeTestSell(
         amount: testSellBase,
         userPublicKey: wallet,
         slippageBps: TEST_SELL_SLIPPAGE_BPS, // Higher slippage for small test sell
+        ...(signer ? { signer } : {}),
       });
 
       if (!swap.success) {

@@ -17,6 +17,29 @@ interface TraderConfigModalProps {
   onClose: () => void;
 }
 
+type TokenAgeUnit = "seconds" | "minutes" | "hours";
+const UNIT_TO_SECONDS: Record<TokenAgeUnit, number> = {
+  seconds: 1,
+  minutes: 60,
+  hours: 3600,
+};
+
+// Pick the largest unit that divides the stored seconds value evenly, so a
+// value someone entered as "2 hours" still shows as "2 hours" (not "7200
+// seconds") next time they open this modal.
+function secondsToValueUnit(totalSeconds: number): {
+  value: number;
+  unit: TokenAgeUnit;
+} {
+  if (totalSeconds > 0 && totalSeconds % 3600 === 0) {
+    return { value: totalSeconds / 3600, unit: "hours" };
+  }
+  if (totalSeconds > 0 && totalSeconds % 60 === 0) {
+    return { value: totalSeconds / 60, unit: "minutes" };
+  }
+  return { value: totalSeconds, unit: "seconds" };
+}
+
 export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
   const { config, updateGlobalSettings, loading } = useTraderConfig();
   const solPriceUsd = useSolPrice();
@@ -26,30 +49,87 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
     maxMarketCapSol: 1000000,
     takeProfitPct: 10,
     stopLossPct: 2,
-    maxTokenAgeHours: 24,
+    maxTokenAgeValue: 24,
+    maxTokenAgeUnit: "hours" as TokenAgeUnit,
+    minSecondsSinceLaunch: 10,
+    maxSecondsSinceLaunch: 60,
     minTokenScore: 30,
     autoTradeEnabled: false,
     maxTradeAmountSol: 1,
+    // "" means unlimited (cleared/never set) — distinct from 0, which would
+    // read as "take zero trades" rather than "no cap".
+    maxTotalTrades: "" as number | "",
   });
 
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (config?.globalSettings) {
+      const g = config.globalSettings;
+      // Prefer the new normalized field; fall back to the pre-unit-selector
+      // hours-only field for configs saved before this change existed.
+      const totalSeconds =
+        g.maxTokenAgeSeconds ?? (g.maxTokenAgeHours ?? 24) * 3600;
+      const { value, unit } = secondsToValueUnit(totalSeconds);
+
       setFormData({
-        minMarketCapSol: config.globalSettings.minMarketCapSol ?? 5,
-        maxMarketCapSol: config.globalSettings.maxMarketCapSol ?? 1000000,
-        takeProfitPct: (config.globalSettings.takeProfitPct ?? 0.1) * 100,
-        stopLossPct: (config.globalSettings.stopLossPct ?? 0.02) * 100,
-        maxTokenAgeHours: config.globalSettings.maxTokenAgeHours ?? 24,
-        minTokenScore: config.globalSettings.minTokenScore ?? 30,
-        autoTradeEnabled: config.globalSettings.autoTradeEnabled ?? false,
-        maxTradeAmountSol: config.globalSettings.maxTradeAmountSol ?? 1,
+        minMarketCapSol: g.minMarketCapSol ?? 5,
+        maxMarketCapSol: g.maxMarketCapSol ?? 1000000,
+        takeProfitPct: (g.takeProfitPct ?? 0.1) * 100,
+        stopLossPct: (g.stopLossPct ?? 0.02) * 100,
+        maxTokenAgeValue: value,
+        maxTokenAgeUnit: unit,
+        minSecondsSinceLaunch: g.minSecondsSinceLaunch ?? 10,
+        maxSecondsSinceLaunch: g.maxSecondsSinceLaunch ?? 60,
+        minTokenScore: g.minTokenScore ?? 30,
+        autoTradeEnabled: g.autoTradeEnabled ?? false,
+        maxTradeAmountSol: g.maxTradeAmountSol ?? 1,
+        maxTotalTrades: g.maxTotalTrades ?? "",
       });
     }
   }, [config]);
 
+  // Empty/zero/negative/non-finite all block Save rather than silently
+  // sending something that would either reject every token or accept all of
+  // them unexpectedly.
+  const maxTokenAgeSeconds =
+    formData.maxTokenAgeValue * UNIT_TO_SECONDS[formData.maxTokenAgeUnit];
+  const maxTokenAgeError =
+    !Number.isFinite(maxTokenAgeSeconds) || maxTokenAgeSeconds <= 0
+      ? "Enter a positive number"
+      : maxTokenAgeSeconds > 30 * 24 * 3600
+      ? "Must be 30 days or less"
+      : null;
+
+  // Same fail-closed reasoning as Max Token Age: empty/negative/inverted
+  // values here would either reject every token or accept all of them.
+  const launchWindowError =
+    !Number.isFinite(formData.minSecondsSinceLaunch) ||
+    formData.minSecondsSinceLaunch < 0 ||
+    !Number.isFinite(formData.maxSecondsSinceLaunch) ||
+    formData.maxSecondsSinceLaunch <= 0
+      ? "Enter non-negative numbers"
+      : formData.minSecondsSinceLaunch > formData.maxSecondsSinceLaunch
+      ? "Min cannot exceed max"
+      : formData.maxSecondsSinceLaunch > 30 * 24 * 3600
+      ? "Must be 30 days or less"
+      : null;
+
+  // Blank ("") means unlimited and is always valid — only a filled-in value
+  // needs to be a real positive whole number.
+  const maxTotalTradesError =
+    formData.maxTotalTrades === ""
+      ? null
+      : !Number.isFinite(formData.maxTotalTrades) ||
+        !Number.isInteger(formData.maxTotalTrades) ||
+        formData.maxTotalTrades <= 0
+      ? "Enter a positive whole number, or leave blank for unlimited"
+      : formData.maxTotalTrades > 100000
+      ? "Must be 100000 or less"
+      : null;
+
   const handleSave = async () => {
+    if (maxTokenAgeError || launchWindowError || maxTotalTradesError) return;
     setSaving(true);
     try {
       await updateGlobalSettings({
@@ -57,10 +137,14 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
         maxMarketCapSol: formData.maxMarketCapSol,
         takeProfitPct: formData.takeProfitPct / 100,
         stopLossPct: formData.stopLossPct / 100,
-        maxTokenAgeHours: formData.maxTokenAgeHours,
+        maxTokenAgeSeconds,
+        minSecondsSinceLaunch: formData.minSecondsSinceLaunch,
+        maxSecondsSinceLaunch: formData.maxSecondsSinceLaunch,
         minTokenScore: formData.minTokenScore,
         autoTradeEnabled: formData.autoTradeEnabled,
         maxTradeAmountSol: formData.maxTradeAmountSol,
+        maxTotalTrades:
+          formData.maxTotalTrades === "" ? null : formData.maxTotalTrades,
       });
       onClose();
     } catch (err) {
@@ -223,21 +307,91 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Max Token Age (hours)
+                  Max Token Age
                 </label>
-                <input
-                  type="number"
-                  value={formData.maxTokenAgeHours}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      maxTokenAgeHours: Number(e.target.value),
-                    })
-                  }
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
-                  min="1"
-                  step="1"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="number"
+                    value={formData.maxTokenAgeValue}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        maxTokenAgeValue: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                    min="0"
+                    step="any"
+                  />
+                  <select
+                    value={formData.maxTokenAgeUnit}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        maxTokenAgeUnit: e.target.value as TokenAgeUnit,
+                      })
+                    }
+                    className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-blue-500"
+                  >
+                    <option value="seconds">Seconds</option>
+                    <option value="minutes">Minutes</option>
+                    <option value="hours">Hours</option>
+                  </select>
+                </div>
+                {maxTokenAgeError ? (
+                  <p className="text-xs text-red-500 mt-1">{maxTokenAgeError}</p>
+                ) : (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Only tokens {formData.maxTokenAgeValue}{" "}
+                    {formData.maxTokenAgeUnit} old or newer are considered
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Launch Window (seconds since launch)
+                </label>
+                <div className="flex gap-2 items-center">
+                  <input
+                    type="number"
+                    value={formData.minSecondsSinceLaunch}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        minSecondsSinceLaunch: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                    min="0"
+                    step="1"
+                    placeholder="Min"
+                  />
+                  <span className="text-gray-500">to</span>
+                  <input
+                    type="number"
+                    value={formData.maxSecondsSinceLaunch}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        maxSecondsSinceLaunch: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                    min="0"
+                    step="1"
+                    placeholder="Max"
+                  />
+                </div>
+                {launchWindowError ? (
+                  <p className="text-xs text-red-500 mt-1">{launchWindowError}</p>
+                ) : (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Only buy tokens between {formData.minSecondsSinceLaunch}s
+                    and {formData.maxSecondsSinceLaunch}s after their pool was
+                    created
+                  </p>
+                )}
               </div>
 
               <div>
@@ -279,6 +433,45 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
                 />
               </div>
 
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Max Total Trades
+                </label>
+                <input
+                  type="number"
+                  value={formData.maxTotalTrades}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      maxTotalTrades:
+                        e.target.value === "" ? "" : Number(e.target.value),
+                    })
+                  }
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                  min="1"
+                  step="1"
+                  placeholder="Unlimited"
+                />
+                {maxTotalTradesError ? (
+                  <p className="text-xs text-red-500 mt-1">
+                    {maxTotalTradesError}
+                  </p>
+                ) : (
+                  <p className="text-xs text-gray-500 mt-1">
+                    {config?.tradesTaken != null
+                      ? `${config.tradesTaken} trade${
+                          config.tradesTaken === 1 ? "" : "s"
+                        } taken so far. `
+                      : ""}
+                    {formData.maxTotalTrades === ""
+                      ? "The bot trades for you with no lifetime limit."
+                      : `The bot stops trading for you after ${formData.maxTotalTrades} total trade${
+                          formData.maxTotalTrades === 1 ? "" : "s"
+                        } — raise this number to continue.`}
+                  </p>
+                )}
+              </div>
+
               <div className="flex items-center">
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
@@ -316,7 +509,13 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
             </button>
             <button
               onClick={handleSave}
-              disabled={saving || loading}
+              disabled={
+                saving ||
+                loading ||
+                !!maxTokenAgeError ||
+                !!launchWindowError ||
+                !!maxTotalTradesError
+              }
               className="px-6 py-2 bg-primary hover:bg-primary-hover text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {saving ? "Saving..." : "Save Settings"}

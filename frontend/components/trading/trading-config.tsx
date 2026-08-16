@@ -28,14 +28,18 @@ export const TradingConfigPanel = () => {
     loadConfigFromAPI,
   } = useTradingConfigStore();
 
-  const { publicKey } = useSolanaWallet();
+  const { publicKey, signMessage } = useSolanaWallet();
 
   // Local config first (fast, always available), then reconcile with this
   // wallet's cloud-saved settings once it's connected — cloud wins for a
   // returning wallet since that's the source of truth across devices.
+  // Re-runs on every wallet change (not just mount) — otherwise switching
+  // from Wallet A to Wallet B in the same browser session would leave A's
+  // values in the live store until/unless B happens to have cloud-saved
+  // settings that overwrite every field.
   useEffect(() => {
-    loadConfig?.();
-  }, [loadConfig]);
+    loadConfig?.(publicKey?.toString());
+  }, [publicKey, loadConfig]);
 
   useEffect(() => {
     if (publicKey) {
@@ -45,9 +49,9 @@ export const TradingConfigPanel = () => {
 
   const handleSave = async () => {
     try {
-      saveConfig?.();
+      saveConfig?.(publicKey?.toString());
       if (publicKey) {
-        await syncConfig?.(publicKey.toString());
+        await syncConfig?.(publicKey.toString(), signMessage);
         toast.success("✅ Configuration saved & synced successfully!");
       } else {
         toast.success("✅ Configuration saved locally.");

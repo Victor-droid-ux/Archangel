@@ -3,6 +3,7 @@
 
 import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
+import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
 import { fetcher, formatNumber } from "@lib/utils";
 import { useSocket } from "@hooks/useSocket";
@@ -40,11 +41,24 @@ export const PositionsPanel: React.FC = () => {
   const [expanded, setExpanded] = useState<string | null>(null);
   const { lastMessage, connected } = useSocket();
   const { allTrailingData } = useTrailingStop();
+  const { publicKey } = useSolanaWallet();
+
+  // Clear the instant the connected wallet changes, before the re-fetch
+  // below even starts — otherwise the previous wallet's positions stay on
+  // screen for the round-trip it takes to load the new wallet's own.
+  useEffect(() => {
+    setPositions([]);
+  }, [publicKey]);
 
   const loadPositions = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetcher("/api/positions");
+      // Scoped to the connected wallet — the bot's own positions plus this
+      // wallet's own, never another wallet's (see positions.route.ts).
+      const walletParam = publicKey
+        ? `?wallet=${encodeURIComponent(publicKey.toString())}`
+        : "";
+      const data = await fetcher(`/api/positions${walletParam}`);
       if (data?.positions) {
         setPositions(data.positions);
       }
@@ -53,7 +67,7 @@ export const PositionsPanel: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [publicKey]);
 
   useEffect(() => {
     loadPositions();

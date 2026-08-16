@@ -3,9 +3,10 @@ import { Server as SocketIOServer } from "socket.io";
 import { getLogger } from "../utils/logger.js";
 import dbService from "./db.service.js";
 import { validateJupiterToken } from "./jupiterTokenValidator.service.js";
-import validationPipelineService from "./validationPipeline.service.js";
+import multiUserExecutionService from "./multiUserExecution.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
 import { TokenLifecycleState } from "./db.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 
 const LOG = getLogger("stored-token-checker");
 
@@ -267,44 +268,53 @@ class StoredTokenChecker {
           }...`
         );
 
-        // Use runPipeline like jupiterDiscovery does
-        const pipelineResult = await validationPipelineService.runPipeline(
+        // Fans out across the operator wallet plus every eligible funded,
+        // auto-trade-enabled user wallet, same as jupiterDiscovery.service.ts.
+        // See multiUserExecution.service.ts.
+        const fanOutResults = await multiUserExecutionService.runPipelineForAllEligibleWallets(
           token.mint,
           validation.details.liquiditySol
         );
 
-        if (!pipelineResult.success) {
-          LOG.debug(
-            {
-              failedStage: pipelineResult.failedStage,
-              reason: pipelineResult.reason,
-            },
-            `Pipeline failed for ${token.symbol || "Unknown"}`
+        let anySucceeded = false;
+        for (const { ownerWallet, result: pipelineResult } of fanOutResults) {
+          if (!pipelineResult.success) {
+            LOG.debug(
+              {
+                wallet: ownerWallet,
+                failedStage: pipelineResult.failedStage,
+                reason: pipelineResult.reason,
+              },
+              `Pipeline failed for ${token.symbol || "Unknown"}`
+            );
+            continue;
+          }
+
+          anySucceeded = true;
+          LOG.info(
+            { wallet: ownerWallet },
+            `✅ ${token.symbol || "Unknown"} passed full pipeline!`
           );
-          return false;
-        }
 
-        LOG.info(`✅ ${token.symbol || "Unknown"} passed full pipeline!`);
+          // Same as jupiterDiscovery.service.ts's buy path — without this,
+          // positions bought through this pipeline never get live P&L tracking
+          // (pnlTracker.service.ts only ever heard about the other path's buys).
+          if (pipelineResult.executionResult) {
+            pnlTrackerService.startTracking({
+              tokenMint: token.mint,
+              entryPrice: pipelineResult.executionResult.actualPrice || 0,
+              amount: pipelineResult.executionResult.tokensReceived || 0,
+              wallet: ownerWallet,
+              entryTime: Date.now(),
+            });
+          }
 
-        // Same as jupiterDiscovery.service.ts's buy path — without this,
-        // positions bought through this pipeline never get live P&L tracking
-        // (pnlTracker.service.ts only ever heard about the other path's buys).
-        if (pipelineResult.executionResult) {
-          pnlTrackerService.startTracking({
-            tokenMint: token.mint,
-            entryPrice: pipelineResult.executionResult.actualPrice || 0,
-            amount: pipelineResult.executionResult.tokensReceived || 0,
-            wallet: process.env.WALLET_PUBLIC_KEY || "",
-            entryTime: Date.now(),
-          });
-        }
-
-        // Live Feed / Trade History only render off "tradeFeed" — without
-        // this, buys executed here never showed up on the dashboard.
-        if (this.io) {
-          this.io.emit("tradeFeed", {
+          // Live Feed / Trade History only render off "tradeFeed" — without
+          // this, buys executed here never showed up on the dashboard.
+          emitToWalletOrGlobal(this.io, ownerWallet, "tradeFeed", {
             type: "buy",
             token: token.mint,
+            wallet: ownerWallet,
             amount: Math.round(
               (pipelineResult.executionResult?.amountSol ?? 0) * 1e9
             ),
@@ -317,6 +327,8 @@ class StoredTokenChecker {
             route: "jupiter",
           });
         }
+
+        if (!anySucceeded) return false;
       }
 
       return true;

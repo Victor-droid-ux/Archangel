@@ -6,9 +6,16 @@ import { getLogger } from "../utils/logger.js";
 const router = Router();
 const log = getLogger("positions.route");
 
-router.get("/", async (_, res) => {
+router.get("/", async (req, res) => {
   try {
-    const positions = await dbService.getPositions();
+    // No wallet query param (no wallet connected on the frontend) must still
+    // resolve to a specific, restricted view — the operator's own public
+    // positions — never the unrestricted {} that dbService.getPositions()
+    // returns for internal engine callers, which would hand every user's
+    // private positions to an unauthenticated request.
+    const wallet =
+      (req.query.wallet as string | undefined) || dbService.OPERATOR_WALLET;
+    const positions = await dbService.getPositions(wallet);
     if (!positions.length) {
       return res.json({ success: true, positions: [] });
     }

@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { toast } from "react-hot-toast";
 import { useStats } from "@hooks/useStats";
 import { useSocket } from "@hooks/useSocket";
@@ -16,19 +17,36 @@ import { fetcher } from "@lib/utils";
 export const useStatsSync = () => {
   const { updateStats, setLoading } = useStats();
   const { lastMessage } = useSocket();
+  const { publicKey } = useSolanaWallet();
 
-  // 0️⃣ One-time backfill of recent real trades — the trade history/live
-  // feed are otherwise purely socket-event-driven, so a freshly-loaded
-  // dashboard shows nothing for trades/positions that happened before the
-  // page was opened (e.g. positions the bot already held on page load).
+  // Clear on-screen numbers the instant the connected wallet changes, before
+  // either fetch below even starts — otherwise the previous wallet's stats/
+  // trade history stay visible for the round-trip it takes to load the new
+  // wallet's own (correctly-scoped, never actually leaked — just stale UI).
+  // React runs effects in declaration order, so this always fires first.
+  useEffect(() => {
+    useStats.getState().reset();
+  }, [publicKey]);
+
+  // 0️⃣ Backfill of recent real trades, scoped to the connected wallet (bot's
+  // own trades + this wallet's own — never another wallet's manual trades).
+  // Re-runs on wallet change. The trade history/live feed are otherwise
+  // purely socket-event-driven, so a freshly-loaded dashboard shows nothing
+  // for trades/positions that happened before the page was opened.
   useEffect(() => {
     let mounted = true;
+    const walletParam = publicKey
+      ? `&wallet=${encodeURIComponent(publicKey.toString())}`
+      : "";
     (async () => {
       try {
         const res = await fetcher<{ success: boolean; trades: any[] }>(
-          "/api/trade/history?limit=100"
+          `/api/trade/history?limit=100${walletParam}`
         );
         if (!mounted || !res?.success || !Array.isArray(res.trades)) return;
+        // No need to clear here — the reset effect above already cleared
+        // tradeHistory the instant publicKey changed, before this fetch
+        // even started.
         const historical = res.trades.map((t) => ({
           id: t.id,
           type: t.type as "buy" | "sell",
@@ -54,13 +72,19 @@ export const useStatsSync = () => {
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [publicKey]);
 
-  // 1️⃣ Poll backend periodically
+  // 1️⃣ Poll backend periodically — scoped to the connected wallet, same as
+  // the trade-history backfill above. Without this, Portfolio Value/Total
+  // Profit/Open Trades/Win Rate showed the bot's global numbers to every
+  // viewer regardless of which wallet they had connected.
   useEffect(() => {
+    const walletParam = publicKey
+      ? `?wallet=${encodeURIComponent(publicKey.toString())}`
+      : "";
     const fetchStats = async () => {
       try {
-        const data = await fetcher("/api/stats");
+        const data = await fetcher(`/api/stats${walletParam}`);
 
         updateStats((prev) => ({
           portfolioValue: Number(data.portfolioValue ?? prev.portfolioValue),
@@ -85,12 +109,18 @@ export const useStatsSync = () => {
     fetchStats();
     const interval = setInterval(fetchStats, 10000);
     return () => clearInterval(interval);
-  }, [updateStats, setLoading]);
+  }, [updateStats, setLoading, publicKey]);
 
-  // 2️⃣ Live updates from socket
+  // 2️⃣ Live updates from socket — this broadcast is always the bot's own
+  // global numbers (see stats.route.ts/socket.route.ts, unscoped by wallet),
+  // so applying it while a specific wallet is connected would overwrite
+  // that wallet's own correctly-scoped numbers with the operator's. Only
+  // apply it when no wallet is connected; the scoped poll above keeps a
+  // connected wallet's numbers fresh instead.
   useEffect(() => {
     if (!lastMessage) return;
     if (lastMessage.event !== "stats:update") return;
+    if (publicKey) return;
 
     const s = lastMessage.payload;
     if (!s) return;
@@ -105,5 +135,5 @@ export const useStatsSync = () => {
       tradeVolumeSol: Number(s.tradeVolumeSol ?? prev.tradeVolumeSol),
       winRate: Number(s.winRate ?? prev.winRate),
     }));
-  }, [lastMessage, updateStats]);
+  }, [lastMessage, updateStats, publicKey]);
 };

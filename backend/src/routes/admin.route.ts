@@ -4,7 +4,12 @@ import dbService from "../services/db.service.js";
 import { executeJupiterSwap } from "../services/jupiter.service.js";
 import notify from "../services/notifications/notify.service.js";
 import pnlTrackerService from "../services/pnlTracker.service.js";
+import userWalletService from "../services/userWallet.service.js";
+import { loadKeypairFromEnv } from "../services/solana.service.js";
 import { getLogger } from "../utils/logger.js";
+
+const OPERATOR_WALLET =
+  process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
 
 const router = express.Router();
 const log = getLogger("admin.route");
@@ -22,13 +27,26 @@ router.post("/force-sell", async (req, res) => {
         .status(400)
         .json({ success: false, message: "token required" });
 
-    // compute amount lamports (default: everything)
+    // compute amount lamports (default: everything). Positions are no
+    // longer unique per token — different wallets can independently hold
+    // the same token — so an explicit wallet is required to disambiguate
+    // which one to sell, unless there's only a single position for it.
     const positions = await dbService.getPositions();
-    const p = positions.find((x: any) => x.token === token);
-    if (!p)
-      return res
-        .status(404)
-        .json({ success: false, message: "position not found" });
+    const matches = positions.filter((x: any) => x.token === token);
+    const p = wallet
+      ? matches.find((x: any) => x.wallet === wallet)
+      : matches.length === 1
+      ? matches[0]
+      : undefined;
+    if (!p) {
+      return res.status(matches.length > 1 ? 400 : 404).json({
+        success: false,
+        message:
+          matches.length > 1
+            ? "Multiple wallets hold this token — specify wallet to disambiguate"
+            : "position not found",
+      });
+    }
 
     const amountToSell = amountSol ?? p.netSol;
     const amountLamports = Math.floor(amountToSell * 1e9);
@@ -37,12 +55,27 @@ router.post("/force-sell", async (req, res) => {
     // token should stop rather than keep polling a position we no longer hold.
     const isFullClose = amountSol === undefined;
 
+    // The position's own owner wallet is authoritative for which keypair
+    // can actually sign this — not the caller-supplied `wallet`, which is
+    // now only used above to disambiguate which position was meant.
+    const signer =
+      p.wallet === OPERATOR_WALLET
+        ? loadKeypairFromEnv()
+        : await userWalletService.getUserWalletKeypair(p.wallet);
+    if (!signer) {
+      return res.status(400).json({
+        success: false,
+        message: `No signer available for wallet ${p.wallet}`,
+      });
+    }
+
     const result = await executeJupiterSwap({
       inputMint: token, // token is the mint address
       outputMint: "So11111111111111111111111111111111111111112",
       amount: amountLamports,
-      userPublicKey: wallet ?? process.env.ADMIN_WALLET_PUBKEY ?? "",
+      userPublicKey: signer.publicKey.toBase58(),
       slippageBps: Number(process.env.ADMIN_FORCE_SLIPPAGE || 1) * 100,
+      signer,
     });
 
     // insert sell trade record
@@ -54,14 +87,14 @@ router.post("/force-sell", async (req, res) => {
       amount: amountLamports,
       price: p.avgBuyPrice ?? 0,
       pnl: 0,
-      wallet: wallet ?? process.env.ADMIN_WALLET_PUBKEY ?? "admin",
+      wallet: p.wallet,
       simulated: !result.success,
       signature: result.success ? result.signature ?? null : null,
       timestamp: new Date(),
     });
 
     if (isFullClose && result.success) {
-      pnlTrackerService.stopTracking(token);
+      pnlTrackerService.stopTracking(token, p.wallet);
     }
 
     // Only include defined optional properties

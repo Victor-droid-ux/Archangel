@@ -132,7 +132,7 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
   const config = getRuntimeConfig();
 
   log.info(
-    `Starting token watcher (Jupiter recent-tokens feed) intervalMs=${intervalMs} MAX_AGE=${config.maxTokenAgeHours}h MIN_SCORE=${config.minTokenScore}`
+    `Starting token watcher (Jupiter recent-tokens feed) intervalMs=${intervalMs} MIN_SCORE=${config.minTokenScore}`
   );
 
   const tick = async () => {
@@ -147,17 +147,16 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
 
       const runtimeConfig = getRuntimeConfig();
 
+      // No age filtering here anymore — Max Token Age and Launch Window are
+      // now each wallet's own setting (see traderConfig.service.ts's
+      // getEffectiveMaxTokenAgeSeconds/getEffectiveLaunchWindowSeconds),
+      // evaluated per-wallet in autoBuyer.service.ts's fan-out loop. Filtering
+      // by a single value here would mean one wallet's setting decides
+      // whether ANY wallet even gets a chance to see/buy a token.
       const filtered = tokens.filter((t) => {
         if (!t.mint || !t.symbol) return false;
         if (EXCLUDED_TOKENS.has(t.mint)) return false;
         if (/(USDC|USDT|USD|DAI|BUSD|TUSD|USDH|USDS)/i.test(t.symbol)) return false;
-
-        const ageHours = getTokenAgeHours(t.firstPoolCreatedAt);
-        const isNotTooOld = !ageHours || ageHours <= runtimeConfig.maxTokenAgeHours;
-        if (!isNotTooOld) {
-          log.debug(`Filtered out: ${t.symbol} - too old (${ageHours?.toFixed(1)}h)`);
-          return false;
-        }
         return true;
       });
 

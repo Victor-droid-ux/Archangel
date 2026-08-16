@@ -20,8 +20,13 @@ export function startPnLBroadcaster(
 
   const broadcastPnL = async () => {
     try {
-      // Fetch portfolio P&L
-      const portfolioPnL = await dbService.getPortfolioPnL();
+      // No specific viewer here — this is a broadcast to every connected
+      // socket, so it must show the operator's own P&L (its intentionally
+      // public activity), never every custodial user's private P&L blended
+      // together (see db.service.ts's viewerWalletFilter).
+      const portfolioPnL = await dbService.getPortfolioPnL(
+        dbService.OPERATOR_WALLET
+      );
 
       // Broadcast to all connected clients. Distinct event name from
       // pnlTracker.service.ts's "pnl:update" — that one is a per-token,

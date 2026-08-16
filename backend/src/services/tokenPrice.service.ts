@@ -19,6 +19,11 @@ export type TokenInfo = {
   priceChange24h?: number | null | undefined;
   circulatingSupply?: number | null | undefined;
   totalSupply?: number | null | undefined;
+  // Set once, the first time this mint is ever tracked — never touched by
+  // later updates. This is what "newest first" ordering sorts on; insertion
+  // order into the Map isn't reliable for that once entries get merged/
+  // updated over time (and wasn't being sorted on at all before this).
+  discoveredAt: number;
 };
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -26,8 +31,8 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 let trackedTokens: TokenInfo[] = [
   // Start with SOL & USDC — expand later automatically
-  { mint: SOL_MINT, symbol: "SOL" },
-  { mint: USDC_MINT, symbol: "USDC" },
+  { mint: SOL_MINT, symbol: "SOL", discoveredAt: 0 },
+  { mint: USDC_MINT, symbol: "USDC", discoveredAt: 0 },
 ];
 
 let priceCache = new Map<string, TokenInfo>();
@@ -74,8 +79,9 @@ export function addTrackedToken(
   data?: Partial<TokenInfo>
 ) {
   const existingIndex = trackedTokens.findIndex((t) => t.mint === mint);
+  const discoveredAt = priceCache.get(mint)?.discoveredAt ?? Date.now();
   if (existingIndex === -1) {
-    trackedTokens.push({ mint, symbol });
+    trackedTokens.push({ mint, symbol, discoveredAt });
     log.info(
       { mint: mint.slice(0, 8), symbol, total: trackedTokens.length },
       "✅ Token added to tracked list"
@@ -85,6 +91,7 @@ export function addTrackedToken(
 
   const merged: TokenInfo = {
     mint,
+    discoveredAt,
     symbol: data?.symbol || symbol || priceCache.get(mint)?.symbol || "NEW",
     name: data?.name ?? priceCache.get(mint)?.name ?? "New Token",
     decimals: data?.decimals ?? priceCache.get(mint)?.decimals ?? 9,
@@ -113,7 +120,10 @@ export function addTrackedToken(
 }
 
 export function getLatestTokens(): TokenInfo[] {
-  const tokens = Array.from(priceCache.values());
+  // Newest-discovered first — see TokenInfo.discoveredAt.
+  const tokens = Array.from(priceCache.values()).sort(
+    (a, b) => b.discoveredAt - a.discoveredAt
+  );
   log.debug({ count: tokens.length }, "Returning tracked tokens");
   return tokens;
 }
@@ -168,6 +178,8 @@ async function refresh(io?: SocketIOServer) {
           symbol: existing?.symbol ?? trackedMeta?.symbol ?? "???",
           name: existing?.name ?? "Token",
           decimals: existing?.decimals ?? 9,
+          discoveredAt:
+            existing?.discoveredAt ?? trackedMeta?.discoveredAt ?? Date.now(),
           ...existing,
           ...partial,
         });

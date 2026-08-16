@@ -9,11 +9,31 @@ import {
   hasSufficientBalance,
   getConnection,
   getBalanceInSol,
+  loadKeypairFromEnv,
 } from "./solana.service.js";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, Keypair } from "@solana/web3.js";
 import dbService from "./db.service.js";
 import { canExecuteTrade } from "./riskManagement.service.js";
 import { ENV } from "../utils/env.js";
+
+/**
+ * Identifies which wallet a pipeline run buys/sells for — the custodial
+ * hot wallet belonging to a specific connected user, not always the single
+ * admin wallet. ownerWallet is the *connected* (Phantom/Solflare) wallet
+ * this hot wallet belongs to, used for risk/settings lookups; publicKey and
+ * keypair are the hot wallet that actually holds funds and signs.
+ */
+export interface WalletContext {
+  ownerWallet: string;
+  publicKey: string;
+  keypair: Keypair;
+}
+
+function defaultWalletContext(): WalletContext {
+  const keypair = loadKeypairFromEnv();
+  const publicKey = keypair.publicKey.toBase58();
+  return { ownerWallet: publicKey, publicKey, keypair };
+}
 
 const LOG = getLogger("validation-pipeline");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -84,13 +104,18 @@ class ValidationPipelineService {
   /**
    * Run the complete 8-stage validation pipeline
    */
-  async runPipeline(tokenMint: string, lpSol: number): Promise<PipelineResult> {
+  async runPipeline(
+    tokenMint: string,
+    lpSol: number,
+    walletContext: WalletContext = defaultWalletContext()
+  ): Promise<PipelineResult> {
     LOG.info(
+      { wallet: walletContext.ownerWallet },
       `🚀 Starting 8-stage validation pipeline for ${tokenMint.slice(0, 8)}...`
     );
 
     const results: ValidationResult[] = [];
-    const wallet = process.env.WALLET_PUBLIC_KEY || "";
+    const wallet = walletContext.publicKey;
 
     // Stage 0: POSITION SIZING + RISK MANAGEMENT CHECK
     // Size the trade as a percentage of live wallet balance (AUTO_TRADE_PERCENT_OF_BALANCE,
@@ -216,7 +241,11 @@ class ValidationPipelineService {
     }
 
     // Stage 5: JUPITER PRE-EXECUTION CHECK
-    const stage5 = await this.stage5_jupiterPreExecution(tokenMint, buySol);
+    const stage5 = await this.stage5_jupiterPreExecution(
+      tokenMint,
+      buySol,
+      wallet
+    );
     results.push(stage5);
     if (!stage5.passed) {
       await this.logFailure(
@@ -234,7 +263,7 @@ class ValidationPipelineService {
     }
 
     // Stage 6: JUPITER EXECUTION (BUY)
-    const stage6 = await this.stage6_jupiterBuy(tokenMint, buySol);
+    const stage6 = await this.stage6_jupiterBuy(tokenMint, buySol, walletContext);
     results.push(stage6);
     if (!stage6.passed) {
       await this.logFailure(
@@ -513,7 +542,8 @@ class ValidationPipelineService {
    */
   private async stage5_jupiterPreExecution(
     tokenMint: string,
-    buySol: number
+    buySol: number,
+    wallet: string
   ): Promise<ValidationResult> {
     LOG.info(
       `[Stage 5] 🔍 Jupiter Pre-Execution Check for ${tokenMint.slice(0, 8)}...`
@@ -521,7 +551,6 @@ class ValidationPipelineService {
 
     try {
       const lamports = Math.floor(buySol * 1e9);
-      const wallet = process.env.WALLET_PUBLIC_KEY || "";
 
       const quote = await getJupiterQuote(
         SOL_MINT,
@@ -584,15 +613,16 @@ class ValidationPipelineService {
    */
   private async stage6_jupiterBuy(
     tokenMint: string,
-    buySol: number
+    buySol: number,
+    walletContext: WalletContext
   ): Promise<ValidationResult> {
+    const wallet = walletContext.publicKey;
     LOG.info(
       `[Stage 6] 🚀 Jupiter Buy Execution for ${tokenMint.slice(0, 8)}...`
     );
 
     try {
       const lamports = Math.floor(buySol * 1e9);
-      const wallet = process.env.WALLET_PUBLIC_KEY || "";
 
       const quote = await getJupiterQuote(
         SOL_MINT,
@@ -618,6 +648,7 @@ class ValidationPipelineService {
             amount: lamports,
             userPublicKey: wallet,
             slippageBps: this.AUTO_BUY_SLIPPAGE_BPS,
+            signer: walletContext.keypair,
           })
         : {
             success: true as const,
@@ -675,7 +706,10 @@ class ValidationPipelineService {
         amountSol: buySol,
       };
 
-      // Store trade in database
+      // Store trade in database under the OWNER's wallet (the address a
+      // dashboard viewer actually recognizes and queries by), not the
+      // generated hot-wallet address that signed it — see db.service.ts's
+      // viewerWalletFilter(), which matches trades on this field.
       await dbService.addTrade({
         type: "buy",
         token: tokenMint,
@@ -684,7 +718,7 @@ class ValidationPipelineService {
         amount: lamports,
         price: actualPrice,
         pnl: 0,
-        wallet,
+        wallet: walletContext.ownerWallet,
         simulated: !useReal,
         signature: swapResult.signature || "",
         route: "jupiter",

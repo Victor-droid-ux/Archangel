@@ -29,7 +29,18 @@ const router = express.Router();
 router.get("/history", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 50, 200);
-    const trades = await db.getTrades(limit, false);
+    // Optional — when provided, restricts results to just that wallet's own
+    // trades. Read access to your own trade history doesn't warrant the same
+    // signature check as a settings change; the wallet address itself isn't
+    // secret. When omitted (no wallet connected), this must still resolve to
+    // a specific, restricted view — the operator's own public trades — never
+    // db.getTrades()'s unrestricted {} scan, which is reserved for trusted
+    // internal engine callers and would hand every user's private trade
+    // history to an unauthenticated request.
+    const wallet =
+      (typeof req.query.wallet === "string" ? req.query.wallet : undefined) ||
+      db.OPERATOR_WALLET;
+    const trades = await db.getTrades(limit, false, wallet);
     return res.json({ success: true, trades });
   } catch (err: any) {
     logger.error("❌ Failed to load trade history:", err.message);
@@ -362,6 +373,25 @@ router.post("/confirm", async (req, res) => {
       );
     }
 
+    // Do not trust req.body.wallet — it's an unverified client claim, and
+    // this is the exact place a caller could otherwise attribute a trade to
+    // someone else's wallet. The transaction just landed on-chain, which
+    // only happens if its fee-payer's signature verified against the fee
+    // payer's own key (enforced by the Solana runtime itself), so the fee
+    // payer IS the real, cryptographically-proven signer.
+    const actualSigner = versionedTx.message.staticAccountKeys[0]?.toBase58();
+    if (wallet && actualSigner && wallet !== actualSigner) {
+      logger.warn(
+        `Client-claimed wallet ${String(wallet).slice(
+          0,
+          8
+        )}... does not match the transaction's actual signer ${actualSigner.slice(
+          0,
+          8
+        )}... — using the verified signer`
+      );
+    }
+
     // Real price (SOL per token) from a fresh same-direction quote — this used to
     // be Math.random(), which fabricated the recorded price/PnL for every trade
     // regardless of whether it succeeded. This is still a post-trade estimate
@@ -404,15 +434,22 @@ router.post("/confirm", async (req, res) => {
       amount: amountLamports,
       price,
       pnl,
-      wallet: wallet || "unknown",
+      wallet: actualSigner || wallet || "unknown",
       simulated: false,
       signature,
       timestamp: new Date(),
     });
 
-    // Broadcast via socket
+    // Targeted to the signer's own wallet room, not a global broadcast —
+    // a manual trade is that wallet's own private activity, not the bot's
+    // public activity (see tradeFeed emits elsewhere, which stay global —
+    // those are the shared bot's own trades, which everyone is meant to see).
     const io = (req.app as any)?.get?.("io") ?? (req.app as any)?.locals?.io;
-    io?.emit?.("tradeFeed", trade);
+    if (io && actualSigner) {
+      io.to(actualSigner).emit("tradeFeed", trade);
+    } else {
+      io?.emit?.("tradeFeed", trade);
+    }
 
     logger.info(`Confirmed ${type} trade (Jupiter): ${signature}`);
 

@@ -9,9 +9,10 @@ const router = express.Router();
    GET /api/stats
    Returns REAL dashboard stats from MongoDB
 ---------------------------------------------------- */
-router.get("/", async (_req, res) => {
+router.get("/", async (req, res) => {
   try {
-    const stats = await dbService.getStats();
+    const wallet = req.query.wallet as string | undefined;
+    const stats = await dbService.getStats(wallet);
 
     return res.json({
       success: true,

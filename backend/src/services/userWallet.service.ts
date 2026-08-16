@@ -1,0 +1,217 @@
+// backend/src/services/userWallet.service.ts
+//
+// Phase 1 of per-user custodial trading: generates and stores a dedicated
+// hot-wallet keypair for each connected "owner" wallet (the wallet a user
+// actually connects via Phantom/Solflare in the browser). The bot will
+// trade using these generated wallets — funded by the owner depositing SOL
+// into them — rather than the single shared ADMIN_WALLET_SECRET. Private
+// keys are encrypted at rest (see utils/walletEncryption.ts); nothing here
+// yet touches execution (that's a later phase) — this only covers
+// generate/lookup/balance.
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
+import bs58 from "bs58";
+import { Collection, Db } from "mongodb";
+import { getLogger } from "../utils/logger.js";
+import { encryptSecret, decryptSecret } from "../utils/walletEncryption.js";
+import {
+  normalizeWalletAddress,
+  getBalanceInSol,
+  getConnection,
+} from "./solana.service.js";
+import { connect } from "./db.service.js";
+
+// Reserve for the transfer's own network fee — a "withdraw everything"
+// request would otherwise try to send a balance that can't also cover the
+// fee to send it, and fail.
+const WITHDRAWAL_FEE_RESERVE_LAMPORTS = 5000;
+
+const log = getLogger("userWallet.service");
+
+export type UserWallet = {
+  ownerWallet: string; // the wallet the user connects in the browser
+  hotWalletPublicKey: string; // the bot-generated trading wallet's address
+  encryptedSecretKey: string; // AES-256-GCM ciphertext of the base58 secret key
+  createdAt: Date;
+};
+
+let col: Collection<UserWallet> | null = null;
+
+async function getCol(): Promise<Collection<UserWallet>> {
+  if (col) return col;
+  const db: Db = await connect();
+  col = db.collection<UserWallet>("userWallets");
+  await col.createIndex({ ownerWallet: 1 }, { unique: true });
+  await col.createIndex({ hotWalletPublicKey: 1 }, { unique: true });
+  return col;
+}
+
+/**
+ * Returns the existing hot wallet for this owner, generating one on first
+ * call. Idempotent — safe to call every time a wallet connects.
+ */
+export async function getOrCreateUserWallet(
+  ownerWalletRaw: string
+): Promise<UserWallet> {
+  const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
+  const c = await getCol();
+
+  const existing = await c.findOne({ ownerWallet });
+  if (existing) return existing;
+
+  const keypair = Keypair.generate();
+  const doc: UserWallet = {
+    ownerWallet,
+    hotWalletPublicKey: keypair.publicKey.toBase58(),
+    encryptedSecretKey: encryptSecret(bs58.encode(keypair.secretKey)),
+    createdAt: new Date(),
+  };
+
+  try {
+    await c.insertOne(doc);
+    log.info(
+      { ownerWallet, hotWallet: doc.hotWalletPublicKey },
+      "Generated new custodial hot wallet"
+    );
+    return doc;
+  } catch (err: any) {
+    // Race: two near-simultaneous requests for the same never-before-seen
+    // owner wallet. Unique index on ownerWallet rejects the loser — fetch
+    // what the winner actually inserted instead of erroring the request.
+    if (err?.code === 11000) {
+      const winner = await c.findOne({ ownerWallet });
+      if (winner) return winner;
+    }
+    throw err;
+  }
+}
+
+export async function getUserWallet(
+  ownerWalletRaw: string
+): Promise<UserWallet | null> {
+  const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
+  const c = await getCol();
+  return c.findOne({ ownerWallet });
+}
+
+/**
+ * Decrypts and returns the actual signing keypair. Only for server-side use
+ * at execution time (later phase) — never returned from an API response.
+ */
+export async function getUserWalletKeypair(
+  ownerWalletRaw: string
+): Promise<Keypair | null> {
+  const wallet = await getUserWallet(ownerWalletRaw);
+  if (!wallet) return null;
+  const secretKey = bs58.decode(decryptSecret(wallet.encryptedSecretKey));
+  return Keypair.fromSecretKey(secretKey);
+}
+
+export async function getUserWalletBalanceSol(
+  ownerWalletRaw: string
+): Promise<{ hotWalletPublicKey: string; balanceSol: number } | null> {
+  const wallet = await getOrCreateUserWallet(ownerWalletRaw);
+  const balanceSol = await getBalanceInSol(wallet.hotWalletPublicKey);
+  return { hotWalletPublicKey: wallet.hotWalletPublicKey, balanceSol };
+}
+
+/**
+ * Withdraws SOL from an owner's custodial hot wallet back to that SAME
+ * owner's own connected wallet — never to an arbitrary caller-supplied
+ * address, which is what makes this safe to expose even given a verified
+ * signature: the destination is always the wallet that proved it owns this
+ * hot wallet, so there's no address to trick the API into draining funds to.
+ * Caller (the route) is responsible for verifying wallet-signature auth
+ * BEFORE calling this — this function trusts ownerWalletRaw completely.
+ */
+export async function withdrawToOwner(
+  ownerWalletRaw: string,
+  amountSol: number
+): Promise<{ signature: string; amountSol: number }> {
+  if (!Number.isFinite(amountSol) || amountSol <= 0) {
+    throw new Error("Withdrawal amount must be a positive number");
+  }
+
+  const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
+  const wallet = await getUserWallet(ownerWallet);
+  if (!wallet) {
+    throw new Error("No trading wallet found for this owner");
+  }
+
+  const keypair = await getUserWalletKeypair(ownerWallet);
+  if (!keypair) {
+    throw new Error("Failed to load trading wallet keypair");
+  }
+
+  const balanceLamports = Math.round(
+    (await getBalanceInSol(wallet.hotWalletPublicKey)) * LAMPORTS_PER_SOL
+  );
+  const requestedLamports = Math.round(amountSol * LAMPORTS_PER_SOL);
+  const maxWithdrawableLamports = balanceLamports - WITHDRAWAL_FEE_RESERVE_LAMPORTS;
+
+  if (maxWithdrawableLamports <= 0) {
+    throw new Error("Balance too low to cover the network fee");
+  }
+  if (requestedLamports > maxWithdrawableLamports) {
+    throw new Error(
+      `Requested ${amountSol} SOL exceeds withdrawable balance of ${(
+        maxWithdrawableLamports / LAMPORTS_PER_SOL
+      ).toFixed(6)} SOL (after reserving the network fee)`
+    );
+  }
+
+  const conn = getConnection();
+  const tx = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: keypair.publicKey,
+      toPubkey: new PublicKey(ownerWallet),
+      lamports: requestedLamports,
+    })
+  );
+
+  const latest = await conn.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = latest.blockhash;
+  tx.feePayer = keypair.publicKey;
+  tx.sign(keypair);
+
+  const signature = await conn.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+  });
+  await conn.confirmTransaction(
+    {
+      signature,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+    },
+    "confirmed"
+  );
+
+  log.info(
+    { ownerWallet, hotWallet: wallet.hotWalletPublicKey, amountSol, signature },
+    "Withdrawal completed"
+  );
+
+  return { signature, amountSol: requestedLamports / LAMPORTS_PER_SOL };
+}
+
+/** All owner wallets with a funded (non-dust) hot wallet — used by the
+ * execution fan-out in a later phase to know who's actually eligible to
+ * receive an auto-buy. Not used yet. */
+export async function listAllUserWallets(): Promise<UserWallet[]> {
+  const c = await getCol();
+  return c.find({}).toArray();
+}
+
+export default {
+  getOrCreateUserWallet,
+  getUserWallet,
+  getUserWalletKeypair,
+  getUserWalletBalanceSol,
+  withdrawToOwner,
+  listAllUserWallets,
+};

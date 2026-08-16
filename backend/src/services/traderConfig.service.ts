@@ -2,6 +2,13 @@
 import { getLogger } from "../utils/logger.js";
 import { MongoClient, Db } from "mongodb";
 import { Server } from "socket.io";
+import dotenv from "dotenv";
+
+// Defensive, same as db.service.ts — this module can be reached (via
+// trade.route.ts's import, evaluated early in app.ts's route list) before
+// index.ts's own dotenv.config() call has run, which would otherwise freeze
+// MONGO_URI below as "" for the rest of the process.
+dotenv.config();
 
 const MONGO_URI = process.env.MONGO_URI || "";
 const MONGO_DB_NAME = process.env.MONGO_DB_NAME || "archangel";
@@ -27,10 +34,29 @@ export interface TraderConfig {
     maxMarketCapUsd?: number;
     takeProfitPct?: number;
     stopLossPct?: number;
+    /** @deprecated use maxTokenAgeSeconds — kept only to read pre-existing
+     * stored configs that predate the unit selector; never written anymore. */
     maxTokenAgeHours?: number;
+    // Normalized internal unit for "how new must a token be to qualify."
+    // The UI lets the user pick seconds/minutes/hours, but everything past
+    // the form always deals in seconds.
+    maxTokenAgeSeconds?: number;
+    // "Snipe window" — only buy a token whose age in seconds falls within
+    // [minSecondsSinceLaunch, maxSecondsSinceLaunch]. Independent of
+    // maxTokenAgeSeconds (a ceiling only); this is a tighter min+max band.
+    minSecondsSinceLaunch?: number;
+    maxSecondsSinceLaunch?: number;
     minTokenScore?: number;
     autoTradeEnabled?: boolean;
     maxTradeAmountSol?: number;
+    // Lifetime cap on how many trades the bot may take for this wallet —
+    // null/undefined means unlimited. Enforced in
+    // multiUserExecution.service.ts's getEligibleWallets() against the live
+    // count from dbService.getTotalTradesCount(), not a stored counter.
+    // Once reached, auto-trading stops for this wallet until the trader
+    // raises the number (there's no separate "reset" — the count reflects
+    // real trade history). null explicitly clears a previously-set cap.
+    maxTotalTrades?: number | null;
   };
   tokenSpecificSettings: {
     [mint: string]: {
@@ -64,6 +90,67 @@ export async function getTraderConfig(
     log.error({ err: err.message }, "Failed to get trader config");
     return null;
   }
+}
+
+// Default: env var (seconds) if set, else the old MAX_TOKEN_AGE_HOURS env
+// var converted to seconds, else 24h — matches the pre-existing default so
+// behavior doesn't silently change for anyone who never touched this setting.
+const DEFAULT_MAX_TOKEN_AGE_SECONDS = process.env.MAX_TOKEN_AGE_SECONDS
+  ? Number(process.env.MAX_TOKEN_AGE_SECONDS)
+  : Number(process.env.MAX_TOKEN_AGE_HOURS ?? 24) * 3600;
+
+/**
+ * A specific wallet's own "how new must a token be" ceiling, in seconds —
+ * each wallet (operator or any custodial user) has its own stored config, so
+ * this must be looked up per-wallet rather than assuming one shared value;
+ * see autoBuyer.service.ts's per-wallet fan-out loop, the caller. Falls back
+ * through: this wallet's stored maxTokenAgeSeconds -> its legacy
+ * maxTokenAgeHours (pre-unit-selector configs) -> env default.
+ */
+export async function getEffectiveMaxTokenAgeSeconds(
+  walletAddress: string
+): Promise<number> {
+  const config = await getTraderConfig(walletAddress);
+  const g = config?.globalSettings;
+  if (g?.maxTokenAgeSeconds != null && g.maxTokenAgeSeconds > 0) {
+    return g.maxTokenAgeSeconds;
+  }
+  if (g?.maxTokenAgeHours != null && g.maxTokenAgeHours > 0) {
+    return g.maxTokenAgeHours * 3600;
+  }
+  return DEFAULT_MAX_TOKEN_AGE_SECONDS;
+}
+
+// Matches autoBuyer.service.ts's pre-existing hardcoded defaults, so nobody
+// who never touches this setting sees a behavior change.
+const DEFAULT_MIN_SECONDS_SINCE_LAUNCH = Number(
+  process.env.MIN_SECONDS_SINCE_LAUNCH ?? "10"
+);
+const DEFAULT_MAX_SECONDS_SINCE_LAUNCH = Number(
+  process.env.MAX_SECONDS_SINCE_LAUNCH ?? "60"
+);
+
+/**
+ * A specific wallet's own "snipe window" — only buy a token whose age in
+ * seconds falls within [min, max]. Same per-wallet lookup pattern as
+ * getEffectiveMaxTokenAgeSeconds; falls back to the env-configured defaults
+ * for a wallet that has never set its own value.
+ */
+export async function getEffectiveLaunchWindowSeconds(
+  walletAddress: string
+): Promise<{ min: number; max: number }> {
+  const config = await getTraderConfig(walletAddress);
+  const g = config?.globalSettings;
+  return {
+    min:
+      g?.minSecondsSinceLaunch != null && g.minSecondsSinceLaunch >= 0
+        ? g.minSecondsSinceLaunch
+        : DEFAULT_MIN_SECONDS_SINCE_LAUNCH,
+    max:
+      g?.maxSecondsSinceLaunch != null && g.maxSecondsSinceLaunch > 0
+        ? g.maxSecondsSinceLaunch
+        : DEFAULT_MAX_SECONDS_SINCE_LAUNCH,
+  };
 }
 
 /**

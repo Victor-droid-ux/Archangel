@@ -2,6 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { fetcher } from "@lib/utils";
 import { useSocket } from "@hooks/useSocket";
 
@@ -50,18 +51,34 @@ const POLL_MS = 30000; // matches pnlBroadcaster.service.ts's own interval
 
 export function usePnLData(historyDays = 30) {
   const { lastMessage, connected, sendMessage } = useSocket();
+  const { publicKey } = useSolanaWallet();
   const [portfolio, setPortfolio] = useState<PortfolioPnL | null>(null);
   const [tokenPnL, setTokenPnL] = useState<TokenPnL[]>([]);
   const [history, setHistory] = useState<PnLHistoryPoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Clear the instant the connected wallet changes, before the re-fetch
+  // below even starts — otherwise the previous wallet's P&L stays on
+  // screen for the round-trip it takes to load the new wallet's own.
+  useEffect(() => {
+    setPortfolio(null);
+    setTokenPnL([]);
+    setHistory([]);
+    setLoading(true);
+  }, [publicKey]);
+
   const load = useCallback(async () => {
     try {
+      // Scoped to the connected wallet — the bot's own P&L plus this
+      // wallet's own, never another wallet's (see pnl.route.ts).
+      const wallet = publicKey ? encodeURIComponent(publicKey.toString()) : "";
       const [portfolioRes, tokensRes, historyRes] = await Promise.all([
-        fetcher(`/api/pnl/portfolio`),
-        fetcher(`/api/pnl/tokens`),
-        fetcher(`/api/pnl/history?days=${historyDays}`),
+        fetcher(`/api/pnl/portfolio${wallet ? `?wallet=${wallet}` : ""}`),
+        fetcher(`/api/pnl/tokens${wallet ? `?wallet=${wallet}` : ""}`),
+        fetcher(
+          `/api/pnl/history?days=${historyDays}${wallet ? `&wallet=${wallet}` : ""}`
+        ),
       ]);
       if (portfolioRes?.success) setPortfolio(portfolioRes.data);
       if (tokensRes?.success) setTokenPnL(tokensRes.data || []);
@@ -72,7 +89,7 @@ export function usePnLData(historyDays = 30) {
     } finally {
       setLoading(false);
     }
-  }, [historyDays]);
+  }, [historyDays, publicKey]);
 
   // Initial load + periodic refresh (covers getPnLHistory, which has no
   // real-time socket push — it's a daily aggregate, not worth pushing live)
@@ -82,19 +99,22 @@ export function usePnLData(historyDays = 30) {
     return () => clearInterval(interval);
   }, [load]);
 
-  // Live updates without waiting for the next poll tick. Portfolio P&L is a
-  // real broadcast (pnlBroadcaster.service.ts, every 30s to everyone); token
-  // P&L is request/response only (socket.route.ts's pnl:tokens:request), so
-  // ask for a fresh copy whenever the socket (re)connects.
+  // Live updates without waiting for the next poll tick. Both broadcasts are
+  // always the bot's own unscoped global numbers (pnlBroadcaster.service.ts /
+  // socket.route.ts's pnl:tokens:request) — applying them while a specific
+  // wallet is connected would overwrite that wallet's correctly-scoped P&L
+  // with the operator's. Only apply them with no wallet connected; the
+  // scoped poll above keeps a connected wallet's numbers fresh instead.
   useEffect(() => {
     if (!lastMessage) return;
+    if (publicKey) return;
     if (lastMessage.event === "portfolio:pnl:update") {
       setPortfolio(lastMessage.payload);
     }
     if (lastMessage.event === "pnl:tokens:update") {
       setTokenPnL(lastMessage.payload || []);
     }
-  }, [lastMessage]);
+  }, [lastMessage, publicKey]);
 
   useEffect(() => {
     if (connected) sendMessage("pnl:tokens:request");

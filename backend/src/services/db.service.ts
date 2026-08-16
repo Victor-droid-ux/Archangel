@@ -12,6 +12,32 @@ const MONGO_DB_NAME = process.env.MONGO_DB_NAME || "archangel";
 
 const log = getLogger("db.service");
 
+// The bot's own operating wallet — every operator-signed auto-trade uses
+// this key (see backend/.env's ADMIN_WALLET_SECRET). Its trades are its own
+// private activity too, exactly like any custodial user's — see
+// viewerWalletFilter() below. Exported so the few call sites that broadcast
+// to sockets with no specific connected wallet (pnlBroadcaster.service.ts,
+// socket.route.ts) can explicitly show the operator's own numbers as that
+// "no wallet connected" public view, instead of every user's data blended
+// together.
+export const OPERATOR_WALLET =
+  process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
+
+/**
+ * Builds the trade-visibility filter for a given viewer. When viewerWallet
+ * is omitted (internal engine callers like riskManagement.service.ts and
+ * monitor.service.ts, which must manage the bot's REAL, complete position
+ * set across every wallet regardless of who's looking), this returns {} —
+ * no filtering. When a viewerWallet IS provided (a dashboard route acting on
+ * behalf of one specific connected wallet), visibility is restricted to
+ * strictly that wallet's own trades — including when that wallet is the
+ * operator's own. No wallet's activity is ever mixed into another's view.
+ */
+function viewerWalletFilter(viewerWallet?: string): Record<string, any> {
+  if (!viewerWallet) return {};
+  return { wallet: viewerWallet };
+}
+
 /* ---------------------------------------
    TYPE DEFINITIONS
 ---------------------------------------- */
@@ -198,6 +224,11 @@ export type OldTokenState = TokenState & {
 ---------------------------------------- */
 export type PositionMetadata = {
   token: string;
+  // Multiple wallets can independently hold a position in the same token —
+  // tranche/tier/trailing-stop progress must be tracked per (token, wallet)
+  // pair, not per token alone, or two different users' positions in the
+  // same coin would silently share (and corrupt) one metadata record.
+  wallet: string;
   highestPnlPct?: number;
   trailingActivated?: boolean;
   soldAt40?: boolean;
@@ -235,7 +266,29 @@ export async function connect() {
   await tradesCol.createIndex({ timestamp: -1 });
   await watchlistCol.createIndex({ mint: 1 });
   await watchlistCol.createIndex({ userId: 1 });
-  await positionMetadataCol.createIndex({ token: 1 }, { unique: true });
+  // Was a unique index on token alone, from when only one wallet ever held
+  // positions — that would now reject a second wallet's metadata for a
+  // token the first wallet is also holding. Drop it (no-op if it never
+  // existed, e.g. a fresh DB) and replace with the real compound identity.
+  try {
+    await positionMetadataCol.dropIndex("token_1");
+  } catch (err: any) {
+    // Either the index was never created (IndexNotFound) or the collection
+    // itself doesn't exist yet — e.g. a brand-new DB, as in the test suite's
+    // in-memory MongoDB (surfaces as "ns not found"/NamespaceNotFound rather
+    // than IndexNotFound). Both are fine: there's nothing to drop either way.
+    const benign =
+      err?.codeName === "IndexNotFound" ||
+      err?.codeName === "NamespaceNotFound" ||
+      err?.code === 26 ||
+      err?.code === 27 ||
+      /ns not found/i.test(err?.message ?? "");
+    if (!benign) throw err;
+  }
+  await positionMetadataCol.createIndex(
+    { token: 1, wallet: 1 },
+    { unique: true }
+  );
   await tokenStateCol.createIndex({ mint: 1 }, { unique: true });
   await tokenStateCol.createIndex({ state: 1 });
   await tokenStateCol.createIndex({ updatedAt: -1 });
@@ -346,14 +399,41 @@ export async function addTrade(
   return record;
 }
 
+/**
+ * How many trades this wallet has ever taken — counts distinct tokens
+ * bought, not raw buy-fill rows: a 2-tranche buy (see autoBuyer.service.ts)
+ * records two separate "buy" TradeRecords for what a trader perceives as one
+ * trade/position, so counting raw fills would silently double it. Used by
+ * multiUserExecution.service.ts to enforce each wallet's own Max Total
+ * Trades setting — computed live from real trade history rather than a
+ * separate incrementing counter, so it can never drift (same reasoning as
+ * getStats()'s openTrades).
+ */
+export async function getTotalTradesCount(wallet: string): Promise<number> {
+  if (!db) await connect();
+  const tokens = await tradesCol!.distinct("token", {
+    wallet,
+    type: "buy",
+    simulated: { $ne: true },
+  });
+  return tokens.length;
+}
+
 // includeSimulated defaults to false — the same reasoning as getPositions():
 // simulated trades don't represent real capital and must not silently
 // contaminate real-money aggregates (daily-loss circuit breaker, PnL display,
 // win rate). Callers that genuinely want the full picture (e.g. an admin
 // audit view) can opt in explicitly.
-export async function getTrades(limit = 50, includeSimulated = false) {
+export async function getTrades(
+  limit = 50,
+  includeSimulated = false,
+  viewerWallet?: string
+) {
   if (!db) await connect();
-  const filter = includeSimulated ? {} : { simulated: { $ne: true } };
+  const filter = {
+    ...(includeSimulated ? {} : { simulated: { $ne: true } }),
+    ...viewerWalletFilter(viewerWallet),
+  };
   return tradesCol!.find(filter).sort({ timestamp: -1 }).limit(limit).toArray();
 }
 
@@ -363,21 +443,42 @@ const POSITION_DUST_THRESHOLD_SOL = Number(
   process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
 );
 
-export async function getStats() {
+export async function getStats(viewerWallet?: string) {
   if (!db) await connect();
-  const doc = await statsCol!.findOne({});
-  if (!doc) throw new Error("Stats missing");
 
-  const positions = await getPositions();
+  // Always computed fresh from the resolved wallet's own trades/positions —
+  // never the stored statsCol doc, which $inc's across every wallet in the
+  // system (see addTrade) and would blend every user's private numbers
+  // together. No viewer (an internal caller, or a socket client with no
+  // wallet connected — see socket.route.ts) falls back to the operator's
+  // own numbers, never a system-wide blend.
+  const effectiveWallet = viewerWallet || OPERATOR_WALLET;
+  const [positions, pnl] = await Promise.all([
+    getPositions(effectiveWallet),
+    getPortfolioPnL(effectiveWallet),
+  ]);
   const openTrades = positions.filter(
     (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL
   ).length;
-
-  return { ...doc, openTrades };
+  return {
+    portfolioValue: pnl.openPositionsValue,
+    totalProfitSol: pnl.totalPnlSol,
+    totalProfitPercent: pnl.totalPnlPercent,
+    openTrades,
+    tradeVolumeSol: pnl.totalInvestedSol + pnl.totalReturnedSol,
+    winRate: pnl.winRate,
+    lastUpdated: new Date(),
+  };
 }
 
 export type Position = {
   token: string;
+  // The wallet this position belongs to (TradeRecord.wallet — the owner
+  // wallet for custodial trades, see validationPipeline.service.ts). Needed
+  // to know which wallet's keypair can actually sign a sell for this
+  // position, and to keep two wallets holding the same token from being
+  // treated as one merged position.
+  wallet: string;
   netSol: number;
   avgBuyPrice?: number;
   highestPnlPct?: number;
@@ -391,16 +492,23 @@ export type Position = {
   firstBuyAt?: Date; // Earliest buy fill for this token — used for the SL grace period
 };
 
-export async function getPositions(): Promise<Position[]> {
+export async function getPositions(viewerWallet?: string): Promise<Position[]> {
   if (!db) await connect();
   const agg = await tradesCol!
     .aggregate([
       // Simulated trades don't represent real capital at risk and must never
       // count against MAX_OPEN_POSITIONS / risk-management position sizing.
-      { $match: { simulated: { $ne: true } } },
+      // viewerWalletFilter() is {} (no restriction) unless a specific
+      // viewer's wallet was passed in — internal risk/monitoring callers
+      // never pass one, so their view of "all real positions" is unchanged.
+      { $match: { simulated: { $ne: true }, ...viewerWalletFilter(viewerWallet) } },
       {
         $group: {
-          _id: "$token",
+          // Compound identity: two different wallets holding the same token
+          // are two separate positions, not one merged position — each has
+          // its own cost basis, its own remaining size, and only one wallet
+          // can actually sign a sell for it.
+          _id: { token: "$token", wallet: "$wallet" },
           bought: {
             $sum: { $cond: [{ $eq: ["$type", "buy"] }, "$amountLamports", 0] },
           },
@@ -436,7 +544,8 @@ export async function getPositions(): Promise<Position[]> {
       },
       {
         $project: {
-          token: "$_id",
+          token: "$_id.token",
+          wallet: "$_id.wallet",
           netSol: { $divide: [{ $subtract: ["$bought", "$sold"] }, 1e9] },
           avgBuyPrice: {
             $cond: [
@@ -457,7 +566,10 @@ export async function getPositions(): Promise<Position[]> {
   // instead of permanently-undefined props.
   const positions = agg as Position[];
   for (const pos of positions) {
-    const metadata = await positionMetadataCol!.findOne({ token: pos.token });
+    const metadata = await positionMetadataCol!.findOne({
+      token: pos.token,
+      wallet: pos.wallet,
+    });
     if (metadata) {
       if (metadata.highestPnlPct !== undefined) {
         pos.highestPnlPct = metadata.highestPnlPct;
@@ -485,17 +597,18 @@ export async function getPositions(): Promise<Position[]> {
 
 export async function updatePositionMetadata(
   token: string,
-  updates: Partial<Omit<PositionMetadata, "token" | "updatedAt">>
+  wallet: string,
+  updates: Partial<Omit<PositionMetadata, "token" | "wallet" | "updatedAt">>
 ): Promise<void> {
   if (!db) await connect();
   await positionMetadataCol!.updateOne(
-    { token },
+    { token, wallet },
     {
       $set: {
         ...updates,
         updatedAt: new Date(),
       },
-      $setOnInsert: { token },
+      $setOnInsert: { token, wallet },
     },
     { upsert: true }
   );
@@ -590,14 +703,16 @@ export async function updateWatchlistAlert(
 /**
  * Calculate comprehensive portfolio P&L
  */
-export async function getPortfolioPnL(): Promise<PortfolioPnL> {
+export async function getPortfolioPnL(
+  viewerWallet?: string
+): Promise<PortfolioPnL> {
   if (!db) await connect();
 
   // Same reasoning as getPositions()/getTrades(): paper/simulated trades must
   // not contaminate real realized-PnL, win-rate, or invested-SOL figures —
   // this is what the dashboard actually displays to you.
   const trades = await tradesCol!
-    .find({ simulated: { $ne: true } })
+    .find({ simulated: { $ne: true }, ...viewerWalletFilter(viewerWallet) })
     .sort({ timestamp: 1 })
     .toArray();
 
@@ -634,7 +749,7 @@ export async function getPortfolioPnL(): Promise<PortfolioPnL> {
   }
 
   // Get current open positions value
-  const positions = await getPositions();
+  const positions = await getPositions(viewerWallet);
   let unrealizedPnlSol = 0;
   let openPositionsValue = 0;
 
@@ -681,11 +796,11 @@ export async function getPortfolioPnL(): Promise<PortfolioPnL> {
 /**
  * Get P&L breakdown by token
  */
-export async function getTokenPnL(): Promise<TokenPnL[]> {
+export async function getTokenPnL(viewerWallet?: string): Promise<TokenPnL[]> {
   if (!db) await connect();
 
   const trades = await tradesCol!
-    .find({ simulated: { $ne: true } })
+    .find({ simulated: { $ne: true }, ...viewerWalletFilter(viewerWallet) })
     .sort({ timestamp: 1 })
     .toArray();
   const tokenMap = new Map<
@@ -754,7 +869,10 @@ export async function getTokenPnL(): Promise<TokenPnL[]> {
 /**
  * Get P&L history over time (daily aggregation)
  */
-export async function getPnLHistory(days: number = 30): Promise<
+export async function getPnLHistory(
+  days: number = 30,
+  viewerWallet?: string
+): Promise<
   Array<{
     date: string;
     realizedPnlSol: number;
@@ -772,6 +890,7 @@ export async function getPnLHistory(days: number = 30): Promise<
       timestamp: { $gte: startDate },
       type: "sell",
       simulated: { $ne: true },
+      ...viewerWalletFilter(viewerWallet),
     })
     .sort({ timestamp: 1 })
     .toArray();
@@ -945,9 +1064,11 @@ export async function close() {
 }
 
 export default {
+  OPERATOR_WALLET,
   connect,
   addTrade,
   getTrades,
+  getTotalTradesCount,
   getStats,
   getPositions,
   updateStats,

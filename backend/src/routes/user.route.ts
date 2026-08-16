@@ -2,6 +2,7 @@
 import express from "express";
 import { getLogger } from "../utils/logger.js";
 import dbService from "../services/db.service.js";
+import { verifyWalletAuth } from "../utils/walletAuth.js";
 
 const router = express.Router();
 const log = getLogger("user.route");
@@ -21,6 +22,8 @@ router.post("/settings", async (req, res) => {
       autoTrade,
       dexRoute,
       selectedToken,
+      walletAuthTimestamp,
+      walletAuthSignature,
     } = req.body;
 
     if (!wallet) {
@@ -29,7 +32,22 @@ router.post("/settings", async (req, res) => {
         .json({ success: false, message: "wallet required" });
     }
 
-    const saved = await dbService.saveUserSettings(wallet, {
+    // Without this, POSTing a different `wallet` field would silently
+    // overwrite anyone else's saved trading config.
+    const verifiedWallet = verifyWalletAuth({
+      wallet,
+      timestamp: walletAuthTimestamp,
+      signature: walletAuthSignature,
+    });
+    if (!verifiedWallet) {
+      return res.status(401).json({
+        success: false,
+        message:
+          "Wallet signature required or invalid — sign the auth message with the connected wallet and retry.",
+      });
+    }
+
+    const saved = await dbService.saveUserSettings(verifiedWallet, {
       amount,
       slippage,
       takeProfit,

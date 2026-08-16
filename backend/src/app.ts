@@ -24,6 +24,7 @@ import adminRoutes from "./routes/admin.route.js";
 import userRoutes from "./routes/user.route.js";
 import oldTokensRoute from "./routes/oldTokens.route.js";
 import socialRoute from "./routes/social.route.js";
+import userWalletRoute from "./routes/userWallet.route.js";
 
 import dbService from "./services/db.service.js";
 import { ENV } from "./utils/env.js";
@@ -90,5 +91,6 @@ export const createApp = () => {
   app.use("/api/trader-config", traderConfigRoutes);
   app.use("/api/old-tokens", oldTokensRoute);
   app.use("/api/social", socialRoute);
+  app.use("/api/user-wallet", userWalletRoute);
   return app;
 };

@@ -32,6 +32,11 @@ interface StatsState {
       | Partial<DashboardStats>
       | ((prev: DashboardStats) => Partial<DashboardStats>)
   ) => void;
+  // Clears stats/tradeHistory back to defaults and re-enters the loading
+  // state — called the instant the connected wallet changes, before the
+  // new wallet's scoped fetch even starts, so the previous wallet's
+  // numbers never linger on screen mid-switch.
+  reset: () => void;
 }
 
 export const useStats = create<StatsState>((set) => ({
@@ -66,5 +71,19 @@ export const useStats = create<StatsState>((set) => ({
         typeof updates === "function" ? updates(state.stats) : updates;
 
       return { stats: { ...state.stats, ...partial } };
+    }),
+
+  reset: () =>
+    set({
+      loading: true,
+      tradeHistory: [],
+      stats: {
+        portfolioValue: 0,
+        totalProfitSol: 0,
+        totalProfitPercent: 0,
+        openTrades: 0,
+        tradeVolumeSol: 0,
+        winRate: 0,
+      },
     }),
 }));

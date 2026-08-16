@@ -1,6 +1,7 @@
 import { getLogger } from "../utils/logger.js";
 import birdeyeService, { BirdeyePnLData } from "./birdeye.service.js";
 import { Server as SocketIOServer } from "socket.io";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 
 const LOG = getLogger("pnl-tracker");
 
@@ -17,10 +18,18 @@ interface TrackedPosition {
  * Continuously track unrealized P&L via Birdeye
  */
 class PnLTrackerService {
+  // Keyed by "wallet:tokenMint", not tokenMint alone — different wallets
+  // can independently hold a position in the same token, and a bare-token
+  // key would let one wallet's tracked position silently overwrite (or get
+  // stopped by) another's.
   private trackedPositions: Map<string, TrackedPosition> = new Map();
   private trackingInterval: NodeJS.Timeout | null = null;
   private readonly POLL_INTERVAL_MS = 2000; // 2 seconds
   private io: SocketIOServer | null = null;
+
+  private key(wallet: string, tokenMint: string): string {
+    return `${wallet}:${tokenMint}`;
+  }
 
   /**
    * Set Socket.IO server for broadcasting
@@ -34,8 +43,14 @@ class PnLTrackerService {
    * Start tracking a position
    */
   startTracking(position: TrackedPosition): void {
-    LOG.info(`📊 Started tracking P&L for ${position.tokenMint.slice(0, 8)}`);
-    this.trackedPositions.set(position.tokenMint, position);
+    LOG.info(
+      { wallet: position.wallet },
+      `📊 Started tracking P&L for ${position.tokenMint.slice(0, 8)}`
+    );
+    this.trackedPositions.set(
+      this.key(position.wallet, position.tokenMint),
+      position
+    );
 
     // Start tracking loop if not already running
     if (!this.trackingInterval) {
@@ -46,9 +61,9 @@ class PnLTrackerService {
   /**
    * Stop tracking a position
    */
-  stopTracking(tokenMint: string): void {
-    LOG.info(`🛑 Stopped tracking P&L for ${tokenMint.slice(0, 8)}`);
-    this.trackedPositions.delete(tokenMint);
+  stopTracking(tokenMint: string, wallet: string): void {
+    LOG.info({ wallet }, `🛑 Stopped tracking P&L for ${tokenMint.slice(0, 8)}`);
+    this.trackedPositions.delete(this.key(wallet, tokenMint));
 
     // Stop tracking loop if no positions left
     if (this.trackedPositions.size === 0 && this.trackingInterval) {
@@ -71,18 +86,20 @@ class PnLTrackerService {
     LOG.info("🔄 Starting P&L tracking loop...");
 
     this.trackingInterval = setInterval(async () => {
-      for (const [tokenMint, position] of this.trackedPositions) {
+      // Iterate values only — the Map key is "wallet:tokenMint" for
+      // uniqueness, not a usable mint address on its own.
+      for (const position of this.trackedPositions.values()) {
         try {
           const pnlData = await birdeyeService.getPnLData(
-            tokenMint,
+            position.tokenMint,
             position.entryPrice
           );
 
           // Broadcast to frontend via WebSocket
-          this.broadcastPnLUpdate(tokenMint, position, pnlData);
+          this.broadcastPnLUpdate(position.tokenMint, position, pnlData);
         } catch (error: any) {
           LOG.error(
-            `Error tracking P&L for ${tokenMint.slice(0, 8)}: ${error.message}`
+            `Error tracking P&L for ${position.tokenMint.slice(0, 8)}: ${error.message}`
           );
         }
       }
@@ -111,8 +128,9 @@ class PnLTrackerService {
       timestamp: Date.now(),
     };
 
-    // Emit to all connected clients
-    this.io?.emit("pnl:update", update);
+    // Only this position's own owner wallet (or everyone, for the shared
+    // operator bot) — see walletSocket.ts.
+    emitToWalletOrGlobal(this.io, position.wallet, "pnl:update", update);
 
     // Log significant changes
     if (Math.abs(pnlData.percentChange) > 10) {

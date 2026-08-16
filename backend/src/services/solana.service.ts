@@ -117,6 +117,22 @@ export function loadKeypairFromEnv(): Keypair {
 }
 
 /**
+ * Canonical form of a Solana address for use as a DB/identity key.
+ *
+ * Solana addresses are base58 and case-sensitive — unlike EVM addresses,
+ * there is no valid alternate-casing representation, so lowercasing would
+ * corrupt them rather than normalize them. PublicKey's constructor already
+ * validates the input is well-formed (right length, valid base58, on the
+ * ed25519 curve's byte range) and .toBase58() gives back its one canonical
+ * encoding, which is all the "normalization" a Solana address needs or
+ * should get. Throws on malformed input — callers should treat that as a
+ * bad request, not silently fall back to the raw string.
+ */
+export function normalizeWalletAddress(address: string): string {
+  return new PublicKey(address.trim()).toBase58();
+}
+
+/**
  * 🌐 Get wallet balance (in lamports)
  */
 export async function getBalance(pubkey: PublicKey | string) {

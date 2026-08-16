@@ -197,7 +197,12 @@ export function registerSocketHandlers(io: Server) {
      */
     socket.on("pnl:request", async () => {
       try {
-        const portfolioPnL = await dbService.getPortfolioPnL();
+        // No specific viewer identified on this event — show the operator's
+        // own P&L (its public activity), never a blend of every user's
+        // private data (see db.service.ts's viewerWalletFilter).
+        const portfolioPnL = await dbService.getPortfolioPnL(
+          dbService.OPERATOR_WALLET
+        );
         // See pnlBroadcaster.service.ts — "pnl:update" is reserved for
         // pnlTracker.service.ts's per-token PnLUpdate payload shape.
         socket.emit("portfolio:pnl:update", portfolioPnL);
@@ -211,7 +216,8 @@ export function registerSocketHandlers(io: Server) {
      */
     socket.on("pnl:tokens:request", async () => {
       try {
-        const tokenPnL = await dbService.getTokenPnL();
+        // Same reasoning as pnl:request above.
+        const tokenPnL = await dbService.getTokenPnL(dbService.OPERATOR_WALLET);
         socket.emit("pnl:tokens:update", tokenPnL);
       } catch (err: any) {
         logger.error("Failed to fetch token P&L:", err?.message);

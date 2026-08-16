@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import { Settings as SettingsIcon } from "lucide-react";
 import TradingConfigPanel from "@components/trading/trading-config";
 import { TraderConfigModal } from "@components/trading/trader-config-modal";
+import { DepositPanel } from "@components/trading/DepositPanel";
 import { Button } from "@components/ui/button";
 
 // Content must never depend on this animation actually running to become
@@ -32,6 +33,10 @@ export default function SettingsPage() {
       </motion.div>
 
       <motion.div {...fadeIn(0.2)}>
+        <DepositPanel />
+      </motion.div>
+
+      <motion.div {...fadeIn(0.25)}>
         <TradingConfigPanel />
       </motion.div>
 

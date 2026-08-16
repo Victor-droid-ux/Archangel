@@ -11,8 +11,9 @@ import jupiterService, {
 } from "./jupiter.service.js";
 import { validateJupiterToken } from "./jupiterTokenValidator.service.js";
 import dbService from "./db.service.js";
-import validationPipelineService from "./validationPipeline.service.js";
+import multiUserExecutionService from "./multiUserExecution.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 
 const LOG = getLogger("jupiter-discovery");
 
@@ -203,59 +204,72 @@ class JupiterDiscoveryService {
       });
     }
 
-    if (!this.config.autoBuyEnabled || this.config.autoBuyAmountSol <= 0) return;
+    if (!this.config.autoBuyEnabled) return;
 
     LOG.info(`🚀 Starting validation pipeline for auto-buy: ${token.symbol}...`);
-    const pipelineResult = await validationPipelineService.runPipeline(
+    // Fans out across the operator wallet plus every eligible funded,
+    // auto-trade-enabled user wallet — each independently risk-checked and
+    // executed with its own capital. See multiUserExecution.service.ts.
+    // NOTE: socket events below still broadcast globally rather than to a
+    // per-wallet room — that's the next phase of this work, not yet done,
+    // so for now every connected dashboard sees every wallet's auto-buy
+    // activity for this event type (trade history/positions reads are
+    // already wallet-scoped; this is a live-feed-only gap).
+    const fanOutResults = await multiUserExecutionService.runPipelineForAllEligibleWallets(
       token.mint,
       validation.details.liquiditySol
     );
 
-    if (!pipelineResult.success) {
-      LOG.error(
-        {
-          mint: token.mint.slice(0, 8),
-          failedStage: pipelineResult.failedStage,
-          stageName: pipelineResult.failedStageName,
-          reason: pipelineResult.reason,
-        },
-        `❌ Pipeline failed at Stage ${pipelineResult.failedStage}: ${pipelineResult.failedStageName}`
-      );
-      if (this.io) {
-        this.io.emit("jupiter:pipeline_failed", {
+    for (const { ownerWallet, result: pipelineResult } of fanOutResults) {
+      if (!pipelineResult.success) {
+        LOG.error(
+          {
+            mint: token.mint.slice(0, 8),
+            wallet: ownerWallet,
+            failedStage: pipelineResult.failedStage,
+            stageName: pipelineResult.failedStageName,
+            reason: pipelineResult.reason,
+          },
+          `❌ Pipeline failed at Stage ${pipelineResult.failedStage}: ${pipelineResult.failedStageName}`
+        );
+        emitToWalletOrGlobal(this.io, ownerWallet, "jupiter:pipeline_failed", {
           mint: token.mint,
+          wallet: ownerWallet,
           failedStage: pipelineResult.failedStage,
           failedStageName: pipelineResult.failedStageName,
           reason: pipelineResult.reason,
           results: pipelineResult.results,
           timestamp: new Date().toISOString(),
         });
+        continue;
       }
-      return;
-    }
 
-    LOG.info(
-      { mint: token.mint.slice(0, 8), signature: pipelineResult.executionResult?.signature },
-      `✅ Pipeline completed successfully! Buy executed via Jupiter.`
-    );
+      LOG.info(
+        {
+          mint: token.mint.slice(0, 8),
+          wallet: ownerWallet,
+          signature: pipelineResult.executionResult?.signature,
+        },
+        `✅ Pipeline completed successfully! Buy executed via Jupiter.`
+      );
 
-    if (pipelineResult.executionResult) {
-      pnlTrackerService.startTracking({
-        tokenMint: token.mint,
-        entryPrice: pipelineResult.executionResult.actualPrice || 0,
-        amount: pipelineResult.executionResult.tokensReceived || 0,
-        wallet: process.env.WALLET_PUBLIC_KEY || "",
-        entryTime: Date.now(),
-      });
-    }
+      if (pipelineResult.executionResult) {
+        pnlTrackerService.startTracking({
+          tokenMint: token.mint,
+          entryPrice: pipelineResult.executionResult.actualPrice || 0,
+          amount: pipelineResult.executionResult.tokensReceived || 0,
+          wallet: ownerWallet,
+          entryTime: Date.now(),
+        });
+      }
 
-    if (this.io) {
       // Live Feed / Trade History on the dashboard only render off "tradeFeed"
       // — without this, buys executed through this pipeline (the dominant
       // auto-buy path) never appeared there even though they're real trades.
-      this.io.emit("tradeFeed", {
+      emitToWalletOrGlobal(this.io, ownerWallet, "tradeFeed", {
         type: "buy",
         token: token.mint,
+        wallet: ownerWallet,
         amount: Math.round(
           (pipelineResult.executionResult?.amountSol ?? 0) * 1e9
         ),
@@ -268,8 +282,9 @@ class JupiterDiscoveryService {
         route: "jupiter",
       });
 
-      this.io.emit("jupiter:pipeline_success", {
+      emitToWalletOrGlobal(this.io, ownerWallet, "jupiter:pipeline_success", {
         mint: token.mint,
+        wallet: ownerWallet,
         signature: pipelineResult.executionResult?.signature,
         tokensReceived: pipelineResult.executionResult?.tokensReceived,
         actualPrice: pipelineResult.executionResult?.actualPrice,

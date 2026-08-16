@@ -4,7 +4,7 @@
 // execution layer and Pump.fun bonding-curve trading entirely.
 import axios from "axios";
 import crypto from "crypto";
-import { Connection, VersionedTransaction } from "@solana/web3.js";
+import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
 import { getConnection, loadKeypairFromEnv } from "./solana.service.js";
 import { ENV } from "../utils/env.js";
@@ -338,12 +338,20 @@ class JupiterService {
     amount,
     userPublicKey,
     slippageBps = 500,
+    signer,
   }: {
     inputMint: string;
     outputMint: string;
     amount: number | string;
     userPublicKey: string;
     slippageBps?: number;
+    // Per-user custodial trading: the wallet that actually signs must match
+    // userPublicKey (Jupiter builds the transaction's token accounts/fee
+    // payer around userPublicKey, so a mismatched signer would fail on-chain
+    // or worse, sign a transaction moving a DIFFERENT wallet's funds).
+    // Defaults to the single admin/operator keypair for every existing
+    // caller that doesn't pass one — unchanged behavior for them.
+    signer?: Keypair;
   }): Promise<JupiterSwapResult> {
     try {
       const quote = await this.getQuote(inputMint, outputMint, amount, slippageBps);
@@ -362,8 +370,18 @@ class JupiterService {
 
       const useReal = process.env.USE_REAL_SWAP === "true";
       const connection = getConnection();
-      const signer = loadKeypairFromEnv();
-      tx.sign([signer]);
+      const actualSigner = signer ?? loadKeypairFromEnv();
+      // The transaction was built around userPublicKey (token accounts, fee
+      // payer). Signing it with any other keypair would either fail on-chain
+      // or, worse, succeed while moving funds/paying fees from the wrong
+      // wallet — so this must never be silently mismatched.
+      if (actualSigner.publicKey.toBase58() !== userPublicKey) {
+        return {
+          success: false,
+          error: "Signer does not match userPublicKey — refusing to sign",
+        };
+      }
+      tx.sign([actualSigner]);
 
       if (!useReal) {
         const { value } = await connection.simulateTransaction(tx, {
@@ -485,6 +503,7 @@ export const executeJupiterSwap = (params: {
   amount: number | string;
   userPublicKey: string;
   slippageBps?: number;
+  signer?: Keypair;
 }) => jupiterService.executeSwap(params);
 
 export const getRecentJupiterTokens = (limit?: number) =>

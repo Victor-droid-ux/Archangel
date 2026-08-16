@@ -5,6 +5,7 @@ import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { Connection } from "@solana/web3.js";
 import { useSocket } from "./useSocket";
 import { useTradingConfigStore } from "./useConfig";
+import { fetcher } from "@lib/utils";
 
 interface WalletState {
   connected: boolean;
@@ -153,6 +154,16 @@ export const useWallet = (): WalletState => {
         autoMode: autoTrade,
         manualAmountSol: amount,
       });
+
+      // "Sign up" this wallet — generates its custodial trading wallet on
+      // first sight (userWallet.service.ts's getOrCreateUserWallet is
+      // idempotent, safe to call every time). This used to only happen if
+      // the user visited Settings; firing it here means connecting a
+      // wallet ANYWHERE in the app is what makes it a real user, not
+      // landing on one specific page.
+      fetcher(`/api/user-wallet/${solanaWallet.publicKey.toString()}`).catch(
+        (err) => console.error("Failed to provision trading wallet:", err)
+      );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, solanaWallet.publicKey]);

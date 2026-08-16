@@ -9,7 +9,11 @@ const router = Router();
  */
 router.get("/portfolio", async (req: Request, res: Response) => {
   try {
-    const pnl = await db.getPortfolioPnL();
+    // No wallet param must still resolve to a specific, restricted view (the
+    // operator's own public P&L), never dbService's unrestricted {} — that's
+    // reserved for trusted internal callers, not an unauthenticated request.
+    const wallet = (req.query.wallet as string | undefined) || db.OPERATOR_WALLET;
+    const pnl = await db.getPortfolioPnL(wallet);
     res.json({
       success: true,
       data: pnl,
@@ -30,7 +34,9 @@ router.get("/portfolio", async (req: Request, res: Response) => {
  */
 router.get("/tokens", async (req: Request, res: Response) => {
   try {
-    const tokenPnL = await db.getTokenPnL();
+    // Same reasoning as /portfolio above.
+    const wallet = (req.query.wallet as string | undefined) || db.OPERATOR_WALLET;
+    const tokenPnL = await db.getTokenPnL(wallet);
     res.json({
       success: true,
       data: tokenPnL,
@@ -52,7 +58,9 @@ router.get("/tokens", async (req: Request, res: Response) => {
 router.get("/history", async (req: Request, res: Response) => {
   try {
     const days = parseInt(req.query.days as string) || 30;
-    const history = await db.getPnLHistory(days);
+    // Same reasoning as /portfolio above.
+    const wallet = (req.query.wallet as string | undefined) || db.OPERATOR_WALLET;
+    const history = await db.getPnLHistory(days, wallet);
     res.json({
       success: true,
       data: history,

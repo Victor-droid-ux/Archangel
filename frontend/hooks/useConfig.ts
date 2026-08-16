@@ -1,6 +1,7 @@
 // frontend/hooks/useConfig.ts
 import { create } from "zustand";
 import { fetcher } from "@lib/utils";
+import { signWalletAuth, SignMessageFn } from "@lib/walletAuth";
 
 interface TradingConfig {
   amount: number;
@@ -17,9 +18,12 @@ interface TradingConfig {
   setStopLoss: (value: number) => void;
   setAutoTrade: (value: boolean) => void;
   setDexRoute: (value: string) => void;
-  saveConfig: () => void;
-  loadConfig: () => void;
-  syncConfig: (wallet: string) => Promise<void>;
+  saveConfig: (wallet?: string) => void;
+  loadConfig: (wallet?: string) => void;
+  syncConfig: (
+    wallet: string,
+    signMessage: SignMessageFn | undefined
+  ) => Promise<void>;
   loadConfigFromAPI: (wallet: string) => Promise<void>;
 }
 
@@ -40,14 +44,21 @@ export const useTradingConfigStore = create<TradingConfig>((set, get) => ({
   setDexRoute: (value) => set({ dexRoute: value }),
   setSelectedToken: (token: string) => set({ selectedToken: token }),
 
-  saveConfig: () => {
+  // Keyed per-wallet — without this, Wallet A's saved preferences would
+  // still be sitting in localStorage under a flat key and show up
+  // immediately for Wallet B on the same browser, before (or even if)
+  // loadConfigFromAPI ever gets a chance to overwrite them with B's own.
+  saveConfig: (wallet) => {
     const config = get();
-    localStorage.setItem("tradingConfig", JSON.stringify(config));
+    localStorage.setItem(
+      `tradingConfig:${wallet || "anonymous"}`,
+      JSON.stringify(config)
+    );
     console.log("✅ Trading config saved locally:", config);
   },
 
-  loadConfig: () => {
-    const saved = localStorage.getItem("tradingConfig");
+  loadConfig: (wallet) => {
+    const saved = localStorage.getItem(`tradingConfig:${wallet || "anonymous"}`);
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
@@ -60,19 +71,35 @@ export const useTradingConfigStore = create<TradingConfig>((set, get) => ({
       } catch (err) {
         console.error("⚠️ Failed to parse saved config:", err);
       }
+    } else {
+      // No cached config for this wallet — reset to defaults rather than
+      // leaving whatever the PREVIOUSLY connected wallet's values were
+      // sitting in the live store.
+      set({
+        amount: 0.1,
+        slippage: 1,
+        takeProfit: 10,
+        stopLoss: 2,
+        autoTrade: false,
+        dexRoute: "Jupiter",
+        selectedToken: undefined,
+      });
     }
   },
 
   // Persist the data fields (not the store's functions) to the backend for
   // this wallet — real persistence now, see db.service.ts's userSettings
-  // collection / user.route.ts (previously a stub that 400'd because wallet
-  // was never sent).
-  syncConfig: async (wallet: string) => {
+  // collection / user.route.ts. Signed so the backend can verify this
+  // actually came from whoever controls `wallet`, not just trust the field —
+  // otherwise anyone could overwrite any other wallet's saved settings by
+  // POSTing a different wallet address.
+  syncConfig: async (wallet: string, signMessage: SignMessageFn | undefined) => {
     if (!wallet) {
       console.warn("⚠️ No wallet provided to sync config");
       return;
     }
     try {
+      const auth = await signWalletAuth(signMessage, wallet);
       const {
         amount,
         slippage,
@@ -93,6 +120,7 @@ export const useTradingConfigStore = create<TradingConfig>((set, get) => ({
           autoTrade,
           dexRoute,
           selectedToken,
+          ...auth,
         }),
       });
       console.log("☁️ Synced config to backend");

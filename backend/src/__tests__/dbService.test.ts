@@ -68,14 +68,19 @@ describe("addTrade", () => {
   });
 
   it("does increment real stats for a non-simulated trade", async () => {
-    const before = await dbService.getStats();
+    // getStats() is wallet-scoped (see db.service.ts's viewerWalletFilter) —
+    // every real trade carries a wallet, so this must too to be visible to
+    // the same wallet's own getStats() call, matching real usage.
+    const wallet = "TEST_WALLET_REAL_STATS";
+    const before = await dbService.getStats(wallet);
     await dbService.addTrade({
       type: "buy",
       token: "MINT_REAL_STATS",
       amount: 2_000_000_000, // 2 SOL
       price: 0.01,
+      wallet,
     });
-    const after = await dbService.getStats();
+    const after = await dbService.getStats(wallet);
     expect(after.tradeVolumeSol).toBeCloseTo(before.tradeVolumeSol + 2, 6);
   });
 });
@@ -162,15 +167,20 @@ describe("getPositions — quantity-weighted average cost basis", () => {
 
 describe("getStats — openTrades is derived live, not a drifting counter", () => {
   it("counts openTrades from actual current positions above the dust threshold", async () => {
+    // getStats()/getPositions() are wallet-scoped when a wallet is passed
+    // (see db.service.ts's viewerWalletFilter) — tag both calls with the
+    // same wallet, matching how every real trade is recorded today.
+    const wallet = "TEST_WALLET_OPEN_COUNT";
     const token = "MINT_OPEN_COUNT";
     await dbService.addTrade({
       type: "buy",
       token,
       amount: 1_000_000_000,
       price: 0.001,
+      wallet,
     });
-    const statsWithOpen = await dbService.getStats();
-    const positions = await dbService.getPositions();
+    const statsWithOpen = await dbService.getStats(wallet);
+    const positions = await dbService.getPositions(wallet);
     const expectedOpen = positions.filter((p) => p.netSol >= 0.0005).length;
     expect(statsWithOpen.openTrades).toBe(expectedOpen);
 
@@ -181,9 +191,10 @@ describe("getStats — openTrades is derived live, not a drifting counter", () =
       token,
       amount: 1_000_000_000,
       price: 0.001,
+      wallet,
     });
-    const statsAfterClose = await dbService.getStats();
-    const positionsAfterClose = await dbService.getPositions();
+    const statsAfterClose = await dbService.getStats(wallet);
+    const positionsAfterClose = await dbService.getPositions(wallet);
     const stillOpen = positionsAfterClose.find((p) => p.token === token);
     expect(stillOpen ? stillOpen.netSol < 0.0005 : true).toBe(true);
     expect(statsAfterClose.openTrades).toBe(

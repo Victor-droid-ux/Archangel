@@ -4,6 +4,9 @@
 // live external APIs (Jupiter price data) are mocked so the suite stays
 // fast and doesn't require network access to pass.
 import request from "supertest";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import { Keypair } from "@solana/web3.js";
 import { startTestDb, stopTestDb } from "./testDb.js";
 
 jest.mock("../services/jupiter.service.js", () => ({
@@ -48,14 +51,19 @@ describe("GET /api/positions", () => {
   });
 
   it("enriches a real position with live price and a correctly-signed unrealized PnL", async () => {
+    // /api/positions is wallet-scoped (see positions.route.ts); every real
+    // trade carries a wallet, so this must too, and the request must ask
+    // for that same wallet to see it back.
+    const wallet = "RouteTestWalletPosition2222222222222222222";
     await dbService.addTrade({
       type: "buy",
       token: "MINT_ROUTE_POSITION",
       amount: 1_000_000_000, // 1 SOL
       price: 0.001, // avgBuyPrice in SOL
+      wallet,
     });
 
-    const res = await request(app).get("/api/positions");
+    const res = await request(app).get(`/api/positions?wallet=${wallet}`);
     expect(res.statusCode).toBe(200);
     const pos = res.body.positions.find(
       (p: any) => p.token === "MINT_ROUTE_POSITION"
@@ -105,7 +113,25 @@ describe("POST /api/trade/calculate-risk", () => {
 });
 
 describe("POST/GET /api/user/settings — real persistence round-trip", () => {
-  const wallet = "RouteTestWallet33333333333333333333333333";
+  // POST requires a real wallet-signature proof (see user.route.ts's
+  // verifyWalletAuth) — a fixed placeholder string can't produce one, so
+  // this uses a real generated keypair, matching how the frontend actually
+  // signs the auth message via the connected wallet's signMessage.
+  const testWalletKeypair = Keypair.generate();
+  const wallet = testWalletKeypair.publicKey.toBase58();
+
+  function signWalletAuth() {
+    const timestamp = Date.now();
+    const message = `ArchAngel auth\nwallet: ${wallet}\ntimestamp: ${timestamp}`;
+    const signature = nacl.sign.detached(
+      new TextEncoder().encode(message),
+      testWalletKeypair.secretKey
+    );
+    return {
+      walletAuthTimestamp: timestamp,
+      walletAuthSignature: bs58.encode(signature),
+    };
+  }
 
   it("400s without a wallet", async () => {
     const res = await request(app)
@@ -115,15 +141,18 @@ describe("POST/GET /api/user/settings — real persistence round-trip", () => {
   });
 
   it("saves settings for a wallet and reads them back unchanged", async () => {
-    const saveRes = await request(app).post("/api/user/settings").send({
-      wallet,
-      amount: 0.3,
-      slippage: 3,
-      takeProfit: 20,
-      stopLoss: 8,
-      autoTrade: true,
-      dexRoute: "Jupiter",
-    });
+    const saveRes = await request(app)
+      .post("/api/user/settings")
+      .send({
+        wallet,
+        amount: 0.3,
+        slippage: 3,
+        takeProfit: 20,
+        stopLoss: 8,
+        autoTrade: true,
+        dexRoute: "Jupiter",
+        ...signWalletAuth(),
+      });
     expect(saveRes.statusCode).toBe(200);
     expect(saveRes.body.success).toBe(true);
 
