@@ -1,11 +1,11 @@
 "use client";
 
 import React, { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
-import { fetcher, formatNumber } from "@lib/utils";
+import { fetcher, formatNumber, formatPrice } from "@lib/utils";
 import { useSocket } from "@hooks/useSocket";
 import { useJupiterEvents } from "@hooks/useJupiterEvents";
-import { useManualBuy } from "@hooks/useManualBuy";
 import {
   Loader2,
   CheckCircle,
@@ -13,7 +13,6 @@ import {
   TrendingUp,
   ShoppingCart,
 } from "lucide-react";
-import { toast } from "react-hot-toast";
 
 type TokenItem = {
   symbol: string;
@@ -31,9 +30,9 @@ type TokensResponse = {
 };
 
 export const TokenDiscovery: React.FC = () => {
+  const router = useRouter();
   const [tokens, setTokens] = useState<TokenItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [buyingToken, setBuyingToken] = useState<string | null>(null);
 
   const { lastMessage, connected } = useSocket();
   const {
@@ -45,27 +44,6 @@ export const TokenDiscovery: React.FC = () => {
     latestPipelineSuccess,
     latestPipelineFailed,
   } = useJupiterEvents();
-
-  const { executeManualBuy, loading: manualBuyLoading } = useManualBuy();
-
-  const handleManualBuy = async (tokenMint: string) => {
-    setBuyingToken(tokenMint);
-    try {
-      const result = await executeManualBuy({
-        tokenMint,
-        amountSol: 0.05, // Default 0.05 SOL
-        slippage: 10, // 10% slippage
-      });
-
-      if (result?.success) {
-        toast.success(`Successfully bought ${tokenMint.slice(0, 8)}...`);
-      }
-    } catch (error) {
-      console.error("Manual buy error:", error);
-    } finally {
-      setBuyingToken(null);
-    }
-  };
 
   // Manual buys skip all validation, so any token that failed auto-buy
   // criteria is still available for the user to buy at their own discretion.
@@ -192,18 +170,26 @@ export const TokenDiscovery: React.FC = () => {
           )}
         </div>
 
-        {/* Manual Buy Available Tokens */}
+        {/* Tokens that failed the bot's own validation are listed for
+            visibility (why the bot passed on them) but are intentionally
+            not buyable from here — the manual Buy flow (/trading/buy) only
+            ever offers tokens that cleared the same safety checks the bot
+            itself requires, on purpose (see trade.route.ts's buy-time
+            re-validation). A "buy anyway" path here used to exist but
+            always signed with the operator's own wallet regardless of who
+            was connected — a real fund-misattribution bug, not a shortcut
+            worth keeping. */}
         {manualBuyTokens.length > 0 && (
           <div className="mb-4">
             <h3 className="text-sm font-semibold text-orange-400 mb-2 flex items-center gap-2">
               <ShoppingCart className="w-4 h-4" />
-              Available for Manual Buy ({manualBuyTokens.length})
+              Failed Auto-Buy Validation ({manualBuyTokens.length})
             </h3>
             <div className="space-y-2 max-h-[250px] overflow-y-auto pr-2">
               {manualBuyTokens.slice(0, 20).map((token) => (
                 <div
                   key={token.mint}
-                  className="flex items-center justify-between p-3 bg-orange-500/5 border border-orange-500/20 rounded hover:bg-orange-500/10 transition"
+                  className="flex items-center justify-between p-3 bg-orange-500/5 border border-orange-500/20 rounded"
                 >
                   <div className="flex-1">
                     <div className="flex items-center gap-2">
@@ -215,26 +201,6 @@ export const TokenDiscovery: React.FC = () => {
                       {token.reason}
                     </div>
                   </div>
-
-                  <button
-                    onClick={() => handleManualBuy(token.mint)}
-                    disabled={
-                      buyingToken === token.mint || manualBuyLoading
-                    }
-                    className="px-3 py-1.5 bg-orange-500 hover:bg-orange-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-xs font-medium rounded transition flex items-center gap-1"
-                  >
-                    {buyingToken === token.mint ? (
-                      <>
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        Buying...
-                      </>
-                    ) : (
-                      <>
-                        <ShoppingCart className="w-3 h-3" />
-                        Buy 0.05 SOL
-                      </>
-                    )}
-                  </button>
                 </div>
               ))}
             </div>
@@ -266,7 +232,13 @@ export const TokenDiscovery: React.FC = () => {
                   {tokens.map((t) => (
                     <tr
                       key={t.mint || t.symbol}
-                      className="border-b border-base-300 hover:bg-base-300/20 transition"
+                      onClick={() =>
+                        t.mint && router.push(`/trading/buy?mint=${t.mint}`)
+                      }
+                      className={`border-b border-base-300 hover:bg-base-300/20 transition ${
+                        t.mint ? "cursor-pointer" : ""
+                      }`}
+                      title={t.mint ? "Buy this token" : undefined}
                     >
                       <td className="py-2 px-4 font-medium">
                         {t.name ?? t.symbol}{" "}
@@ -274,7 +246,7 @@ export const TokenDiscovery: React.FC = () => {
                       </td>
 
                       <td className="py-2 px-4 text-right">
-                        {formatNumber(t.price ?? 0)}
+                        {formatPrice(t.price ?? 0)}
                       </td>
 
                       <td className="py-2 px-4 text-right">

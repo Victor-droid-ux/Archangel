@@ -245,6 +245,14 @@ export type PositionMetadata = {
   remainingPct?: number;
   firstTrancheEntry?: number;
   secondTrancheEntry?: number;
+  // Consecutive sell-attempt failures for this position (any exit path —
+  // emergency, tiered, or final TP/SL) and when the most recent attempt
+  // happened. Lets monitor.service.ts back off and stop re-notifying every
+  // 5-second tick for a token with genuinely no Jupiter route left (a dead
+  // pool), rather than retrying — and alerting — forever. Reset to 0 on any
+  // successful sell.
+  sellFailureCount?: number;
+  lastSellAttemptAt?: Date;
   updatedAt: Date;
 };
 
@@ -524,6 +532,8 @@ export type Position = {
   firstTrancheEntry?: number; // Timestamp of first 60% buy
   secondTrancheEntry?: number; // Timestamp of second 40% buy
   firstBuyAt?: Date; // Earliest buy fill for this token — used for the SL grace period
+  sellFailureCount?: number; // Consecutive failed sell attempts — see PositionMetadata
+  lastSellAttemptAt?: Date;
 };
 
 export async function getPositions(viewerWallet?: string): Promise<Position[]> {
@@ -627,6 +637,12 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
       }
       if (metadata.secondTrancheEntry !== undefined) {
         pos.secondTrancheEntry = metadata.secondTrancheEntry;
+      }
+      if (metadata.sellFailureCount !== undefined) {
+        pos.sellFailureCount = metadata.sellFailureCount;
+      }
+      if (metadata.lastSellAttemptAt !== undefined) {
+        pos.lastSellAttemptAt = metadata.lastSellAttemptAt;
       }
     }
   }

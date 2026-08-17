@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Card } from "@components/ui/card";
-import { fetcher, formatNumber } from "@lib/utils";
+import { fetcher, formatNumber, formatPrice } from "@lib/utils";
 import { useParams } from "next/navigation";
 import { useWallet } from "@hooks/useWallet";
 import {
@@ -179,7 +179,7 @@ export default function TokenDetailsPage() {
             </div>
             <div className="font-display text-2xl font-bold text-white tabular-nums">
               {token.price
-                ? `$${formatNumber(token.price)}`
+                ? `$${formatPrice(token.price)}`
                 : token.priceSol
                 ? `${token.priceSol.toFixed(8)} SOL`
                 : "—"}

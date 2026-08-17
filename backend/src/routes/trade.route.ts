@@ -13,7 +13,6 @@ import {
 } from "../services/jupiter.service.js";
 import { Connection, VersionedTransaction } from "@solana/web3.js";
 import { validateTradeOpportunity } from "../services/tradeValidation.service.js";
-import { executeManualBuy } from "../services/manualBuy.service.js";
 import { getTokenBalance } from "../services/solana.service.js";
 
 const logger = getLogger("trade.route");
@@ -142,84 +141,17 @@ router.post("/validate", async (req, res) => {
   }
 });
 
-/**
- * POST /api/trade/manual-buy
- * body: { tokenMint, amountSol, slippage?, wallet? }
- * NO VALIDATIONS - User discretion only (DYOR)
- */
-router.post("/manual-buy", async (req, res) => {
-  try {
-    const { tokenMint, amountSol, slippage, wallet } = req.body;
-
-    if (!tokenMint || !amountSol) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing required parameters: tokenMint, amountSol",
-      });
-    }
-
-    logger.info(
-      `⚠️ Manual buy request: ${amountSol} SOL for ${tokenMint.slice(
-        0,
-        8
-      )}... (NO VALIDATIONS)`
-    );
-
-    // Execute manual buy with NO validations
-    const result = await executeManualBuy({
-      tokenMint,
-      amountSol,
-      slippage:
-        slippage ||
-        parseFloat(process.env.MANUAL_BUY_DEFAULT_SLIPPAGE_PCT || "10"),
-      reason: "manual_ui",
-      wallet,
-    });
-
-    if (!result.success) {
-      return res.status(400).json({
-        success: false,
-        message: result.error || "Manual buy failed",
-      });
-    }
-
-    // Store trade in database
-    const trade = await db.addTrade({
-      type: "buy",
-      token: tokenMint,
-      inputMint: "So11111111111111111111111111111111111111112",
-      outputMint: tokenMint,
-      amount: Math.floor(amountSol * 1e9),
-      price: result.pricePerToken || 0,
-      pnl: 0,
-      wallet: wallet || process.env.WALLET_PUBLIC_KEY || "",
-      simulated: false,
-      signature: result.signature || null,
-      route: "jupiter",
-      timestamp: new Date(),
-    });
-
-    // Broadcast via socket
-    const io = (req.app as any)?.get?.("io") ?? (req.app as any)?.locals?.io;
-    io?.emit?.("tradeFeed", trade);
-
-    logger.info(`✅ Manual buy executed: ${result.signature}`);
-
-    return res.json({
-      success: true,
-      data: {
-        ...result,
-        trade,
-      },
-    });
-  } catch (error: any) {
-    logger.error(`Manual buy error: ${error.message}`);
-    return res.status(500).json({
-      success: false,
-      message: error.message || "Manual buy failed",
-    });
-  }
-});
+// A "POST /api/trade/manual-buy" endpoint used to live here — like the
+// generic "POST /api/trade" root endpoint noted below, it held its own
+// server-side signing authority (manualBuy.service.ts's executeManualBuy,
+// via jupiter.service.ts's executeJupiterSwap with no signer override) that
+// always signed with the operator's own env-configured wallet regardless of
+// the `wallet` field in the request body — a real fund-misattribution bug,
+// not a functioning per-user path. The real manual-buy flow is /prepare +
+// /confirm below, where the connected wallet signs its own transaction
+// client-side (see frontend/hooks/useTrade.ts, frontend/app/trading/buy).
+// Removed along with its now-fully-unused manualBuy.service.ts, rather than
+// left reachable with a real signer bug and zero remaining callers.
 
 // A generic "POST /api/trade" (root) endpoint used to live here — a second,
 // server-signs-the-transaction execution path alongside the real one below

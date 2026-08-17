@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card } from "@components/ui/card";
 import { Button } from "@components/ui/button";
-import { fetcher, formatNumber, truncateAddress } from "@lib/utils";
+import { fetcher, formatNumber, formatPrice, truncateAddress } from "@lib/utils";
 import { useWallet } from "@hooks/useWallet";
 import { useTrade } from "@hooks/useTrade";
 import { ArrowLeft, Loader2, TrendingDown } from "lucide-react";
@@ -129,7 +129,7 @@ export default function SellPage() {
                 {truncateAddress(selected.token)}
               </h2>
               <p className="text-xs text-gray-500">
-                Avg buy price: {selected.avgBuyPrice ? formatNumber(selected.avgBuyPrice, 9) : "—"}{" "}
+                Avg buy price: {selected.avgBuyPrice ? formatPrice(selected.avgBuyPrice) : "—"}{" "}
                 SOL
               </p>
             </div>

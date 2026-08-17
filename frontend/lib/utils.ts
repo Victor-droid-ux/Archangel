@@ -80,6 +80,24 @@ export const formatNumber = (num: number, decimals = 2) =>
   }).format(num);
 
 /**
+ * 💵 Format a token price specifically — freshly-launched tokens routinely
+ * price at a small fraction of a cent (e.g. $0.0000144), and formatNumber's
+ * normal 2-decimal default rounds that straight to "0", which reads as "no
+ * price data" even though a real price exists. Uses significant digits
+ * instead of a fixed decimal count for anything under $1, so a genuinely
+ * tiny price still shows real digits.
+ */
+export const formatPrice = (num: number): string => {
+  if (!Number.isFinite(num)) return "—";
+  if (num === 0) return "0";
+  if (Math.abs(num) >= 1) return formatNumber(num, 2);
+  return Intl.NumberFormat("en-US", {
+    maximumSignificantDigits: 4,
+    minimumSignificantDigits: 2,
+  }).format(num);
+};
+
+/**
  * 🔗 Shorten Solana addresses — matches the 8+4 convention used everywhere
  * else in the app truncates a mint/address inline (LiveTrades.tsx,
  * PipelineStatus.tsx, TokenDiscovery.tsx, etc.)

@@ -1,13 +1,12 @@
 "use client";
 
 import React, { useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { TrendingUp, TrendingDown, Zap, Loader2 } from "lucide-react";
+import { TrendingUp, TrendingDown, Zap } from "lucide-react";
 import { Button } from "@components/ui/button";
-import { useTrade } from "@hooks/useTrade";
 import { useSocket } from "@hooks/useSocket";
 import { useWallet } from "@hooks/useWallet";
-import { useTradingConfigStore } from "@hooks/useConfig";
 import toast from "react-hot-toast";
 import TokenDiscovery from "@components/trading/TokenDiscovery";
 import LiveTrades from "@components/trading/LiveTrades";
@@ -31,10 +30,9 @@ export default function TradingPage() {
   // Auto-sync stats from backend
   useStatsSync();
 
+  const router = useRouter();
   const { connected } = useWallet();
-  const { executeTrade, loading } = useTrade();
   const { connected: socketConnected, lastMessage } = useSocket();
-  const { selectedToken } = useTradingConfigStore();
 
   // Toast notification on every trade — the full log lives in LiveTrades below.
   useEffect(() => {
@@ -50,18 +48,6 @@ export default function TradingPage() {
       { duration: 3000 }
     );
   }, [lastMessage]);
-
-  const handleTrade = async (type: "buy" | "sell") => {
-    if (!connected) {
-      toast.error("Please connect your wallet first!");
-      return;
-    }
-    if (!selectedToken) {
-      toast.error("Please select a token first!");
-      return;
-    }
-    await executeTrade(type, selectedToken);
-  };
 
   return (
     <div className="space-y-8">
@@ -103,38 +89,34 @@ export default function TradingPage() {
       <motion.div {...fadeIn(0.05)} className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Button
           variant="secondary"
-          onClick={() => handleTrade("buy")}
-          disabled={loading || !connected}
+          onClick={() => {
+            if (!connected) {
+              toast.error("Please connect your wallet first!");
+              return;
+            }
+            router.push("/trading/buy");
+          }}
+          disabled={!connected}
           className="text-base py-4 hover:shadow-glow-success"
         >
-          {loading ? (
-            <Loader2 className="animate-spin" size={18} />
-          ) : (
-            <TrendingUp size={18} className="text-success" />
-          )}
-          {loading
-            ? "Executing..."
-            : selectedToken
-            ? `Buy ${selectedToken}`
-            : "Select a Token to Buy"}
+          <TrendingUp size={18} className="text-success" />
+          Buy a Token
         </Button>
 
         <Button
           variant="secondary"
-          onClick={() => handleTrade("sell")}
-          disabled={loading || !connected}
+          onClick={() => {
+            if (!connected) {
+              toast.error("Please connect your wallet first!");
+              return;
+            }
+            router.push("/trading/sell");
+          }}
+          disabled={!connected}
           className="text-base py-4"
         >
-          {loading ? (
-            <Loader2 className="animate-spin" size={18} />
-          ) : (
-            <TrendingDown size={18} className="text-danger" />
-          )}
-          {loading
-            ? "Executing..."
-            : selectedToken
-            ? `Sell ${selectedToken}`
-            : "Select a Token to Sell"}
+          <TrendingDown size={18} className="text-danger" />
+          Sell a Token
         </Button>
       </motion.div>
 

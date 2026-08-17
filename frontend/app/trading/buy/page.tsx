@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useState, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Card } from "@components/ui/card";
 import { Input } from "@components/ui/input";
 import { Button } from "@components/ui/button";
@@ -27,8 +27,12 @@ interface BuyCandidate {
 // doesn't fail on-chain from having nothing left for fees.
 const FEE_BUFFER_SOL = 0.005;
 
-export default function BuyPage() {
+// useSearchParams() opts this subtree out of static rendering unless it's
+// isolated behind a Suspense boundary — see the default export below.
+function BuyPageInner() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const preselectMint = searchParams.get("mint");
   const { connected, balance, refreshBalance } = useWallet();
   const { executeTrade, loading: submitting } = useTrade();
 
@@ -44,7 +48,20 @@ export default function BuyPage() {
         const res = await fetcher<{ success: boolean; candidates: BuyCandidate[] }>(
           "/api/trade/manual-buy-candidates?limit=40"
         );
-        if (mounted && res?.success) setCandidates(res.candidates || []);
+        if (!mounted || !res?.success) return;
+        const list = res.candidates || [];
+        setCandidates(list);
+        // Arrived via a link naming a specific token (e.g. TokenDiscovery's
+        // "Buy" button) — jump straight to its detail/amount step instead of
+        // making them find it again in the list.
+        if (preselectMint) {
+          const match = list.find((c) => c.mint === preselectMint);
+          if (match) setSelected(match);
+          else
+            toast.error(
+              "That token isn't currently in the bot's validated list — pick another below."
+            );
+        }
       } catch (err) {
         console.error("Failed to load buy candidates:", err);
         toast.error("Failed to load tokens.");
@@ -55,7 +72,7 @@ export default function BuyPage() {
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [preselectMint]);
 
   useEffect(() => {
     if (connected) refreshBalance();
@@ -218,5 +235,13 @@ export default function BuyPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function BuyPage() {
+  return (
+    <Suspense fallback={null}>
+      <BuyPageInner />
+    </Suspense>
   );
 }

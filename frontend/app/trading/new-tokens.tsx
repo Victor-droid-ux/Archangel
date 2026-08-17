@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
 import { useSocket } from "@hooks/useSocket";
-import { fetcher, formatNumber } from "@lib/utils";
+import { fetcher, formatNumber, formatPrice } from "@lib/utils";
 import { TokenConfigModal } from "@components/trading/token-config-modal";
 
 interface Token {
@@ -180,7 +180,7 @@ export const NewTokens = () => {
                     }`}
                   >
                     {t.price
-                      ? formatNumber(t.price)
+                      ? formatPrice(t.price)
                       : t.priceSol
                         ? `${t.priceSol.toFixed(8)} SOL`
                         : "-"}

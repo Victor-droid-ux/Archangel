@@ -1,13 +1,14 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardTitle, CardContent } from "../ui/card";
 import { Table, Spinner } from "../ui/table";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import { WalletBalance } from "../ui";
-import { Archive, Search, X } from "lucide-react";
+import { Archive, Search, X, ShoppingCart } from "lucide-react";
 import {
   ResponsiveContainer,
   LineChart,
@@ -17,8 +18,6 @@ import {
   Tooltip,
   CartesianGrid,
 } from "recharts";
-import { useManualBuy } from "@hooks/useManualBuy";
-import { useWallet } from "@hooks/useWallet";
 
 export type OldToken = {
   mint: string;
@@ -415,81 +414,34 @@ export default function OldTokensDashboard() {
   );
 }
 
-// ManualBuyPanel with token prop
-export function ManualBuyPanel({ token }: { token: OldToken }) {
-  const [amountSol, setAmountSol] = useState<string>("0.1");
-  const [slippage, setSlippage] = useState<string>("10");
-  const { executeManualBuy, loading } = useManualBuy();
-  const { connected, connectWallet } = useWallet();
-  const [result, setResult] = useState<string | null>(null);
-
-  const handleManualBuy = async () => {
-    setResult(null);
-    if (!connected) {
-      await connectWallet();
-      return;
-    }
-    const res = await executeManualBuy({
-      tokenMint: token.mint,
-      amountSol: parseFloat(amountSol),
-      slippage: parseFloat(slippage),
-    });
-    if (res?.success) {
-      setResult(`Success! Tx: ${res.signature}`);
-    } else {
-      setResult(res?.error || "Manual buy failed");
-    }
-  };
+// Links into the real, tested manual-buy flow (/trading/buy) instead of
+// executing here directly — this used to sign every "manual" buy with the
+// operator's own env-configured wallet regardless of who was connected
+// (useManualBuy → /api/trade/manual-buy → executeManualBuy, which never
+// accepted a signer override), a real fund-misattribution bug, not a
+// shortcut worth keeping. The Buy page only lists the bot's own validated
+// tokens, so an old/inactive token may not preselect there — that's
+// intentional, not a bug: buying now re-validates safety at that moment,
+// which an old token failing means it genuinely shouldn't be bought blind.
+function ManualBuyPanel({ token }: { token: OldToken }) {
+  const router = useRouter();
 
   return (
     <div className="border border-warning/20 bg-warning/[0.04] rounded-xl p-4">
       <div className="mb-3 font-display font-semibold text-warning text-sm">
-        ⚠️ Manual Buy (No Validations)
-      </div>
-      <div className="flex flex-wrap gap-4 mb-3">
-        <div>
-          <Label>Amount (SOL)</Label>
-          <Input
-            type="number"
-            step="0.01"
-            min="0.001"
-            value={amountSol}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-              setAmountSol(e.target.value)
-            }
-            className="w-28 mt-1.5"
-          />
-        </div>
-        <div>
-          <Label>Slippage (%)</Label>
-          <Input
-            type="number"
-            step="1"
-            min="1"
-            max="50"
-            value={slippage}
-            onChange={(e) => setSlippage(e.target.value)}
-            className="w-24 mt-1.5"
-          />
-        </div>
+        Buy {token.symbol || "this token"}
       </div>
       <Button
-        onClick={handleManualBuy}
-        disabled={loading}
-        variant="danger"
+        onClick={() => router.push(`/trading/buy?mint=${token.mint}`)}
+        variant="secondary"
         className="w-full"
       >
-        {loading
-          ? "Executing..."
-          : connected
-          ? `Buy ${token.symbol || token.mint}`
-          : "Connect Wallet"}
+        <ShoppingCart className="h-4 w-4" />
+        Buy {token.symbol || token.mint}
       </Button>
-      {result && (
-        <div className="mt-2 text-success text-sm break-all">{result}</div>
-      )}
       <p className="text-xs text-base-content/40 mt-2">
-        No validation • User discretion only
+        Re-checks the bot&apos;s own safety validation at the moment you buy —
+        signed by your own connected wallet, not the bot&apos;s.
       </p>
     </div>
   );

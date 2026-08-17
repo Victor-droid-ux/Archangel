@@ -58,6 +58,10 @@ export function TokenPriceChart({
           <div className="flex items-center justify-center h-full text-gray-400">
             Loading chart…
           </div>
+        ) : data.length === 0 ? (
+          <div className="flex items-center justify-center h-full text-gray-500 text-sm text-center px-4">
+            No chart data available for this token yet.
+          </div>
         ) : (
           <ResponsiveContainer width="100%" height="100%">
             <LineChart

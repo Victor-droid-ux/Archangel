@@ -5,7 +5,7 @@ import React, { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
-import { fetcher, formatNumber } from "@lib/utils";
+import { fetcher, formatNumber, formatPrice } from "@lib/utils";
 import { useSocket } from "@hooks/useSocket";
 import { useTrailingStop } from "@hooks/useTrailingStop";
 import { TrancheProgress } from "@components/trading/TrancheProgress";
@@ -165,11 +165,11 @@ export const PositionsPanel: React.FC = () => {
                         </td>
 
                         <td className="py-2 text-right">
-                          {p.avgBuyPrice ? formatNumber(p.avgBuyPrice) : "—"}
+                          {p.avgBuyPrice ? formatPrice(p.avgBuyPrice) : "—"}
                         </td>
 
                         <td className="py-2 text-right">
-                          {p.currentPrice ? formatNumber(p.currentPrice) : "—"}
+                          {p.currentPrice ? formatPrice(p.currentPrice) : "—"}
                         </td>
 
                         <td

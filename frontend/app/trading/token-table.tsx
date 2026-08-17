@@ -3,7 +3,7 @@
 import React, { useEffect } from "react";
 import useSWR from "swr";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
-import { fetcher, formatNumber } from "@lib/utils";
+import { fetcher, formatPrice } from "@lib/utils";
 import { Loader2 } from "lucide-react";
 import { useSocket } from "@hooks/useSocket";
 
@@ -96,7 +96,7 @@ export default function TokenTable() {
                     <td className="py-2 px-4 font-medium">{t.symbol}</td>
 
                     <td className="py-2 px-4 text-right">
-                      {t.price !== null ? formatNumber(t.price) : "—"}
+                      {t.price !== null ? formatPrice(t.price) : "—"}
                     </td>
 
                     <td

@@ -37,6 +37,64 @@ async function resolveSignerForPosition(
   return userWalletService.getUserWalletKeypair(ownerWallet);
 }
 
+// A token whose pool has genuinely run dry (fully rugged/delisted) can
+// never be sold, no matter how many times a Jupiter quote is retried — but
+// nothing here can tell "temporarily no route" apart from "permanently no
+// route" in advance. Rather than guessing, this backs off the retry
+// frequency (and the alert spam) after enough consecutive failures, while
+// still trying occasionally in case liquidity genuinely comes back.
+const SELL_BACKOFF_THRESHOLD = 5; // consecutive failures before slowing down
+const SELL_BACKOFF_INTERVAL_MS = 30 * 60 * 1000; // 30 min between attempts once backed off
+// Once backed off, only re-alert every Nth backed-off attempt (~6h at the
+// 30-minute interval above) instead of every single one.
+const SELL_NOTIFY_EVERY_N_BACKED_OFF_ATTEMPTS = 12;
+
+/** True if this position is in backoff cooldown and this tick should skip
+ * attempting a sell for it entirely (no Jupiter call, no log spam). */
+function isSellInBackoffCooldown(pos: {
+  sellFailureCount?: number;
+  lastSellAttemptAt?: Date | string | null;
+}): boolean {
+  const failures = pos.sellFailureCount ?? 0;
+  if (failures < SELL_BACKOFF_THRESHOLD) return false;
+  const last = pos.lastSellAttemptAt
+    ? new Date(pos.lastSellAttemptAt).getTime()
+    : 0;
+  return Date.now() - last < SELL_BACKOFF_INTERVAL_MS;
+}
+
+/** Records a failed sell attempt and returns whether this specific failure
+ * should actually be alerted on (vs. silently logged) — always the first
+ * failure, never again until backed off, then only every Nth attempt. */
+async function recordSellFailure(
+  tokenMint: string,
+  wallet: string,
+  currentFailureCount: number | undefined
+): Promise<{ newCount: number; shouldNotify: boolean }> {
+  const newCount = (currentFailureCount ?? 0) + 1;
+  await dbService.updatePositionMetadata(tokenMint, wallet, {
+    sellFailureCount: newCount,
+    lastSellAttemptAt: new Date(),
+  });
+  const shouldNotify =
+    newCount <= 1 ||
+    (newCount >= SELL_BACKOFF_THRESHOLD &&
+      (newCount - SELL_BACKOFF_THRESHOLD) %
+        SELL_NOTIFY_EVERY_N_BACKED_OFF_ATTEMPTS ===
+        0);
+  return { newCount, shouldNotify };
+}
+
+/** Clears the failure streak after any successful sell for this position. */
+async function recordSellSuccess(
+  tokenMint: string,
+  wallet: string
+): Promise<void> {
+  await dbService.updatePositionMetadata(tokenMint, wallet, {
+    sellFailureCount: 0,
+  });
+}
+
 const log = getLogger("monitor");
 
 /* ------------------------------------------------------------------
@@ -182,6 +240,14 @@ export function startPositionMonitor(
             process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
           );
           if (!pos.netSol || pos.netSol < DUST_THRESHOLD_SOL) continue;
+
+          // A position that's failed to sell repeatedly (e.g. a rugged
+          // token with no Jupiter route left) backs off to a slow retry
+          // instead of hammering Jupiter and re-alerting every 5-second tick
+          // forever — see recordSellFailure/isSellInBackoffCooldown above.
+          if (isSellInBackoffCooldown(pos)) {
+            continue;
+          }
 
           // Grace period: don't evaluate TP/SL/emergency-exit at all until the
           // position has been open long enough for the price feed to settle.
@@ -387,6 +453,7 @@ export function startPositionMonitor(
                 };
 
                 await dbService.addTrade(emergencyTrade);
+                await recordSellSuccess(tokenMint, pos.wallet);
 
                 // Emergency exit always sells the entire position — stop the
                 // live P&L poll loop, otherwise it keeps polling Birdeye for
@@ -418,6 +485,28 @@ export function startPositionMonitor(
                   },
                   "Emergency exit swap failed!"
                 );
+
+                const { newCount, shouldNotify } = await recordSellFailure(
+                  tokenMint,
+                  pos.wallet,
+                  pos.sellFailureCount
+                );
+                if (shouldNotify) {
+                  notify
+                    .notifyError({
+                      source: "position-monitor",
+                      message: `Emergency exit failed for ${tokenMint}${
+                        newCount >= SELL_BACKOFF_THRESHOLD
+                          ? ` (${newCount} consecutive failures — backing off to a 30-minute retry interval)`
+                          : ""
+                      }`,
+                      details: {
+                        error: emergencySwap.error,
+                        reason: emergencyCheck.criticalReason,
+                      },
+                    })
+                    .catch(() => {});
+                }
               }
             }
 
@@ -524,6 +613,7 @@ export function startPositionMonitor(
                   };
 
                   await dbService.addTrade(tieredTrade);
+                  await recordSellSuccess(tokenMint, pos.wallet);
 
                   emitToWalletOrGlobal(io, pos.wallet, "tradeFeed", {
                     ...tieredTrade,
@@ -543,6 +633,30 @@ export function startPositionMonitor(
                     },
                     "✅ Tiered profit sell executed"
                   );
+                } else {
+                  log.error(
+                    { tokenMint, error: tieredSwap.error },
+                    "Tiered profit sell failed"
+                  );
+
+                  const { newCount, shouldNotify } = await recordSellFailure(
+                    tokenMint,
+                    pos.wallet,
+                    pos.sellFailureCount
+                  );
+                  if (shouldNotify) {
+                    notify
+                      .notifyError({
+                        source: "position-monitor",
+                        message: `Tiered profit sell failed for ${tokenMint}${
+                          newCount >= SELL_BACKOFF_THRESHOLD
+                            ? ` (${newCount} consecutive failures — backing off to a 30-minute retry interval)`
+                            : ""
+                        }`,
+                        details: { error: tieredSwap.error, tierReason, sellPercent },
+                      })
+                      .catch(() => {});
+                  }
                 }
               }
             }
@@ -656,17 +770,29 @@ export function startPositionMonitor(
                 "Auto-sell swap failed"
               );
 
-              // Send error notification
-              notify
-                .notifyError({
-                  source: "position-monitor",
-                  message: `Auto-sell failed for ${tokenMint}`,
-                  details: { error: swapRes.error, pnlPercent, tpPct, slPct },
-                })
-                .catch(() => {});
+              const { newCount, shouldNotify } = await recordSellFailure(
+                tokenMint,
+                pos.wallet,
+                pos.sellFailureCount
+              );
+              if (shouldNotify) {
+                notify
+                  .notifyError({
+                    source: "position-monitor",
+                    message: `Auto-sell failed for ${tokenMint}${
+                      newCount >= SELL_BACKOFF_THRESHOLD
+                        ? ` (${newCount} consecutive failures — backing off to a 30-minute retry interval)`
+                        : ""
+                    }`,
+                    details: { error: swapRes.error, pnlPercent, tpPct, slPct },
+                  })
+                  .catch(() => {});
+              }
 
               continue;
             }
+
+            await recordSellSuccess(tokenMint, pos.wallet);
 
             // Build trade record in DB format
             const tradeRecord = {
