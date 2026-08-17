@@ -25,6 +25,7 @@ import {
   getEffectiveLaunchWindowSeconds,
 } from "./traderConfig.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
+import { withWalletLock } from "../utils/walletMutex.js";
 
 const LOG = getLogger("autoBuyer");
 import { ENV } from "../utils/env.js";
@@ -275,11 +276,12 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
         }
       }
 
-      const trade = await executeAutoBuyForWallet(
-        io,
-        mint,
-        decimals,
-        walletContext
+      // Serialized per wallet (see walletMutex.ts) — if this wallet already
+      // has a buy in flight from a different token/pipeline, this waits for
+      // it to finish and sizes against the balance actually left afterward,
+      // rather than racing it off the same stale balance reading.
+      const trade = await withWalletLock(walletContext.ownerWallet, () =>
+        executeAutoBuyForWallet(io, mint, decimals, walletContext)
       );
       if (trade) lastTrade = trade;
     }
@@ -312,7 +314,7 @@ async function executeAutoBuyForWallet(
     // whatever scale the wallet actually supports.
     const walletBalance = await getBalanceInSol(wallet);
     const riskPct = ENV.AUTO_TRADE_PERCENT_OF_BALANCE;
-    const minTradeSol = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.01);
+    const minTradeSol = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
     const buySol = walletBalance * riskPct;
 
     if (buySol < minTradeSol) {

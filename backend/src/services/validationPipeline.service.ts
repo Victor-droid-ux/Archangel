@@ -92,7 +92,7 @@ class ValidationPipelineService {
   // Floor below which a trade is too small to be worth executing, not a hard
   // trade-size constant — the actual buy amount is computed per-run in
   // runPipeline() as a percentage of live wallet balance (see there for why).
-  private readonly MIN_TRADE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.01);
+  private readonly MIN_TRADE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
   private readonly AUTO_BUY_SLIPPAGE = parseFloat(
     process.env.AUTO_BUY_SLIPPAGE_PCT || "10"
   );

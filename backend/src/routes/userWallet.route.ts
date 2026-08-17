@@ -15,7 +15,7 @@ const log = getLogger("userWallet.route");
 const AUTO_TRADE_PERCENT_OF_BALANCE = Number(
   process.env.AUTO_TRADE_PERCENT_OF_BALANCE ?? 0.02
 );
-const MIN_AUTO_TRADE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.01);
+const MIN_AUTO_TRADE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
 const MIN_BALANCE_FOR_AUTO_TRADE_SOL =
   AUTO_TRADE_PERCENT_OF_BALANCE > 0
     ? MIN_AUTO_TRADE_SOL / AUTO_TRADE_PERCENT_OF_BALANCE

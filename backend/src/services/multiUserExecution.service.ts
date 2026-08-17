@@ -19,6 +19,7 @@ import userWalletService from "./userWallet.service.js";
 import { getTraderConfig } from "./traderConfig.service.js";
 import { loadKeypairFromEnv } from "./solana.service.js";
 import dbService from "./db.service.js";
+import { withWalletLock } from "../utils/walletMutex.js";
 
 const LOG = getLogger("multi-user-execution");
 
@@ -26,7 +27,7 @@ const LOG = getLogger("multi-user-execution");
 // (matches validationPipeline.service.ts's own MIN_AUTO_TRADE_SOL floor —
 // no point fanning a pipeline run out to a wallet that Stage 0 will reject
 // anyway, that's just wasted Jupiter/Birdeye calls).
-const MIN_FUNDED_BALANCE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.01);
+const MIN_FUNDED_BALANCE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
 
 const OPERATOR_WALLET =
   process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
@@ -191,10 +192,14 @@ export async function runPipelineForAllEligibleWallets(
         continue;
       }
 
-      const result = await validationPipelineService.runPipeline(
-        tokenMint,
-        lpSol,
-        walletContext
+      // Serialized per wallet (see walletMutex.ts) — this pipeline and
+      // autoBuyer.service.ts's both size trades as a percentage of live
+      // balance, so a wallet with a buy already in flight (from either
+      // pipeline, for a different token) must not have a second one read
+      // the same stale balance concurrently. This one waits its turn and
+      // sizes against whatever's actually left afterward.
+      const result = await withWalletLock(walletContext.ownerWallet, () =>
+        validationPipelineService.runPipeline(tokenMint, lpSol, walletContext)
       );
       results.push({ ownerWallet: walletContext.ownerWallet, result });
     } catch (err: any) {
