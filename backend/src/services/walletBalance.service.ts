@@ -101,9 +101,13 @@ export async function startWalletBalanceSync(
           // Update last balance
           sync.lastBalance = currentBalance;
         }
-      } catch (err) {
+      } catch (err: any) {
+        // fetch's TypeError wraps the real reason (ECONNRESET, ETIMEDOUT,
+        // DNS failure, ...) in .cause — plain `${err}` interpolation drops
+        // it, leaving only the unhelpful "TypeError: fetch failed".
         log.error(
-          `Failed to sync balance for ${wallet.slice(0, 8)}...: ${err}`
+          { err: err?.message ?? String(err), cause: err?.cause?.message ?? err?.cause },
+          `Failed to sync balance for ${wallet.slice(0, 8)}...`
         );
       }
     }, intervalMs);
@@ -123,9 +127,10 @@ export async function startWalletBalanceSync(
         activeWalletSyncs.size
       } active syncs)`
     );
-  } catch (err) {
+  } catch (err: any) {
     log.error(
-      `Failed to start balance sync for ${wallet.slice(0, 8)}...: ${err}`
+      { err: err?.message ?? String(err), cause: err?.cause?.message ?? err?.cause },
+      `Failed to start balance sync for ${wallet.slice(0, 8)}...`
     );
     throw err;
   }

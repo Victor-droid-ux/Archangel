@@ -3,6 +3,7 @@ import { getLogger } from "../utils/logger.js";
 import { getLatestTokens } from "../services/tokenPrice.service.js";
 import dbService from "../services/db.service.js";
 import { poolMonitor } from "../services/poolMonitor.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 import {
   startWalletBalanceSync,
   stopWalletBalanceSync,
@@ -147,26 +148,34 @@ export function registerSocketHandlers(io: Server) {
     });
 
     /**
-     * FRONTEND TRADE EVENTS → Broadcast to all
-     * and trigger stats recalculation
+     * FRONTEND TRADE EVENTS → scoped to the sending socket's own identified
+     * wallet (not a global broadcast — this is that wallet's own manual
+     * trade, private the same as every other per-wallet activity), plus a
+     * refreshed stats snapshot for that same wallet.
      */
     socket.on("tradeLog", async (payload) => {
-      logger.info("📥 tradeLog received → broadcasting");
-      io.emit("tradeFeed", {
+      const wallet = socket.data?.wallet;
+      logger.info({ wallet }, "📥 tradeLog received");
+      emitToWalletOrGlobal(io, wallet, "tradeFeed", {
         ...payload,
         timestamp: new Date().toISOString(),
       });
 
-      const stats = await dbService.getStats();
-      io.emit("stats:update", stats);
+      if (wallet) {
+        const stats = await dbService.getStats(wallet);
+        emitToWalletOrGlobal(io, wallet, "stats:update", stats);
+      }
     });
 
     socket.on("trade:update", async (payload) => {
-      logger.info("📡 trade:update received");
-      io.emit("tradeFeed", payload);
+      const wallet = socket.data?.wallet;
+      logger.info({ wallet }, "📡 trade:update received");
+      emitToWalletOrGlobal(io, wallet, "tradeFeed", payload);
 
-      const stats = await dbService.getStats();
-      io.emit("stats:update", stats);
+      if (wallet) {
+        const stats = await dbService.getStats(wallet);
+        emitToWalletOrGlobal(io, wallet, "stats:update", stats);
+      }
     });
 
     /**
@@ -185,24 +194,44 @@ export function registerSocketHandlers(io: Server) {
     });
 
     /**
-     * FRONTEND CAN REQUEST CURRENT STATS
+     * FRONTEND CAN REQUEST CURRENT STATS — scoped to this socket's own
+     * identified wallet (set by "identify", above). Unidentified (no wallet
+     * connected) correctly gets back zeroed stats from getStats(undefined).
      */
     socket.on("stats:request", async () => {
-      const stats = await dbService.getStats();
+      const stats = await dbService.getStats(socket.data?.wallet);
       socket.emit("stats:update", stats);
     });
 
     /**
-     * PORTFOLIO P&L REQUEST
+     * PORTFOLIO P&L REQUEST — scoped to this socket's own identified wallet.
+     * Was previously hardcoded to the operator's own P&L regardless of who
+     * asked, which handed the operator's private numbers to any socket.
      */
     socket.on("pnl:request", async () => {
       try {
-        // No specific viewer identified on this event — show the operator's
-        // own P&L (its public activity), never a blend of every user's
-        // private data (see db.service.ts's viewerWalletFilter).
-        const portfolioPnL = await dbService.getPortfolioPnL(
-          dbService.OPERATOR_WALLET
-        );
+        const wallet = socket.data?.wallet;
+        const portfolioPnL = wallet
+          ? await dbService.getPortfolioPnL(wallet)
+          : {
+              totalInvestedSol: 0,
+              totalReturnedSol: 0,
+              unrealizedPnlSol: 0,
+              realizedPnlSol: 0,
+              totalPnlSol: 0,
+              totalPnlPercent: 0,
+              winningTrades: 0,
+              losingTrades: 0,
+              totalTrades: 0,
+              winRate: 0,
+              averageWinSol: 0,
+              averageLossSol: 0,
+              largestWinSol: 0,
+              largestLossSol: 0,
+              openPositionsValue: 0,
+              closedPositionsValue: 0,
+              roi: 0,
+            };
         // See pnlBroadcaster.service.ts — "pnl:update" is reserved for
         // pnlTracker.service.ts's per-token PnLUpdate payload shape.
         socket.emit("portfolio:pnl:update", portfolioPnL);
@@ -212,12 +241,12 @@ export function registerSocketHandlers(io: Server) {
     });
 
     /**
-     * TOKEN P&L REQUEST
+     * TOKEN P&L REQUEST — same reasoning as pnl:request above.
      */
     socket.on("pnl:tokens:request", async () => {
       try {
-        // Same reasoning as pnl:request above.
-        const tokenPnL = await dbService.getTokenPnL(dbService.OPERATOR_WALLET);
+        const wallet = socket.data?.wallet;
+        const tokenPnL = wallet ? await dbService.getTokenPnL(wallet) : [];
         socket.emit("pnl:tokens:update", tokenPnL);
       } catch (err: any) {
         logger.error("Failed to fetch token P&L:", err?.message);

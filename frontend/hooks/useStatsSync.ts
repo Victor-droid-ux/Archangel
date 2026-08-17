@@ -111,16 +111,14 @@ export const useStatsSync = () => {
     return () => clearInterval(interval);
   }, [updateStats, setLoading, publicKey]);
 
-  // 2️⃣ Live updates from socket — this broadcast is always the bot's own
-  // global numbers (see stats.route.ts/socket.route.ts, unscoped by wallet),
-  // so applying it while a specific wallet is connected would overwrite
-  // that wallet's own correctly-scoped numbers with the operator's. Only
-  // apply it when no wallet is connected; the scoped poll above keeps a
-  // connected wallet's numbers fresh instead.
+  // 2️⃣ Live updates from socket — the backend now scopes this event to only
+  // the socket that identified as the same wallet it's reporting on (see
+  // socket.route.ts's "identify" room join + emitToWalletOrGlobal), so
+  // whatever arrives here is already this wallet's own data, safe to apply
+  // regardless of connection state.
   useEffect(() => {
     if (!lastMessage) return;
     if (lastMessage.event !== "stats:update") return;
-    if (publicKey) return;
 
     const s = lastMessage.payload;
     if (!s) return;
@@ -135,5 +133,5 @@ export const useStatsSync = () => {
       tradeVolumeSol: Number(s.tradeVolumeSol ?? prev.tradeVolumeSol),
       winRate: Number(s.winRate ?? prev.winRate),
     }));
-  }, [lastMessage, updateStats, publicKey]);
+  }, [lastMessage, updateStats]);
 };

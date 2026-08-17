@@ -24,6 +24,11 @@ export interface PortfolioPnL {
   openPositionsValue: number;
   closedPositionsValue: number;
   roi: number;
+  // Total SOL ever deposited into this wallet's custodial trading wallet,
+  // and that total plus net PnL (= Portfolio Value shown elsewhere on the
+  // dashboard). See backend/src/services/portfolioValuation.service.ts.
+  totalDepositedSol: number;
+  portfolioValue: number;
 }
 
 export interface TokenPnL {
@@ -99,22 +104,20 @@ export function usePnLData(historyDays = 30) {
     return () => clearInterval(interval);
   }, [load]);
 
-  // Live updates without waiting for the next poll tick. Both broadcasts are
-  // always the bot's own unscoped global numbers (pnlBroadcaster.service.ts /
-  // socket.route.ts's pnl:tokens:request) — applying them while a specific
-  // wallet is connected would overwrite that wallet's correctly-scoped P&L
-  // with the operator's. Only apply them with no wallet connected; the
-  // scoped poll above keeps a connected wallet's numbers fresh instead.
+  // Live updates without waiting for the next poll tick. The backend now
+  // scopes both broadcasts to only the socket that identified as the same
+  // wallet they report on (see socket.route.ts's "identify" room join +
+  // emitToWalletOrGlobal), so whatever arrives here is already this
+  // wallet's own data, safe to apply regardless of connection state.
   useEffect(() => {
     if (!lastMessage) return;
-    if (publicKey) return;
     if (lastMessage.event === "portfolio:pnl:update") {
       setPortfolio(lastMessage.payload);
     }
     if (lastMessage.event === "pnl:tokens:update") {
       setTokenPnL(lastMessage.payload || []);
     }
-  }, [lastMessage, publicKey]);
+  }, [lastMessage]);
 
   useEffect(() => {
     if (connected) sendMessage("pnl:tokens:request");

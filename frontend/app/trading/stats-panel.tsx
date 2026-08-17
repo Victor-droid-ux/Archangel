@@ -5,10 +5,12 @@ import React from "react";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
 import { TrendingUp, Wallet, Activity } from "lucide-react";
 import { useStats } from "@hooks/useStats";
+import { useWallet } from "@hooks/useWallet";
 import { formatNumber } from "@lib/utils";
 
 export default function StatsPanel() {
   const { stats, loading } = useStats();
+  const { connected, balance } = useWallet();
 
   if (loading) {
     return (
@@ -28,7 +30,7 @@ export default function StatsPanel() {
         </CardTitle>
       </CardHeader>
 
-      <CardContent className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center text-sm">
+      <CardContent className="grid grid-cols-2 md:grid-cols-5 gap-4 text-center text-sm">
         {/* TOTAL PROFIT */}
         <div>
           <p className="opacity-60 text-xs">Total Profit</p>
@@ -60,12 +62,22 @@ export default function StatsPanel() {
           <span className="font-bold">{stats.winRate.toFixed(1)}%</span>
         </div>
 
-        {/* PORTFOLIO VALUE */}
+        {/* PORTFOLIO VALUE — total deposited + net PnL, your trading equity */}
         <div>
           <p className="opacity-60 text-xs">Portfolio Value</p>
           <span className="font-bold flex items-center gap-1 justify-center">
             <Wallet size={14} className="opacity-70" />
             {formatNumber(stats.portfolioValue, 4)} SOL
+          </span>
+        </div>
+
+        {/* WALLET BALANCE — your connected wallet's own SOL, not the
+            custodial trading wallet */}
+        <div>
+          <p className="opacity-60 text-xs">Wallet Balance</p>
+          <span className="font-bold flex items-center gap-1 justify-center">
+            <Wallet size={14} className="opacity-70" />
+            {connected ? `${formatNumber(balance, 4)} SOL` : "—"}
           </span>
         </div>
       </CardContent>

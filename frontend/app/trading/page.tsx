@@ -15,7 +15,6 @@ import LivePnL from "@components/trading/LivePnL";
 import { NewTokens } from "@app/trading/new-tokens";
 import TradeSummary from "@components/trading/trade-summary"; // ✅ imported from ui version
 import TradeHistory from "@components/trading/trade-history";
-import { usePortfolio } from "@hooks/usePortfolio";
 import { useStatsSync } from "@hooks/useStatsSync";
 import { TraderConfigModal } from "@components/trading/trader-config-modal";
 import { RiskManagementPanel } from "@components/trading/risk-management-panel";
@@ -44,9 +43,6 @@ const fadeIn = (delay = 0) => ({
 });
 
 export default function TradingDashboard() {
-  // Initialize portfolio tracking (wallet balance → portfolio value)
-  usePortfolio();
-
   // Fetch/poll real trading stats (Total Profit, Trade Volume, Open Trades,
   // Win Rate) and trade history — without this, StatsPanel and TradeHistory
   // never receive data and their loading state never clears.

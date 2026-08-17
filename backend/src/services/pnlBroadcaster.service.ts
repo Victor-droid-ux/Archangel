@@ -2,6 +2,7 @@
 import { Server } from "socket.io";
 import { getLogger } from "../utils/logger.js";
 import dbService from "./db.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 
 const log = getLogger("pnlBroadcaster");
 
@@ -20,25 +21,29 @@ export function startPnLBroadcaster(
 
   const broadcastPnL = async () => {
     try {
-      // No specific viewer here — this is a broadcast to every connected
-      // socket, so it must show the operator's own P&L (its intentionally
-      // public activity), never every custodial user's private P&L blended
-      // together (see db.service.ts's viewerWalletFilter).
+      // This periodically refreshes the operator's OWN P&L — its own
+      // private activity, same as any custodial user's, so it only reaches
+      // a socket that has identified as the operator's own wallet (see
+      // emitToWalletOrGlobal), never every connected client.
       const portfolioPnL = await dbService.getPortfolioPnL(
         dbService.OPERATOR_WALLET
       );
 
-      // Broadcast to all connected clients. Distinct event name from
-      // pnlTracker.service.ts's "pnl:update" — that one is a per-token,
-      // per-position payload (PnLUpdate: tokenMint/entryPrice/currentPrice/...)
-      // consumed by useJupiterEvents.tsx, which keys its map off `tokenMint`.
-      // This is portfolio-wide (PortfolioPnL: totalInvestedSol/...), no
-      // tokenMint field — reusing the same event name meant every 30s
-      // broadcast here overwrote that map's real per-token data under an
-      // "undefined" key.
-      io.emit("portfolio:pnl:update", portfolioPnL);
+      // Distinct event name from pnlTracker.service.ts's "pnl:update" —
+      // that one is a per-token, per-position payload (PnLUpdate:
+      // tokenMint/entryPrice/currentPrice/...) consumed by
+      // useJupiterEvents.tsx, which keys its map off `tokenMint`. This is
+      // portfolio-wide (PortfolioPnL: totalInvestedSol/...), no tokenMint
+      // field — reusing the same event name meant every 30s broadcast here
+      // overwrote that map's real per-token data under an "undefined" key.
+      emitToWalletOrGlobal(
+        io,
+        dbService.OPERATOR_WALLET,
+        "portfolio:pnl:update",
+        portfolioPnL
+      );
 
-      log.debug("Broadcasted portfolio P&L update");
+      log.debug("Broadcasted operator's portfolio P&L update");
     } catch (err: any) {
       log.error({ err: err?.message ?? String(err) }, "Error broadcasting P&L");
     }

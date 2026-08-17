@@ -13,6 +13,7 @@ import { startTokenWatcher } from "./services/tokenDiscovery.service.js";
 import { startPositionMonitor } from "./services/monitor.service.js";
 import { startPriceAlertMonitor } from "./services/priceAlert.service.js";
 import { startPnLBroadcaster } from "./services/pnlBroadcaster.service.js";
+import { startDepositTracker } from "./services/depositTracker.service.js";
 import { getLogger } from "./utils/logger.js";
 
 const log = getLogger("index");
@@ -92,6 +93,8 @@ process.on("uncaughtException", (err: Error) => {
   startPriceAlertMonitor(io, { intervalMs: 60000 }); // Check every minute
   // Start P&L broadcaster for periodic portfolio updates
   startPnLBroadcaster(io, { intervalMs: 30000 }); // Broadcast every 30 seconds
+  // Detect SOL deposited into each custodial wallet (see depositTracker.service.ts)
+  startDepositTracker({ intervalMs: 60000 });
   // Start Jupiter token discovery (polls Jupiter's own recent-tokens feed;
   // replaces the old Raydium on-chain pool listener + Pump.fun bonding-curve watcher)
   if (process.env.JUPITER_DISCOVERY_ENABLED !== "false") {

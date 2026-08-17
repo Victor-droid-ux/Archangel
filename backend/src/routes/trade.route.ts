@@ -32,14 +32,16 @@ router.get("/history", async (req, res) => {
     // Optional — when provided, restricts results to just that wallet's own
     // trades. Read access to your own trade history doesn't warrant the same
     // signature check as a settings change; the wallet address itself isn't
-    // secret. When omitted (no wallet connected), this must still resolve to
-    // a specific, restricted view — the operator's own public trades — never
-    // db.getTrades()'s unrestricted {} scan, which is reserved for trusted
-    // internal engine callers and would hand every user's private trade
-    // history to an unauthenticated request.
+    // secret. When omitted (no wallet connected), there's no specific
+    // identity to show trades for — not even the operator's own, which is
+    // that wallet's own private activity now too — so this returns empty
+    // rather than falling through to db.getTrades()'s unrestricted {} scan,
+    // which is reserved for trusted internal engine callers.
     const wallet =
-      (typeof req.query.wallet === "string" ? req.query.wallet : undefined) ||
-      db.OPERATOR_WALLET;
+      typeof req.query.wallet === "string" ? req.query.wallet : undefined;
+    if (!wallet) {
+      return res.json({ success: true, trades: [] });
+    }
     const trades = await db.getTrades(limit, false, wallet);
     return res.json({ success: true, trades });
   } catch (err: any) {

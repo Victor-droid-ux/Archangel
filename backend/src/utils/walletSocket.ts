@@ -2,13 +2,13 @@
 //
 // Emits a wallet-attributed event to only that wallet's own connections —
 // sockets join a room named after their owner wallet on "identify" (see
-// socket.route.ts) — except for the bot's own operator-wallet activity,
-// which stays a global broadcast (consistent with db.service.ts's
-// viewerWalletFilter(), which treats the operator's trades as everyone's
-// shared "here's what the bot is doing" view, while a specific user's own
-// activity is private to them). Without this, every connected browser saw
-// every wallet's live trade feed/pipeline events/PnL updates regardless of
-// which wallet was actually connected in that browser.
+// socket.route.ts). This includes the bot's own operator-wallet activity:
+// it is that wallet's own private activity too, exactly like any custodial
+// user's, visible only to a socket that has identified as that same wallet
+// — never a global broadcast. (This function used to special-case the
+// operator wallet as an always-public broadcast; that made the operator's
+// trade history/PnL visible to every visitor, connected or not, which is
+// exactly the leak this was rewritten to close.)
 import { Server } from "socket.io";
 import { getLogger } from "./logger.js";
 
@@ -24,8 +24,10 @@ export function emitToWalletOrGlobal(
   payload: unknown
 ): void {
   if (!io) return;
-  if (!wallet || wallet === OPERATOR_WALLET) {
-    io.emit(event, payload);
+  if (!wallet) {
+    // No identified wallet to scope this to — silently drop rather than
+    // broadcasting globally, which would leak this activity to every
+    // connected visitor regardless of what (if anything) they've connected.
     return;
   }
   io.to(wallet).emit(event, payload);

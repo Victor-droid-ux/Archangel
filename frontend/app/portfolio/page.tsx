@@ -6,7 +6,6 @@ import TradeSummary from "@components/trading/trade-summary";
 import PortfolioPnLPanel from "@components/trading/PortfolioPnLPanel";
 import PositionsPanel from "@components/trading/PositionsPanel";
 import TradeHistory from "@components/trading/trade-history";
-import { usePortfolio } from "@hooks/usePortfolio";
 import { useStatsSync } from "@hooks/useStatsSync";
 
 // Content must never depend on this animation actually running to become
@@ -23,7 +22,6 @@ export default function PortfolioPage() {
   // Same bootstrapping as /trading — this page can be the first one a user
   // lands on, so it can't rely on /trading having already populated the
   // shared stats store.
-  usePortfolio();
   useStatsSync();
 
   return (

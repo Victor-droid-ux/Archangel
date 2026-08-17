@@ -38,9 +38,29 @@ export type UserWallet = {
   hotWalletPublicKey: string; // the bot-generated trading wallet's address
   encryptedSecretKey: string; // AES-256-GCM ciphertext of the base58 secret key
   createdAt: Date;
+  // Newest transaction signature depositTracker.service.ts has already
+  // classified for this wallet — lets its periodic scan resume from where
+  // it left off instead of re-scanning full history every tick.
+  lastScannedSignature?: string;
+};
+
+export type WalletWithdrawal = {
+  ownerWallet: string;
+  hotWalletPublicKey: string;
+  signature: string;
+  amountSol: number;
+  timestamp: Date;
 };
 
 let col: Collection<UserWallet> | null = null;
+let withdrawalsCol: Collection<WalletWithdrawal> | null = null;
+
+async function getWithdrawalsCol(): Promise<Collection<WalletWithdrawal>> {
+  if (withdrawalsCol) return withdrawalsCol;
+  const db: Db = await connect();
+  withdrawalsCol = db.collection<WalletWithdrawal>("walletWithdrawals");
+  return withdrawalsCol;
+}
 
 async function getCol(): Promise<Collection<UserWallet>> {
   if (col) return col;
@@ -195,6 +215,19 @@ export async function withdrawToOwner(
     { ownerWallet, hotWallet: wallet.hotWalletPublicKey, amountSol, signature },
     "Withdrawal completed"
   );
+
+  // Recorded directly here (not detected from chain, unlike deposits) —
+  // this is our own app-initiated transfer, so we already know everything
+  // about it. depositTracker.service.ts checks this collection so a
+  // withdrawal is never mistaken for an external deposit.
+  const withdrawals = await getWithdrawalsCol();
+  await withdrawals.insertOne({
+    ownerWallet,
+    hotWalletPublicKey: wallet.hotWalletPublicKey,
+    signature,
+    amountSol: requestedLamports / LAMPORTS_PER_SOL,
+    timestamp: new Date(),
+  });
 
   return { signature, amountSol: requestedLamports / LAMPORTS_PER_SOL };
 }

@@ -443,19 +443,37 @@ const POSITION_DUST_THRESHOLD_SOL = Number(
   process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
 );
 
+const EMPTY_STATS = {
+  portfolioValue: 0,
+  totalProfitSol: 0,
+  totalProfitPercent: 0,
+  openTrades: 0,
+  tradeVolumeSol: 0,
+  winRate: 0,
+};
+
 export async function getStats(viewerWallet?: string) {
   if (!db) await connect();
+
+  // No connected wallet — including the operator's own — means there's
+  // nobody specific to show numbers for. The operator's own trades are that
+  // wallet's own private activity now, same as any custodial user's: only
+  // visible when THAT wallet (operator or otherwise) is the one connected,
+  // never to an anonymous/disconnected viewer. (This used to fall back to
+  // the operator's real numbers as a "public bot feed" — that was the exact
+  // leak that made the operator's trade history visible without connecting
+  // any wallet at all.)
+  if (!viewerWallet) {
+    return { ...EMPTY_STATS, lastUpdated: new Date() };
+  }
 
   // Always computed fresh from the resolved wallet's own trades/positions —
   // never the stored statsCol doc, which $inc's across every wallet in the
   // system (see addTrade) and would blend every user's private numbers
-  // together. No viewer (an internal caller, or a socket client with no
-  // wallet connected — see socket.route.ts) falls back to the operator's
-  // own numbers, never a system-wide blend.
-  const effectiveWallet = viewerWallet || OPERATOR_WALLET;
+  // together.
   const [positions, pnl] = await Promise.all([
-    getPositions(effectiveWallet),
-    getPortfolioPnL(effectiveWallet),
+    getPositions(viewerWallet),
+    getPortfolioPnL(viewerWallet),
   ]);
   const openTrades = positions.filter(
     (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL
