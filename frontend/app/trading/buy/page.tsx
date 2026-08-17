@@ -107,7 +107,7 @@ export default function BuyPage() {
         </h1>
       </div>
       <p className="text-sm text-gray-400 -mt-4">
-        Only tokens that have already cleared the bot's own safety checks
+        Only tokens that have already cleared the bot&apos;s own safety checks
         (liquidity, routing, authority) are listed here.
       </p>
 
@@ -187,7 +187,7 @@ export default function BuyPage() {
           </Button>
           <p className="text-xs text-gray-500">
             Signed and paid for by your own connected wallet — the tokens
-            land in your wallet, not the bot's.
+            land in your wallet, not the bot&apos;s.
           </p>
         </Card>
       ) : loading ? (

@@ -187,7 +187,7 @@ export default function SellPage() {
         </div>
       ) : positions.length === 0 ? (
         <div className="text-center py-10 text-gray-400">
-          You don't have any manually-bought positions to sell.
+          You don&apos;t have any manually-bought positions to sell.
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
