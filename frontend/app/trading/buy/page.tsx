@@ -1,0 +1,222 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Card } from "@components/ui/card";
+import { Input } from "@components/ui/input";
+import { Button } from "@components/ui/button";
+import { fetcher, formatNumber, truncateAddress } from "@lib/utils";
+import { useWallet } from "@hooks/useWallet";
+import { useTrade } from "@hooks/useTrade";
+import { ArrowLeft, Loader2, TrendingUp } from "lucide-react";
+import { toast } from "react-hot-toast";
+
+interface BuyCandidate {
+  mint: string;
+  symbol: string;
+  name: string;
+  liquidityUSD: number;
+  liquiditySOL: number;
+  marketCapUSD: number;
+  poolAddress: string | null;
+  tradableAt: string | null;
+}
+
+// Rough network-fee + rent buffer — leaves enough SOL uncommitted to
+// actually pay for the swap transaction itself, so "spend my whole balance"
+// doesn't fail on-chain from having nothing left for fees.
+const FEE_BUFFER_SOL = 0.005;
+
+export default function BuyPage() {
+  const router = useRouter();
+  const { connected, balance, refreshBalance } = useWallet();
+  const { executeTrade, loading: submitting } = useTrade();
+
+  const [candidates, setCandidates] = useState<BuyCandidate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState<BuyCandidate | null>(null);
+  const [amountSol, setAmountSol] = useState(0.1);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const res = await fetcher<{ success: boolean; candidates: BuyCandidate[] }>(
+          "/api/trade/manual-buy-candidates?limit=40"
+        );
+        if (mounted && res?.success) setCandidates(res.candidates || []);
+      } catch (err) {
+        console.error("Failed to load buy candidates:", err);
+        toast.error("Failed to load tokens.");
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (connected) refreshBalance();
+  }, [connected, refreshBalance]);
+
+  const insufficientBalance =
+    connected && amountSol + FEE_BUFFER_SOL > balance;
+
+  const handleBuy = async () => {
+    if (!connected) {
+      toast.error("Connect your wallet first.");
+      return;
+    }
+    if (!selected) return;
+    if (!Number.isFinite(amountSol) || amountSol <= 0) {
+      toast.error("Enter a valid SOL amount.");
+      return;
+    }
+    // Checked here (not just left to fail on-chain) so the error is a clear
+    // "you don't have enough SOL" instead of an opaque wallet/RPC rejection.
+    await refreshBalance();
+    if (amountSol + FEE_BUFFER_SOL > balance) {
+      toast.error(
+        `Insufficient balance: you have ${formatNumber(
+          balance,
+          4
+        )} SOL, need ~${formatNumber(amountSol + FEE_BUFFER_SOL, 4)} SOL (including network fees).`
+      );
+      return;
+    }
+
+    const lamports = Math.floor(amountSol * 1e9);
+    const trade = await executeTrade("buy", selected.mint, lamports);
+    if (trade) {
+      setSelected(null);
+      router.push("/trading");
+    }
+  };
+
+  return (
+    <div className="max-w-5xl mx-auto p-6 space-y-6">
+      <div className="flex items-center gap-3">
+        <Button variant="outline" onClick={() => router.push("/trading")}>
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
+        <h1 className="text-2xl font-bold text-primary flex items-center gap-2">
+          <TrendingUp className="h-5 w-5 text-green-400" />
+          Buy a Token
+        </h1>
+      </div>
+      <p className="text-sm text-gray-400 -mt-4">
+        Only tokens that have already cleared the bot's own safety checks
+        (liquidity, routing, authority) are listed here.
+      </p>
+
+      {selected ? (
+        <Card className="p-6 space-y-4 bg-base-200 border border-base-300">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-lg font-semibold">
+                {selected.symbol}{" "}
+                <span className="text-gray-400 font-normal">
+                  {selected.name}
+                </span>
+              </h2>
+              <p className="text-xs text-gray-500 font-mono">
+                {truncateAddress(selected.mint)}
+              </p>
+            </div>
+            <Button variant="outline" onClick={() => setSelected(null)}>
+              Back to list
+            </Button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4 text-sm">
+            <div className="bg-base-300/40 rounded-lg p-3">
+              <div className="text-gray-400">Liquidity</div>
+              <div className="font-semibold">
+                ${formatNumber(selected.liquidityUSD)}
+              </div>
+            </div>
+            <div className="bg-base-300/40 rounded-lg p-3">
+              <div className="text-gray-400">Market Cap</div>
+              <div className="font-semibold">
+                ${formatNumber(selected.marketCapUSD)}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">Amount to spend (SOL)</label>
+              {connected && (
+                <span className="text-xs text-gray-500">
+                  Wallet balance: {formatNumber(balance, 4)} SOL
+                </span>
+              )}
+            </div>
+            <Input
+              type="number"
+              min={0}
+              step={0.01}
+              value={amountSol}
+              onChange={(e) => setAmountSol(Number(e.target.value))}
+            />
+            {insufficientBalance && (
+              <p className="text-xs text-red-400">
+                Insufficient balance — you have {formatNumber(balance, 4)} SOL,
+                need ~{formatNumber(amountSol + FEE_BUFFER_SOL, 4)} SOL
+                (including network fees).
+              </p>
+            )}
+          </div>
+
+          <Button
+            onClick={handleBuy}
+            disabled={submitting || !connected || insufficientBalance}
+            className="w-full"
+          >
+            {submitting ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : !connected ? (
+              "Connect wallet to buy"
+            ) : insufficientBalance ? (
+              "Insufficient balance"
+            ) : (
+              `Buy ${selected.symbol} with ${amountSol} SOL`
+            )}
+          </Button>
+          <p className="text-xs text-gray-500">
+            Signed and paid for by your own connected wallet — the tokens
+            land in your wallet, not the bot's.
+          </p>
+        </Card>
+      ) : loading ? (
+        <div className="flex items-center gap-2 py-10 justify-center text-gray-400">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          Loading tradable tokens...
+        </div>
+      ) : candidates.length === 0 ? (
+        <div className="text-center py-10 text-gray-400">
+          No tradable tokens right now — check back shortly.
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {candidates.map((c) => (
+            <button
+              key={c.mint}
+              onClick={() => setSelected(c)}
+              className="text-left bg-base-200 border border-base-300 rounded-xl p-4 hover:border-primary transition-colors"
+            >
+              <div className="font-semibold">{c.symbol}</div>
+              <div className="text-xs text-gray-400 truncate">{c.name}</div>
+              <div className="mt-2 text-xs text-gray-500 flex justify-between">
+                <span>Liq ${formatNumber(c.liquidityUSD)}</span>
+                <span>MC ${formatNumber(c.marketCapUSD)}</span>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

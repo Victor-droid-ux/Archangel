@@ -14,9 +14,79 @@ import {
 import { Connection, VersionedTransaction } from "@solana/web3.js";
 import { validateTradeOpportunity } from "../services/tradeValidation.service.js";
 import { executeManualBuy } from "../services/manualBuy.service.js";
+import { getTokenBalance } from "../services/solana.service.js";
 
 const logger = getLogger("trade.route");
 const router = express.Router();
+
+/**
+ * GET /api/trade/manual-buy-candidates?limit=40
+ * Tokens a user can pick from on the manual Buy page — the same tradable/
+ * validated set the auto-trade discovery pipeline already computes (see
+ * tokenDiscovery.service.ts's startTokenWatcher, which writes state:
+ * "TRADABLE" here once a token clears liquidity/routing/authority checks),
+ * not a separately-invented condition set.
+ */
+// A "TRADABLE" tokenState doc is never re-verified once written — nothing
+// re-checks liquidity/safety on old entries, so without a cutoff a token
+// discovered days ago (and possibly rugged since, if it never triggered
+// monitor.service.ts's emergency-exit blacklist below) would keep showing up
+// here indefinitely. This doesn't replace real safety checks (only an actual
+// re-validation would), just bounds how stale a "was tradable" snapshot can
+// be before this list stops trusting it.
+const MAX_CANDIDATE_AGE_MS = 24 * 60 * 60 * 1000;
+
+router.get("/manual-buy-candidates", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 40, 100);
+    const cutoff = Date.now() - MAX_CANDIDATE_AGE_MS;
+    const tokens = await db.getTokensByState("TRADABLE");
+    const candidates = tokens
+      .map((t) => ({
+        mint: t.mint,
+        symbol: t.symbol,
+        name: t.name,
+        liquidityUSD: t.liquidityUSD ?? 0,
+        liquiditySOL: t.liquiditySOL ?? 0,
+        marketCapUSD: t.marketCapUSD ?? 0,
+        poolAddress: t.poolAddress ?? null,
+        // Newest-tradable-first — confirmedTradableAt is when it actually
+        // cleared validation; detectedAt (first seen at all) as a fallback
+        // for any row missing it.
+        tradableAt: (t.confirmedTradableAt ?? t.detectedAt)?.toISOString?.() ?? null,
+      }))
+      .filter((c) => c.tradableAt && new Date(c.tradableAt).getTime() >= cutoff)
+      .sort((a, b) => new Date(b.tradableAt!).getTime() - new Date(a.tradableAt!).getTime())
+      .slice(0, limit);
+    return res.json({ success: true, candidates });
+  } catch (err: any) {
+    logger.error("Failed to load manual-buy candidates:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /api/trade/token-balance?wallet=X&mint=Y
+ * The real on-chain SPL balance the connected wallet holds for a mint — used
+ * by the manual Sell page to size a "sell my entire holding" request against
+ * what's actually there, not a DB-derived approximation.
+ */
+router.get("/token-balance", async (req, res) => {
+  try {
+    const wallet = req.query.wallet as string | undefined;
+    const mint = req.query.mint as string | undefined;
+    if (!wallet || !mint) {
+      return res
+        .status(400)
+        .json({ success: false, message: "wallet and mint are required" });
+    }
+    const balance = await getTokenBalance(wallet, mint);
+    return res.json({ success: true, data: balance });
+  } catch (err: any) {
+    logger.error("Failed to fetch token balance:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 /**
  * GET /api/trade/history?limit=50
@@ -190,6 +260,22 @@ router.post("/prepare", async (req, res) => {
     const finalInputMint = inputMint || (type === "buy" ? SOL_MINT : tokenMint);
     const finalOutputMint =
       outputMint || (type === "sell" ? SOL_MINT : tokenMint);
+
+    // Re-run the same safety pipeline auto-buy uses, at the moment of
+    // purchase — not just at candidate-list time (trade.route.ts's
+    // /manual-buy-candidates is a point-in-time snapshot that can go stale;
+    // see its own staleness cutoff). A sell is never blocked here — refusing
+    // to let someone exit a position they already hold would be strictly
+    // worse than letting a risky sell through.
+    if (type === "buy") {
+      const validation = await validateTradeOpportunity(tokenMint);
+      if (!validation.approved) {
+        return res.status(400).json({
+          success: false,
+          message: `Token failed safety validation: ${validation.reason}`,
+        });
+      }
+    }
 
     // Check trader config to see if trade should trigger
     const config = await getEffectiveConfig(wallet, tokenMint);
@@ -440,6 +526,10 @@ router.post("/confirm", async (req, res) => {
       simulated: false,
       signature,
       timestamp: new Date(),
+      // This whole route only ever executes a transaction the connected
+      // wallet itself signed (see actualSigner above) — it never touches a
+      // custodial keypair.
+      custody: "self",
     });
 
     // Targeted to the signer's own wallet room, not a global broadcast —

@@ -21,7 +21,17 @@ export const useTrade = () => {
 
   const [loading, setLoading] = useState(false);
 
-  const executeTrade = async (type: "buy" | "sell", tokenMint: string) => {
+  const executeTrade = async (
+    type: "buy" | "sell",
+    tokenMint: string,
+    // Already in the correct base unit for the swap direction — SOL lamports
+    // for a buy, the token's own raw units for a sell (see the Sell page,
+    // which fetches the real on-chain balance rather than assuming a SOL
+    // quantity means anything for a token that isn't SOL). Falls back to the
+    // trading-config store's SOL amount for callers that don't pass one
+    // (the legacy generic Buy button behavior).
+    amountLamportsOverride?: number | string
+  ) => {
     if (!connected || !publicKey) {
       toast.error("Connect your wallet to trade.");
       return null;
@@ -38,6 +48,19 @@ export const useTrade = () => {
     });
 
     try {
+      // A sell's override can be a token's raw base-unit balance — for a
+      // token with a large supply/decimals this routinely exceeds
+      // Number.MAX_SAFE_INTEGER, so round-tripping it through Number()
+      // silently loses precision (and can render in scientific notation once
+      // serialized), which breaks Jupiter's fixed-width amount encoding
+      // downstream ("encoding overruns Uint8Array"). Passed through as-is —
+      // already a valid integer string/number in the right base unit — for
+      // any override; only the store's own SOL amount (always a small,
+      // safe number) goes through Math.floor.
+      const amountLamports: number | string =
+        amountLamportsOverride !== undefined
+          ? amountLamportsOverride
+          : Math.floor(amount * 1e9);
       const slippageBps = Math.floor(slippage * 100);
       const inputMint =
         type === "buy"
@@ -59,7 +82,7 @@ export const useTrade = () => {
           inputMint,
           outputMint,
           wallet: publicKey,
-          amountLamports: Math.floor(amount * 1e9),
+          amountLamports,
           slippageBps,
         }),
       });
@@ -92,7 +115,7 @@ export const useTrade = () => {
           signedTransaction: signedTxBase64,
           type,
           token: mint,
-          amountLamports: Math.floor(amount * 1e9),
+          amountLamports,
           takeProfit,
           stopLoss,
           wallet: publicKey,
@@ -115,7 +138,7 @@ export const useTrade = () => {
         id: d.id ?? crypto.randomUUID(),
         type,
         token: d.token ?? mint,
-        amount: Number(d.amountLamports ?? amount * 1e9),
+        amount: Number(d.amountLamports ?? amountLamports),
         price: Number(d.price ?? 0),
         pnl: Number(d.pnl) || 0,
         signature: d.signature ?? null,

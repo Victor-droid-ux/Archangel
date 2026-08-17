@@ -7,6 +7,7 @@ import { Toaster } from "react-hot-toast";
 import type { Metadata, Viewport } from "next";
 import { SocketProvider } from "./providers/SocketProvider";
 import { SolanaWalletProvider } from "./providers/WalletProvider";
+import { AccountNotifications } from "@components/trading/AccountNotifications";
 
 // Genuinely self-hosted — the actual variable-font .woff2 files ship inside
 // the @fontsource-variable/* packages in node_modules, so next/font/local
@@ -109,6 +110,7 @@ export default function RootLayout({
       <body className="min-h-screen flex flex-col bg-base-100 text-base-content font-sans transition-colors duration-300">
         <SolanaWalletProvider>
           <SocketProvider>
+            <AccountNotifications />
             <Navbar />
 
             <main className="flex-grow container mx-auto px-4 py-8">

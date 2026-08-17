@@ -197,6 +197,38 @@ export async function updateGlobalSettings(
 }
 
 /**
+ * Flip just autoTradeEnabled without touching any other saved setting —
+ * updateGlobalSettings() above replaces the entire globalSettings object, so
+ * using it here would silently wipe this wallet's market-cap/token-age/
+ * launch-window/etc. settings. Used by the "Stop Auto Trade" flow, which
+ * must disable future auto-buys without clobbering everything else the
+ * wallet has configured.
+ */
+export async function setAutoTradeEnabled(
+  walletAddress: string,
+  enabled: boolean,
+  io?: Server
+): Promise<void> {
+  const db = await getDb();
+  const result = await db.collection<TraderConfig>("traderConfigs").findOneAndUpdate(
+    { walletAddress },
+    {
+      $set: { "globalSettings.autoTradeEnabled": enabled, updatedAt: new Date() },
+      $setOnInsert: {
+        walletAddress,
+        tokenSpecificSettings: {},
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true, returnDocument: "after" }
+  );
+  log.info({ walletAddress, enabled }, "Set autoTradeEnabled");
+  if (io) {
+    io.to(walletAddress).emit("traderConfig:updated", result);
+  }
+}
+
+/**
  * Set token-specific trading configuration
  */
 export async function setTokenConfig(

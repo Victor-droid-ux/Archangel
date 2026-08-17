@@ -13,6 +13,7 @@ const PASSTHROUGH_EVENTS = [
   "poolAvailable",
   "poolMonitorTimeout",
   "wallet:balance",
+  "walletDeposit",
   "position:trailingUpdate",
   "tradeError",
   "jupiter:token_detected",

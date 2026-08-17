@@ -8,6 +8,10 @@ import { fetcher } from "@lib/utils";
 interface UserWalletState {
   hotWalletPublicKey: string | null;
   balanceSol: number | null;
+  // The minimum balance auto-trade sizing (AUTO_TRADE_PERCENT_OF_BALANCE)
+  // needs before it can ever produce a trade that clears the server's own
+  // floor (MIN_AUTO_TRADE_SOL) — null until the first successful fetch.
+  minBalanceForAutoTradeSol: number | null;
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
@@ -24,6 +28,8 @@ export function useUserWallet(): UserWalletState {
     null
   );
   const [balanceSol, setBalanceSol] = useState<number | null>(null);
+  const [minBalanceForAutoTradeSol, setMinBalanceForAutoTradeSol] =
+    useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,6 +37,7 @@ export function useUserWallet(): UserWalletState {
     if (!publicKey) {
       setHotWalletPublicKey(null);
       setBalanceSol(null);
+      setMinBalanceForAutoTradeSol(null);
       return;
     }
     setLoading(true);
@@ -40,10 +47,12 @@ export function useUserWallet(): UserWalletState {
         success: boolean;
         hotWalletPublicKey: string;
         balanceSol: number;
+        minBalanceForAutoTradeSol: number;
       }>(`/api/user-wallet/${publicKey.toBase58()}`);
       if (res?.success) {
         setHotWalletPublicKey(res.hotWalletPublicKey);
         setBalanceSol(res.balanceSol);
+        setMinBalanceForAutoTradeSol(res.minBalanceForAutoTradeSol);
       }
     } catch (err: any) {
       setError(err?.message || "Failed to load trading wallet");
@@ -58,7 +67,14 @@ export function useUserWallet(): UserWalletState {
     return () => clearInterval(interval);
   }, [refresh]);
 
-  return { hotWalletPublicKey, balanceSol, loading, error, refresh };
+  return {
+    hotWalletPublicKey,
+    balanceSol,
+    minBalanceForAutoTradeSol,
+    loading,
+    error,
+    refresh,
+  };
 }
 
 export default useUserWallet;

@@ -89,24 +89,33 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
   // === Blacklist/Whitelist Filtering ===
   const mint = token.mint;
   if (!mint) return;
+
+  // Captured now, before the strategy engine, 3-condition validation, and
+  // the 30-second market-behavior observation below run — those stages
+  // alone add 30+ seconds of processing time, so measuring age AFTER them
+  // (as this used to) checked "is this still young enough having spent 30+
+  // seconds deciding," not "was this young enough when we found it." Against
+  // the tight default Launch Window (10-60s), that inflation made the
+  // window mathematically almost impossible to clear for a real launch —
+  // this is reused as-is in the per-wallet loop further down, never
+  // recomputed later.
+  const ageSecondsAtDiscovery = token.pairCreatedAt
+    ? (Date.now() - Number(token.pairCreatedAt)) / 1000
+    : undefined;
+  // The 4 checks below (blacklist/whitelist/strategy/decimals) are all
+  // token-intrinsic — evaluated once per discovered token, before any
+  // specific wallet is even considered. They used to broadcast as
+  // "tradeError" to every connected socket, which meant every visitor got a
+  // popup for the bot's routine background scanning of the entire token
+  // universe (most tokens never pass these), not anything about their own
+  // account. Logged for backend diagnostics only now — see the per-wallet
+  // checks further down for what actually surfaces as a user-facing popup.
   if (ENV.TOKEN_BLACKLIST.length && isInList(mint, ENV.TOKEN_BLACKLIST)) {
     LOG.warn({ mint }, "⛔ Skipping blacklisted token");
-    io.emit("tradeError", {
-      type: "blacklist",
-      mint,
-      reason: "Token is blacklisted",
-      message: "Token is blacklisted",
-    });
     return;
   }
   if (ENV.TOKEN_WHITELIST.length && !isInList(mint, ENV.TOKEN_WHITELIST)) {
     LOG.warn({ mint }, "⛔ Skipping non-whitelisted token");
-    io.emit("tradeError", {
-      type: "whitelist",
-      mint,
-      reason: "Token is not whitelisted",
-      message: "Token is not whitelisted",
-    });
     return;
   }
 
@@ -139,12 +148,6 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
         { mint, reason: strategyResult?.reason },
         "⏭️ No strategy signaled a buy"
       );
-      io.emit("tradeError", {
-        type: "strategy_blocked",
-        mint,
-        reason: strategyResult?.reason || "No strategy signaled a buy",
-        message: strategyResult?.reason || "No strategy signaled a buy",
-      });
       return;
     }
     LOG.info(
@@ -208,12 +211,6 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
         { mint },
         "⏭️ Skipping trade: could not verify real token decimals — refusing to guess on a value that determines cost basis"
       );
-      io.emit("tradeError", {
-        type: "decimals_unknown",
-        mint,
-        reason: "Could not determine token decimals",
-        message: "Could not determine token decimals",
-      });
       return;
     }
 
@@ -224,14 +221,25 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
     // jupiterDiscovery.service.ts / storedTokenChecker.service.ts.
     const eligibleWallets = await multiUserExecutionService.getEligibleWallets();
     let lastTrade: TradeRecord | null = null;
-    // Token age, in seconds, at the moment of this check — undefined when
+    // The age captured at the top of this function, before any of the
+    // pipeline's own processing time could inflate it — undefined when
     // Jupiter didn't report a pool-creation time, matching the old
     // isWithinLaunchWindow's fallback of allowing the token through.
-    const ageSeconds = token.pairCreatedAt
-      ? (Date.now() - Number(token.pairCreatedAt)) / 1000
-      : undefined;
+    const ageSeconds = ageSecondsAtDiscovery;
 
     for (const walletContext of eligibleWallets) {
+      // Re-checked fresh right before this wallet's own execution, not just
+      // trusted from the eligibleWallets snapshot above — closes the window
+      // where Stop Auto Trade disables the flag after this fan-out started
+      // but before this specific wallet's turn came up.
+      if (!(await multiUserExecutionService.isAutoTradeCurrentlyEnabled(walletContext.ownerWallet))) {
+        LOG.debug(
+          { mint, wallet: walletContext.ownerWallet },
+          "⏭️ Skipping wallet: auto-trade was disabled after this run started"
+        );
+        continue;
+      }
+
       if (ageSeconds !== undefined) {
         const [maxAgeSeconds, launchWindow] = await Promise.all([
           getEffectiveMaxTokenAgeSeconds(walletContext.ownerWallet),
@@ -330,7 +338,7 @@ async function executeAutoBuyForWallet(
         { mint, reason: riskCheck.reason },
         `⏭️ Skipping trade: Risk limit exceeded`
       );
-      io.emit("tradeError", {
+      emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
         type: "risk_limit",
         mint,
         reason: riskCheck.reason,
@@ -370,7 +378,7 @@ async function executeAutoBuyForWallet(
           },
           "Insufficient balance for auto-buy"
         );
-        io.emit("tradeError", {
+        emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
           type: "insufficient_balance",
           mint,
           required: buySol,
@@ -399,7 +407,7 @@ async function executeAutoBuyForWallet(
         { mint, error: tranche1Result.error },
         "First tranche failed - aborting buy"
       );
-      io.emit("tradeError", {
+      emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
         type: "tranche1_failed",
         mint,
         error: tranche1Result.error,
@@ -463,10 +471,11 @@ async function executeAutoBuyForWallet(
               { mint, signature: emergencySwap.signature },
               "Emergency exit completed"
             );
-            io.emit("tradeError", {
+            emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
               type: "test_sell_failed_emergency_exit",
               mint,
               reason: testSellResult.error,
+              message: `Test sell failed (${testSellResult.error}) — emergency-exited your first tranche`,
               emergencyExitSignature: emergencySwap.signature,
             });
           } else {
@@ -505,6 +514,7 @@ async function executeAutoBuyForWallet(
       simulated: !useReal,
       signature: tranche1Result.signature ?? null,
       timestamp: new Date(),
+      custody: "custodial" as const,
     };
 
     await dbService.addTrade(trade1);
@@ -513,7 +523,7 @@ async function executeAutoBuyForWallet(
       remainingPct: 100, // Full position after first buy
     });
 
-    io.emit("tradeFeed", {
+    emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeFeed", {
       ...trade1,
       auto: true,
       reason: "tranche1_buy",
@@ -585,6 +595,7 @@ async function executeAutoBuyForWallet(
       simulated: !useReal,
       signature: tranche2Result.signature ?? null,
       timestamp: new Date(),
+      custody: "custodial" as const,
     };
 
     const savedTrade2 = await dbService.addTrade(trade2);
@@ -592,7 +603,7 @@ async function executeAutoBuyForWallet(
       secondTrancheEntry: Date.now(),
     });
 
-    io.emit("tradeFeed", {
+    emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeFeed", {
       ...trade2,
       auto: true,
       reason: "tranche2_buy",

@@ -53,28 +53,57 @@ async function isUnderTradeCap(wallet: string): Promise<boolean> {
 }
 
 /**
+ * Whether this wallet's own Global Trade Settings currently allow auto-buy —
+ * meant to be re-read fresh right before a specific buy actually fires, not
+ * just once when a whole fan-out batch's eligible list was built. Without
+ * this second check, "Stop Auto Trade" disabling the flag mid-fan-out
+ * wouldn't stop a buy for a wallet that was already in this run's eligible
+ * list before the flag flipped — see the per-wallet re-check in
+ * autoBuyer.service.ts and runPipelineForAllEligibleWallets below.
+ *
+ * The operator defaults to enabled (unchanged from before this flag existed,
+ * so nobody who's never touched Global Trade Settings sees a behavior
+ * change) — only an explicit false (from Stop Auto Trade) turns it off. A
+ * regular user wallet defaults to disabled, same as getEligibleWallets()
+ * below.
+ */
+export async function isAutoTradeCurrentlyEnabled(
+  ownerWallet: string
+): Promise<boolean> {
+  const config = await getTraderConfig(ownerWallet);
+  if (ownerWallet === OPERATOR_WALLET) {
+    return config?.globalSettings?.autoTradeEnabled !== false;
+  }
+  return config?.globalSettings?.autoTradeEnabled === true;
+}
+
+/**
  * Every wallet currently eligible to receive an auto-buy: the operator's
  * own wallet (the bot's original, always-on identity — gated the same way
  * it always has been, by JUPITER_AUTO_BUY/config upstream of this call) plus
  * every user-created custodial hot wallet that has auto-trade enabled in
  * its owner's Global Trade Settings AND a non-dust balance. Either can be
- * excluded by its own Max Total Trades cap, once reached.
+ * excluded by its own Max Total Trades cap, once reached, or by Stop Auto
+ * Trade having explicitly disabled it.
  */
 export async function getEligibleWallets(): Promise<WalletContext[]> {
   const eligible: WalletContext[] = [];
 
-  // Operator wallet: always eligible from this function's point of view —
-  // whether auto-buy actually happens for it is gated by the caller
-  // (jupiterDiscovery.service.ts / storedTokenChecker.service.ts's existing
-  // JUPITER_AUTO_BUY config), same as before this phase existed — except its
-  // own Max Total Trades cap, if it has set one, same as any other wallet.
+  // Operator wallet: eligible from this function's point of view unless it
+  // has explicitly disabled auto-trade (Stop Auto Trade) or hit its own Max
+  // Total Trades cap — whether auto-buy actually happens for it is also
+  // still gated by the caller's own JUPITER_AUTO_BUY config, same as before
+  // this phase existed.
   const operatorCtx = operatorWalletContext();
-  if (await isUnderTradeCap(operatorCtx.ownerWallet)) {
+  if (
+    (await isAutoTradeCurrentlyEnabled(operatorCtx.ownerWallet)) &&
+    (await isUnderTradeCap(operatorCtx.ownerWallet))
+  ) {
     eligible.push(operatorCtx);
   } else {
     LOG.info(
       { wallet: operatorCtx.ownerWallet },
-      "Operator wallet excluded from this round: Max Total Trades reached"
+      "Operator wallet excluded from this round: auto-trade disabled or Max Total Trades reached"
     );
   }
 
@@ -142,6 +171,26 @@ export async function runPipelineForAllEligibleWallets(
 
   for (const walletContext of wallets) {
     try {
+      // Re-checked fresh right before this wallet's own execution, not just
+      // trusted from the getEligibleWallets() snapshot above — closes the
+      // window where Stop Auto Trade disables the flag after this batch's
+      // list was built but before this specific wallet's turn came up.
+      if (!(await isAutoTradeCurrentlyEnabled(walletContext.ownerWallet))) {
+        LOG.info(
+          { ownerWallet: walletContext.ownerWallet, tokenMint },
+          "Skipping wallet: auto-trade was disabled after this run started"
+        );
+        results.push({
+          ownerWallet: walletContext.ownerWallet,
+          result: {
+            success: false,
+            reason: "Auto-trade disabled for this wallet",
+            results: [],
+          },
+        });
+        continue;
+      }
+
       const result = await validationPipelineService.runPipeline(
         tokenMint,
         lpSol,
@@ -170,4 +219,5 @@ export async function runPipelineForAllEligibleWallets(
 export default {
   getEligibleWallets,
   runPipelineForAllEligibleWallets,
+  isAutoTradeCurrentlyEnabled,
 };

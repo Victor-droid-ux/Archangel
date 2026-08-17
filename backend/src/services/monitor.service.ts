@@ -163,6 +163,15 @@ export function startPositionMonitor(
         try {
           const tokenMint = pos.token;
           if (!tokenMint) continue;
+          // Self-custody positions (manual buys, held in the user's own
+          // connected wallet) can't be auto-managed here at all — this
+          // monitor only ever resolves a signer for the operator's env key
+          // or a custodial hot wallet (see resolveSignerForPosition below),
+          // never the user's own private key, which the server never has.
+          // Selling those is the user's own responsibility (the manual Sell
+          // page). Legacy trades recorded before this field existed
+          // (custody === null) are skipped too rather than guessed at.
+          if (pos.custody !== "custodial") continue;
           // netSol is derived from cumulative buy-minus-sell lamports; after a
           // position is fully exited this rarely lands on exactly 0 due to
           // floating-point/rounding residue across multiple fills, leaving a
@@ -320,6 +329,20 @@ export function startPositionMonitor(
               "🚨 EMERGENCY EXIT TRIGGERED - SELLING ALL IMMEDIATELY!"
             );
 
+            // This is the strongest signal this codebase ever produces that a
+            // token is actively dangerous (LP pulled, creator dumping, etc.)
+            // — blacklist it regardless of whether the sell below succeeds,
+            // so it drops out of getTokensByState("TRADABLE") and stops being
+            // recommended on the manual Buy page (trade.route.ts's
+            // /manual-buy-candidates) or re-triggering auto-buy for anyone
+            // else. Previously only the 30-second-behavior-check path ever
+            // blacklisted anything — a token that looked fine at discovery
+            // and only turned bad later stayed "TRADABLE" forever.
+            await dbService.blacklistToken(
+              tokenMint,
+              emergencyCheck.criticalReason || "Emergency exit triggered"
+            );
+
             // Emergency sell ALL tokens immediately — using THIS position's
             // own owner wallet, not a fixed backend wallet, since positions
             // can now belong to any of many custodial hot wallets.
@@ -360,6 +383,7 @@ export function startPositionMonitor(
                   simulated: false,
                   signature: emergencySwap.signature ?? null,
                   timestamp: new Date(),
+                  custody: "custodial" as const,
                 };
 
                 await dbService.addTrade(emergencyTrade);

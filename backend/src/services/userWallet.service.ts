@@ -23,8 +23,15 @@ import {
   normalizeWalletAddress,
   getBalanceInSol,
   getConnection,
+  getTokenBalance,
 } from "./solana.service.js";
 import { connect } from "./db.service.js";
+import dbService from "./db.service.js";
+import { getJupiterQuote, executeJupiterSwap } from "./jupiter.service.js";
+import pnlTrackerService from "./pnlTracker.service.js";
+import { setAutoTradeEnabled } from "./traderConfig.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
+import type { Server } from "socket.io";
 
 // Reserve for the transfer's own network fee — a "withdraw everything"
 // request would otherwise try to send a balance that can't also cover the
@@ -240,6 +247,136 @@ export async function listAllUserWallets(): Promise<UserWallet[]> {
   return c.find({}).toArray();
 }
 
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+// Same floor used elsewhere (monitor.service.ts, db.service.ts) to treat a
+// near-zero remainder as fully closed rather than an attemptable sell.
+const POSITION_DUST_THRESHOLD_SOL = Number(
+  process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
+);
+
+export interface StopAutoTradeResult {
+  disabledAutoTrade: boolean;
+  sold: { token: string; signature: string | null; amountSol: number }[];
+  failed: { token: string; error: string }[];
+}
+
+/**
+ * "Stop Auto Trade": disables future auto-buys for this wallet AND
+ * liquidates every open position the bot has already bought for it
+ * (custody === "custodial" only — a self-custody/manual position lives in
+ * the user's own wallet, which only they can sign for, never the server).
+ * Disabling happens first, before any selling starts, so the bot can't
+ * rebuy on its next discovery tick while this is still in progress.
+ */
+export async function stopAutoTradeAndLiquidate(
+  ownerWalletRaw: string,
+  io?: Server
+): Promise<StopAutoTradeResult> {
+  const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
+
+  await setAutoTradeEnabled(ownerWallet, false, io);
+  const result: StopAutoTradeResult = {
+    disabledAutoTrade: true,
+    sold: [],
+    failed: [],
+  };
+
+  const positions = await dbService.getPositions(ownerWallet);
+  const custodialOpen = positions.filter(
+    (p) => p.custody === "custodial" && p.netSol >= POSITION_DUST_THRESHOLD_SOL
+  );
+  if (custodialOpen.length === 0) return result;
+
+  const keypair = await getUserWalletKeypair(ownerWallet);
+  if (!keypair) {
+    for (const p of custodialOpen) {
+      result.failed.push({ token: p.token, error: "No custodial signer available" });
+    }
+    return result;
+  }
+
+  for (const pos of custodialOpen) {
+    try {
+      // Sell the real on-chain balance, not a DB-derived approximation —
+      // avoids leaving unsellable dust behind from any drift between the
+      // two.
+      const { raw } = await getTokenBalance(
+        keypair.publicKey.toBase58(),
+        pos.token
+      );
+      if (!raw || raw === "0") {
+        result.failed.push({
+          token: pos.token,
+          error: "No on-chain balance found to sell",
+        });
+        continue;
+      }
+
+      const quote = await getJupiterQuote(pos.token, SOL_MINT, raw, 1000);
+      if (!quote?.outAmount) {
+        result.failed.push({
+          token: pos.token,
+          error: "No Jupiter route available",
+        });
+        continue;
+      }
+
+      const swap = await executeJupiterSwap({
+        inputMint: pos.token,
+        outputMint: SOL_MINT,
+        amount: raw,
+        userPublicKey: keypair.publicKey.toBase58(),
+        slippageBps: 1000,
+        signer: keypair,
+      });
+
+      if (!swap.success) {
+        result.failed.push({
+          token: pos.token,
+          error: swap.error || "Swap failed",
+        });
+        continue;
+      }
+
+      const amountSol = Number(quote.outAmount) / 1e9;
+      const trade = await dbService.addTrade({
+        type: "sell",
+        token: pos.token,
+        inputMint: pos.token,
+        outputMint: SOL_MINT,
+        amount: Number(quote.outAmount),
+        price: pos.avgBuyPrice ?? 0,
+        pnl: 0,
+        wallet: ownerWallet,
+        simulated: false,
+        signature: swap.signature ?? null,
+        timestamp: new Date(),
+        custody: "custodial",
+      });
+
+      pnlTrackerService.stopTracking(pos.token, ownerWallet);
+      emitToWalletOrGlobal(io, ownerWallet, "tradeFeed", {
+        ...trade,
+        auto: true,
+        reason: "stop_auto_trade",
+      });
+
+      result.sold.push({
+        token: pos.token,
+        signature: swap.signature ?? null,
+        amountSol,
+      });
+    } catch (err: any) {
+      result.failed.push({
+        token: pos.token,
+        error: err?.message || "Unknown error",
+      });
+    }
+  }
+
+  return result;
+}
+
 export default {
   getOrCreateUserWallet,
   getUserWallet,
@@ -247,4 +384,5 @@ export default {
   getUserWalletBalanceSol,
   withdrawToOwner,
   listAllUserWallets,
+  stopAutoTradeAndLiquidate,
 };

@@ -6,6 +6,7 @@ import notify from "../services/notifications/notify.service.js";
 import pnlTrackerService from "../services/pnlTracker.service.js";
 import userWalletService from "../services/userWallet.service.js";
 import { loadKeypairFromEnv } from "../services/solana.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 import { getLogger } from "../utils/logger.js";
 
 const OPERATOR_WALLET =
@@ -91,6 +92,9 @@ router.post("/force-sell", async (req, res) => {
       simulated: !result.success,
       signature: result.success ? result.signature ?? null : null,
       timestamp: new Date(),
+      // This route always resolves a server-held signer (operator's env key
+      // or the custodial hot wallet) — never the connected wallet's own key.
+      custody: "custodial",
     });
 
     if (isFullClose && result.success) {
@@ -113,9 +117,11 @@ router.post("/force-sell", async (req, res) => {
       }),
     });
 
-    // socket
+    // socket — scoped to the position's own owner wallet, not broadcast
+    // globally; a force-sell is that wallet's own activity, not the bot's
+    // shared public feed.
     const io = req.app?.get?.("io");
-    io?.emit("tradeFeed", {
+    emitToWalletOrGlobal(io, p.wallet, "tradeFeed", {
       id: sellRecord.id,
       type: "sell",
       token: sellRecord.token,

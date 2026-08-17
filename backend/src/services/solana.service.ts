@@ -177,6 +177,54 @@ export async function getBalanceInSol(
   }
 }
 
+// Every SPL token program a wallet's holdings might be under — the legacy
+// Token program and Token-2022 are different on-chain programs, and
+// getParsedTokenAccountsByOwner only searches one at a time.
+const TOKEN_PROGRAM_ID = new PublicKey(
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+);
+const TOKEN_2022_PROGRAM_ID = new PublicKey(
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+);
+
+/**
+ * 🪙 Real on-chain SPL token balance for (wallet, mint) — the actual holding,
+ * not a DB-derived approximation from cumulative buy/sell records (which can
+ * drift from on-chain truth from unrecorded transfers, rounding, etc). Used
+ * to size a "sell my entire holding" request against what's really there.
+ */
+export async function getTokenBalance(
+  walletAddress: string,
+  mint: string
+): Promise<{ raw: string; uiAmount: number; decimals: number }> {
+  const conn = getConnection();
+  const owner = new PublicKey(walletAddress);
+  const mintPk = new PublicKey(mint);
+
+  for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+    const resp = await conn.getParsedTokenAccountsByOwner(owner, {
+      mint: mintPk,
+      programId,
+    });
+    if (resp.value.length > 0) {
+      // A wallet can (rarely) hold more than one token account for the same
+      // mint — sum them rather than just reading the first.
+      let rawTotal = 0n;
+      let decimals = 0;
+      let uiAmount = 0;
+      for (const { account } of resp.value) {
+        const info = (account.data as any).parsed.info.tokenAmount;
+        rawTotal += BigInt(info.amount);
+        decimals = info.decimals;
+        uiAmount += info.uiAmount ?? 0;
+      }
+      return { raw: rawTotal.toString(), uiAmount, decimals };
+    }
+  }
+
+  return { raw: "0", uiAmount: 0, decimals: 0 };
+}
+
 /**
  * ✅ Check if wallet has sufficient balance for trade
  * @param pubkey - Wallet public key

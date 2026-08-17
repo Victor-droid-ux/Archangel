@@ -1,19 +1,28 @@
-// components/trading/EmergencyAlert.tsx
+// components/trading/AccountNotifications.tsx
+//
+// Pop-up feed of "what just happened on your account" — every socket event
+// here is already scoped to the connected wallet's own room by the backend
+// (see walletSocket.ts's emitToWalletOrGlobal), so whatever arrives through
+// lastMessage is safe to show as-is; nothing here re-filters by wallet.
+// Covers both outcomes: successful auto-buys/sells/deposits (green) and the
+// reasons a trade was skipped or force-exited (yellow/red) — previously only
+// true emergencies surfaced here, so a skipped buy or a landed deposit gave
+// no signal at all.
 "use client";
 
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { AlertTriangle, XCircle, Info } from "lucide-react";
+import { AlertTriangle, XCircle, Info, CheckCircle2 } from "lucide-react";
 import { useSocket } from "@hooks/useSocket";
 
 interface Alert {
   id: string;
-  type: "emergency" | "error" | "warning";
+  type: "emergency" | "error" | "warning" | "success";
   message: string;
   timestamp: number;
 }
 
-export const EmergencyAlert: React.FC = () => {
+export const AccountNotifications: React.FC = () => {
   const { lastMessage } = useSocket();
   const [alerts, setAlerts] = useState<Alert[]>([]);
 
@@ -37,7 +46,64 @@ export const EmergencyAlert: React.FC = () => {
       ]);
     }
 
-    // Trade errors
+    // Ordinary completed buys/sells — auto-trade or a force-sell; manual
+    // buy/sell already gets its own toast synchronously from useTrade.ts, so
+    // skip those here to avoid a duplicate popup for the same action.
+    if (
+      event === "tradeFeed" &&
+      !payload?.emergency &&
+      payload?.auto &&
+      (payload?.type === "buy" || payload?.type === "sell")
+    ) {
+      const pnlSuffix =
+        typeof payload.pnl === "number"
+          ? ` (${payload.pnl >= 0 ? "+" : ""}${(payload.pnl * 100).toFixed(1)}%)`
+          : "";
+      setAlerts((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          type: "success",
+          message: `✅ Bot ${payload.type === "buy" ? "bought" : "sold"} ${
+            payload.token
+          }${pnlSuffix}`,
+          timestamp: Date.now(),
+        },
+      ]);
+    }
+
+    // Deposit landed in the custodial wallet
+    if (event === "walletDeposit") {
+      setAlerts((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          type: "success",
+          message: payload?.message || "Deposit received",
+          timestamp: Date.now(),
+        },
+      ]);
+    }
+
+    // Jupiter-pipeline auto-buy attempts that reached this wallet's own
+    // eligibility check but failed there (balance too low, risk limit,
+    // routing/authority/market-health checks) — the jupiterDiscovery.service.ts
+    // path's equivalent of the autoBuyer.service.ts "tradeError" events above.
+    if (event === "jupiter:pipeline_failed") {
+      setAlerts((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          type: "warning",
+          message: `⏭️ Auto-buy skipped: ${
+            payload?.failedStageName || "validation"
+          } — ${payload?.reason || "condition not met"}`,
+          timestamp: Date.now(),
+        },
+      ]);
+    }
+
+    // Trade errors — reasons a buy was skipped or force-exited for this wallet
     if (event === "tradeError") {
       setAlerts((prev) => [
         ...prev,
@@ -103,6 +169,8 @@ export const EmergencyAlert: React.FC = () => {
                 ? "bg-red-900/90 border-red-500 text-red-100"
                 : alert.type === "error"
                 ? "bg-orange-900/90 border-orange-500 text-orange-100"
+                : alert.type === "success"
+                ? "bg-green-900/90 border-green-500 text-green-100"
                 : "bg-yellow-900/90 border-yellow-500 text-yellow-100"
             }`}
           >
@@ -112,6 +180,8 @@ export const EmergencyAlert: React.FC = () => {
                   <XCircle size={20} />
                 ) : alert.type === "error" ? (
                   <AlertTriangle size={20} />
+                ) : alert.type === "success" ? (
+                  <CheckCircle2 size={20} />
                 ) : (
                   <Info size={20} />
                 )}
@@ -135,3 +205,5 @@ export const EmergencyAlert: React.FC = () => {
     </div>
   );
 };
+
+export default AccountNotifications;

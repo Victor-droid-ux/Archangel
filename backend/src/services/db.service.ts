@@ -57,6 +57,14 @@ export type TradeRecord = {
   signature?: string | null;
   timestamp: Date;
   route?: "jupiter";
+  // Which wallet actually holds/signs for these tokens on-chain — "self"
+  // means the connected wallet itself (a manual buy/sell, signed directly by
+  // the user's own Phantom/Solflare), "custodial" means the server-managed
+  // hot wallet (an auto-trade, signed with the encrypted custodial keypair).
+  // Both are recorded under the same `wallet` (owner) field, so without this
+  // there's no way to tell which keypair a sell for a given position would
+  // even need — see getPositions()'s compound grouping below.
+  custody?: "self" | "custodial";
 };
 
 export type StatsDoc = {
@@ -497,6 +505,14 @@ export type Position = {
   // position, and to keep two wallets holding the same token from being
   // treated as one merged position.
   wallet: string;
+  // "self" = held in the connected wallet itself (manual trade, sellable by
+  // the user signing directly), "custodial" = held in the server-managed hot
+  // wallet (auto-trade, sellable only via the server's custodial keypair).
+  // null for trades recorded before this field existed. Grouped into the
+  // position identity below — a wallet that both manually holds AND has an
+  // auto-bought position in the same token has two genuinely separate
+  // holdings (different signer, different location on-chain), not one.
+  custody: "self" | "custodial" | null;
   netSol: number;
   avgBuyPrice?: number;
   highestPnlPct?: number;
@@ -525,8 +541,12 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
           // Compound identity: two different wallets holding the same token
           // are two separate positions, not one merged position — each has
           // its own cost basis, its own remaining size, and only one wallet
-          // can actually sign a sell for it.
-          _id: { token: "$token", wallet: "$wallet" },
+          // can actually sign a sell for it. custody is included too — the
+          // same owner wallet can independently hold a manual (self-custody)
+          // and an auto-bought (custodial) position in the same token, and
+          // those live in two different on-chain wallets, so they can't be
+          // netted together either.
+          _id: { token: "$token", wallet: "$wallet", custody: "$custody" },
           bought: {
             $sum: { $cond: [{ $eq: ["$type", "buy"] }, "$amountLamports", 0] },
           },
@@ -564,6 +584,7 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
         $project: {
           token: "$_id.token",
           wallet: "$_id.wallet",
+          custody: { $ifNull: ["$_id.custody", null] },
           netSol: { $divide: [{ $subtract: ["$bought", "$sold"] }, 1e9] },
           avgBuyPrice: {
             $cond: [

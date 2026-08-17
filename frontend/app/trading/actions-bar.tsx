@@ -1,86 +1,86 @@
 "use client";
 
 import React, { useState, useCallback } from "react";
-import { TrendingUp, TrendingDown, Zap, Loader2 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { TrendingUp, TrendingDown, Zap, Loader2, Ban } from "lucide-react";
 import { Button } from "@components/ui/button";
 import { useWallet } from "@hooks/useWallet";
-import { useTradingConfigStore } from "@hooks/useConfig";
-import { useTrade } from "@hooks/useTrade";
-import { useStats } from "@hooks/useStats";
+import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { useSocket } from "@hooks/useSocket";
+import { fetcher } from "@lib/utils";
+import { signWalletAuth } from "@lib/walletAuth";
 import { toast } from "react-hot-toast";
 import { motion } from "framer-motion";
 
 export default function ActionsBar() {
-  const { connected } = useWallet();
-  const { selectedToken } = useTradingConfigStore();
-  const { executeTrade } = useTrade();
-  const { updateStats, stats } = useStats();
-  const { sendMessage, connected: socketConnected } = useSocket();
+  const router = useRouter();
+  const { connected, publicKey } = useWallet();
+  const { signMessage } = useSolanaWallet();
+  const { connected: socketConnected } = useSocket();
 
-  const [loading, setLoading] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
-  const handleTrade = useCallback(
-    async (type: "buy" | "sell") => {
-      if (!connected) {
-        toast.error("Please connect your wallet first.");
-        return;
-      }
+  const handleStopAutoTrade = useCallback(async () => {
+    if (!connected || !publicKey) {
+      toast.error("Please connect your wallet first.");
+      return;
+    }
+    const confirmed = window.confirm(
+      "This disables auto-trading for your wallet and sells every position the bot has bought for you. This cannot be undone. Continue?"
+    );
+    if (!confirmed) return;
 
-      setLoading(true);
-      toast.loading(`${type === "buy" ? "Buying" : "Selling"}...`, {
-        id: "trade-status",
+    setStopping(true);
+    toast.loading("Stopping auto-trade and selling bot-bought positions...", {
+      id: "stop-auto-trade",
+    });
+    try {
+      const auth = await signWalletAuth(signMessage, publicKey);
+      const res = await fetcher<{
+        success: boolean;
+        disabledAutoTrade: boolean;
+        sold: { token: string }[];
+        failed: { token: string; error: string }[];
+        error?: string;
+      }>(`/api/user-wallet/${publicKey}/stop-auto-trade`, {
+        method: "POST",
+        body: JSON.stringify(auth),
       });
 
-      try {
-        if (!selectedToken) {
-          toast.error("Please select a token first");
-          return;
-        }
-        const payload = await executeTrade(type, selectedToken);
-        if (!payload) throw new Error("No payload");
-
-        toast.dismiss("trade-status");
-
-        toast.success(
-          `${
-            payload.simulated ? "🧪 Simulated" : "🚀 Live"
-          } ${type.toUpperCase()} ${payload.token} (${payload.amount})`
-        );
-
-        // Emit to socket feed
-        sendMessage("tradeLog", {
-          type: payload.type,
-          token: payload.token,
-          amount: payload.amount,
-          pnl: payload.pnl,
-          signature: payload.signature,
-          time: new Date().toISOString(),
-        });
-
-        // Update local stats. payload.amount is lamports (useTrade.ts's
-        // trade.amount = amountLamports); totalProfitSol/tradeVolumeSol are
-        // SOL-denominated. totalProfitPercent is deliberately not touched
-        // here — it's a portfolio-wide ratio (totalProfitSol / tradeVolumeSol,
-        // db.service.ts), not a sum of individual trades' own pnl%; the next
-        // useStatsSync poll is the authoritative source for it.
-        if (typeof payload.pnl === "number") {
-          const amountSol = (payload.amount ?? 0) / 1e9;
-          updateStats({
-            totalProfitSol: stats.totalProfitSol + amountSol * payload.pnl,
-            tradeVolumeSol: stats.tradeVolumeSol + amountSol,
-          });
-        }
-      } catch (err: any) {
-        toast.dismiss("trade-status");
-        toast.error("❌ Trade failed");
-        console.error(err);
+      if (!res?.success) {
+        throw new Error(res?.error || "Failed to stop auto-trade");
       }
 
-      setLoading(false);
-    },
-    [connected, executeTrade, selectedToken, sendMessage, updateStats, stats]
-  );
+      toast.dismiss("stop-auto-trade");
+      if (res.sold.length === 0 && res.failed.length === 0) {
+        toast.success("Auto-trade disabled. You had no bot-bought positions to sell.");
+      } else if (res.failed.length === 0) {
+        toast.success(`Auto-trade disabled. Sold ${res.sold.length} position(s).`);
+      } else {
+        // Auto-trade is already off at this point regardless — only the
+        // sell-off is partial. List exactly which tokens didn't sell (not
+        // just a count) so the user knows what's still open, and that
+        // clicking the button again will retry just those.
+        const failedList = res.failed
+          .map((f) => `${f.token.slice(0, 8)}… (${f.error})`)
+          .join("\n");
+        toast.success(
+          `Auto-trade disabled. Sold ${res.sold.length} position(s).`
+        );
+        toast.error(
+          `${res.failed.length} position(s) failed to sell:\n${failedList}\n\nClick Stop Auto Trade again to retry.`,
+          { duration: 10000 }
+        );
+        console.warn("Stop auto-trade: some sells failed", res.failed);
+      }
+    } catch (err: any) {
+      toast.dismiss("stop-auto-trade");
+      toast.error(err?.message || "Failed to stop auto-trade");
+      console.error(err);
+    } finally {
+      setStopping(false);
+    }
+  }, [connected, publicKey, signMessage]);
 
   return (
     <motion.div
@@ -106,22 +106,33 @@ export default function ActionsBar() {
 
         <Button
           variant="secondary"
-          disabled={!connected || loading}
-          onClick={() => handleTrade("buy")}
+          disabled={!connected}
+          onClick={() => router.push("/trading/buy")}
           className="flex items-center gap-2"
         >
-          {loading ? <Loader2 className="animate-spin" /> : <TrendingUp />}
+          <TrendingUp />
           Buy
         </Button>
 
         <Button
           variant="danger"
-          disabled={!connected || loading}
-          onClick={() => handleTrade("sell")}
+          disabled={!connected}
+          onClick={() => router.push("/trading/sell")}
           className="flex items-center gap-2"
         >
-          {loading ? <Loader2 className="animate-spin" /> : <TrendingDown />}
+          <TrendingDown />
           Sell
+        </Button>
+
+        <Button
+          variant="outline"
+          disabled={!connected || stopping}
+          onClick={handleStopAutoTrade}
+          className="flex items-center gap-2"
+          title="Sell everything the bot has bought for you and turn off auto-trade"
+        >
+          {stopping ? <Loader2 className="animate-spin" /> : <Ban />}
+          Stop Auto Trade
         </Button>
       </div>
     </motion.div>

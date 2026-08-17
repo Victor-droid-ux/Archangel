@@ -2,7 +2,7 @@
 //
 // crypto.randomUUID() is only exposed in secure contexts (HTTPS, or
 // localhost) — browsers withhold it entirely over plain HTTP. Several
-// components call it directly (LiveTrades.tsx, EmergencyAlert.tsx,
+// components call it directly (LiveTrades.tsx, AccountNotifications.tsx,
 // live-feed.tsx, useTrade.ts), which crashed the whole app on first render
 // when deployed over HTTP-only. crypto.getRandomValues() has no such
 // restriction, so it's used here to build a spec-compliant (RFC 4122 v4)

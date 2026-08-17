@@ -722,6 +722,7 @@ class ValidationPipelineService {
         simulated: !useReal,
         signature: swapResult.signature || "",
         route: "jupiter",
+        custody: "custodial",
       });
 
       LOG.info(

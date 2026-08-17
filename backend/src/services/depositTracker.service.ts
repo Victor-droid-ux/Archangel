@@ -14,10 +14,12 @@
 // deposit.
 import { Connection, PublicKey } from "@solana/web3.js";
 import { Collection } from "mongodb";
+import type { Server } from "socket.io";
 import { getConnection } from "./solana.service.js";
 import { getLogger } from "../utils/logger.js";
 import { connect } from "./db.service.js";
 import userWalletService, { UserWallet } from "./userWallet.service.js";
+import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 
 const log = getLogger("depositTracker");
 
@@ -70,7 +72,8 @@ const MAX_SIGNATURES_PER_SCAN = 50;
 
 async function scanWallet(
   conn: Connection,
-  uw: Pick<UserWallet, "ownerWallet" | "hotWalletPublicKey" | "lastScannedSignature">
+  uw: Pick<UserWallet, "ownerWallet" | "hotWalletPublicKey" | "lastScannedSignature">,
+  io?: Server
 ): Promise<void> {
   const { deposits, trades, withdrawals, userWallets } = await getCols();
   const pubkey = new PublicKey(uw.hotWalletPublicKey);
@@ -131,6 +134,11 @@ async function scanWallet(
               { ownerWallet: uw.ownerWallet, signature: sig, amountSol },
               "Detected new deposit"
             );
+            emitToWalletOrGlobal(io, uw.ownerWallet, "walletDeposit", {
+              amountSol,
+              signature: sig,
+              message: `Deposit received: +${amountSol.toFixed(4)} SOL`,
+            });
           } catch (err: any) {
             // Unique index on signature — a concurrent scan already
             // recorded this one; not an error.
@@ -161,7 +169,10 @@ async function scanWallet(
 
 let scanInterval: NodeJS.Timeout | null = null;
 
-export function startDepositTracker(opts?: { intervalMs?: number }): void {
+export function startDepositTracker(
+  opts?: { intervalMs?: number },
+  io?: Server
+): void {
   const intervalMs = opts?.intervalMs ?? 60_000;
   const conn = getConnection();
 
@@ -170,7 +181,7 @@ export function startDepositTracker(opts?: { intervalMs?: number }): void {
       const wallets = await userWalletService.listAllUserWallets();
       for (const uw of wallets) {
         try {
-          await scanWallet(conn, uw);
+          await scanWallet(conn, uw, io);
         } catch (err: any) {
           log.error(
             { ownerWallet: uw.ownerWallet, err: err?.message },

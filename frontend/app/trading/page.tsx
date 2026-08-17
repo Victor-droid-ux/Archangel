@@ -3,7 +3,6 @@
 import React, { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { Card } from "@components/ui/card";
-import TradingConfigPanel from "@components/trading/trading-config";
 import LiveFeed from "@components/trading/live-feed";
 import TokenTable from "@app/trading/token-table";
 import StatsPanel from "@app/trading/stats-panel";
@@ -17,6 +16,7 @@ import TradeSummary from "@components/trading/trade-summary"; // ✅ imported fr
 import TradeHistory from "@components/trading/trade-history";
 import { useStatsSync } from "@hooks/useStatsSync";
 import { TraderConfigModal } from "@components/trading/trader-config-modal";
+import { AutoTradeReadiness } from "@components/trading/AutoTradeReadiness";
 import { RiskManagementPanel } from "@components/trading/risk-management-panel";
 import { ValidationStatus } from "@components/trading/ValidationStatus";
 import { useValidation } from "@hooks/useValidation";
@@ -24,7 +24,6 @@ import { useConfig } from "@hooks/useConfig";
 import { Settings } from "lucide-react";
 import { useSocket } from "@hooks/useSocket";
 import { toast } from "react-hot-toast";
-import { EmergencyAlert } from "@components/trading/EmergencyAlert";
 import { StoredTokenCheckerStatus } from "@components/trading/StoredTokenCheckerStatus";
 import { WatchlistPanel } from "@components/trading/WatchlistPanel";
 import { Button } from "@components/ui/button";
@@ -100,9 +99,6 @@ export default function TradingDashboard() {
 
   return (
     <div className="space-y-10">
-      {/* Emergency Alert Notifications */}
-      <EmergencyAlert />
-
       {/* ========================== HEADER ========================== */}
       <motion.div {...fadeIn(0.1)}>
         <div className="flex flex-wrap items-center justify-between gap-4">
@@ -116,14 +112,17 @@ export default function TradingDashboard() {
               in real time.
             </p>
           </div>
-          <Button
-            variant="primary"
-            onClick={() => setIsConfigModalOpen(true)}
-            suppressHydrationWarning
-          >
-            <Settings className="w-4 h-4" />
-            Trading Settings
-          </Button>
+          <div className="flex items-center gap-3">
+            <AutoTradeReadiness compact />
+            <Button
+              variant="primary"
+              onClick={() => setIsConfigModalOpen(true)}
+              suppressHydrationWarning
+            >
+              <Settings className="w-4 h-4" />
+              Trading Settings
+            </Button>
+          </div>
         </div>
       </motion.div>
 
@@ -142,10 +141,6 @@ export default function TradingDashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* LEFT COLUMN */}
         <motion.div {...fadeIn(0.3)} className="space-y-6">
-          <Card className="p-4">
-            <TradingConfigPanel />
-          </Card>
-
           {/* Validation Status Panel - NEW */}
           {selectedToken && <ValidationStatus validation={validation} />}
 
