@@ -6,10 +6,6 @@ import {
   WalletProvider,
 } from "@solana/wallet-adapter-react";
 import { WalletAdapterNetwork } from "@solana/wallet-adapter-base";
-import {
-  PhantomWalletAdapter,
-  SolflareWalletAdapter,
-} from "@solana/wallet-adapter-wallets";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 import { clusterApiUrl } from "@solana/web3.js";
 
@@ -33,10 +29,18 @@ export function SolanaWalletProvider({
     [network]
   );
 
-  const wallets = useMemo(
-    () => [new PhantomWalletAdapter(), new SolflareWalletAdapter()],
-    []
-  );
+  // Phantom and Solflare both now self-register via the browser's Wallet
+  // Standard, independent of this app — manually instantiating
+  // PhantomWalletAdapter/SolflareWalletAdapter here created a SECOND,
+  // competing registration of the same wallet, which is what was actually
+  // causing connect() to hang forever on "Connecting..." (confirmed via
+  // Phantom's own console warning: "Phantom was registered as a Standard
+  // Wallet. The Wallet Adapter for Phantom can be removed from your app.",
+  // plus ObjectMultiplex "orphaned data" stream errors from the two
+  // instances fighting over the same extension). An empty array is the
+  // current recommended pattern — @solana/wallet-adapter-react auto-detects
+  // every Standard Wallet the browser has injected.
+  const wallets = useMemo(() => [], []);
 
   return (
     <ConnectionProvider endpoint={endpoint}>
