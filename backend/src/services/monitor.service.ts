@@ -227,9 +227,18 @@ export function startPositionMonitor(
           // or a custodial hot wallet (see resolveSignerForPosition below),
           // never the user's own private key, which the server never has.
           // Selling those is the user's own responsibility (the manual Sell
-          // page). Legacy trades recorded before this field existed
-          // (custody === null) are skipped too rather than guessed at.
-          if (pos.custody !== "custodial") continue;
+          // page). Only skip on an EXPLICIT "self" — every real
+          // auto-buy/auto-sell trade is recorded under a custodial wallet's
+          // owner address, which resolveSignerForPosition can always resolve
+          // a signer for, so treating missing/null custody as "assume
+          // manageable" (rather than "assume self, skip") is the fund-safe
+          // default: it costs nothing (resolveSignerForPosition fails closed,
+          // logs, and backs off if a signer genuinely can't be found) but the
+          // opposite default silently drops a stop-loss/take-profit entirely
+          // — confirmed in production: every trade recorded so far (all of
+          // them genuinely bot-executed) was missing this field, meaning
+          // every custodial position's SL/TP has been silently unenforced.
+          if (pos.custody === "self") continue;
           // netSol is derived from cumulative buy-minus-sell lamports; after a
           // position is fully exited this rarely lands on exactly 0 due to
           // floating-point/rounding residue across multiple fills, leaving a
