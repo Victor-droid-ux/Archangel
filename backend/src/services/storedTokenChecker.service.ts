@@ -3,6 +3,7 @@ import { Server as SocketIOServer } from "socket.io";
 import { getLogger } from "../utils/logger.js";
 import dbService from "./db.service.js";
 import { validateJupiterToken } from "./jupiterTokenValidator.service.js";
+import jupiterService, { type JupiterRecentToken } from "./jupiter.service.js";
 import multiUserExecutionService from "./multiUserExecution.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
 import { TokenLifecycleState } from "./db.service.js";
@@ -30,18 +31,18 @@ class StoredTokenChecker {
   // and tokenDiscovery.service.ts's currentMints Set (pruned at 2000), this
   // map grew forever, one entry per distinct mint ever checked.
   private readonly MAX_TRACKED_MINTS = Number(
-    process.env.MAX_STORED_TOKEN_CHECK_ENTRIES ?? 5000
+    process.env.MAX_STORED_TOKEN_CHECK_ENTRIES ?? 5000,
   );
 
   constructor() {
     this.config = {
       enabled: process.env.STORED_TOKEN_CHECKER_ENABLED === "true",
       checkIntervalMs: parseInt(
-        process.env.STORED_TOKEN_CHECK_INTERVAL_MS || "300000"
+        process.env.STORED_TOKEN_CHECK_INTERVAL_MS || "300000",
       ), // Default: 5 minutes
       maxTokensPerCheck: parseInt(process.env.MAX_TOKENS_PER_CHECK || "20"),
       minTimeSinceLastCheck: parseInt(
-        process.env.MIN_TIME_BETWEEN_TOKEN_CHECKS || "900000"
+        process.env.MIN_TIME_BETWEEN_TOKEN_CHECKS || "900000",
       ), // Default: 15 minutes
       autoBuyEnabled: process.env.JUPITER_AUTO_BUY === "true",
       autoBuyAmountSol: parseFloat(process.env.JUPITER_AUTO_BUY_SOL || "0.05"),
@@ -58,7 +59,7 @@ class StoredTokenChecker {
         maxTokensPerCheck: this.config.maxTokensPerCheck,
         minTimeBetweenChecks: `${this.config.minTimeSinceLastCheck / 1000}s`,
       },
-      "🔍 Stored Token Checker initialized"
+      "🔍 Stored Token Checker initialized",
     );
   }
 
@@ -81,7 +82,7 @@ class StoredTokenChecker {
     LOG.info(
       `🚀 Starting stored token checker (interval: ${
         this.config.checkIntervalMs / 1000
-      }s)`
+      }s)`,
     );
 
     // Run initial check after 30 seconds
@@ -90,7 +91,7 @@ class StoredTokenChecker {
     // Set up recurring checks
     this.intervalId = setInterval(
       () => this.checkStoredTokens(),
-      this.config.checkIntervalMs
+      this.config.checkIntervalMs,
     );
   }
 
@@ -132,13 +133,24 @@ class StoredTokenChecker {
       let checkedCount = 0;
       let qualifiedCount = 0;
 
+      // One batched /tokens/v2/search call for every token this cycle will
+      // actually check, instead of each evaluateToken() making its own
+      // per-mint call — with maxTokensPerCheck defaulting to 20, that was
+      // 20 separate rate-limited requests every cycle stacking on top of
+      // whatever tokenDiscovery/autoBuyer were also firing at the same time.
+      const checkableMints = tokens
+        .filter((token) => this.shouldCheckToken(token.mint))
+        .map((token) => token.mint);
+      const tokenInfoByMint =
+        await jupiterService.getTokenInfoBatch(checkableMints);
+
       for (const token of tokens) {
         try {
           const shouldCheck = this.shouldCheckToken(token.mint);
           if (!shouldCheck) {
             LOG.debug(
               { mint: token.mint.substring(0, 8) },
-              `Skipping ${token.symbol} - checked recently`
+              `Skipping ${token.symbol} - checked recently`,
             );
             continue;
           }
@@ -150,10 +162,13 @@ class StoredTokenChecker {
               state: token.state,
               poolId: token.poolAddress?.substring(0, 8),
             },
-            `Evaluating stored token: ${token.symbol}`
+            `Evaluating stored token: ${token.symbol}`,
           );
 
-          const qualified = await this.evaluateToken(token);
+          const qualified = await this.evaluateToken(
+            token,
+            tokenInfoByMint.get(token.mint) ?? null,
+          );
           if (qualified) {
             qualifiedCount++;
             LOG.info(
@@ -161,7 +176,7 @@ class StoredTokenChecker {
                 mint: token.mint.substring(0, 8),
                 poolId: token.poolAddress?.substring(0, 8),
               },
-              `✅ Stored token ${token.symbol} now meets criteria!`
+              `✅ Stored token ${token.symbol} now meets criteria!`,
             );
           }
 
@@ -183,7 +198,7 @@ class StoredTokenChecker {
           qualified: qualifiedCount,
           durationMs: duration,
         },
-        `✅ Stored token check completed`
+        `✅ Stored token check completed`,
       );
 
       this.emitStatus(checkedCount, qualifiedCount);
@@ -195,7 +210,7 @@ class StoredTokenChecker {
   }
 
   private async getTokensToCheck(
-    states: TokenLifecycleState[]
+    states: TokenLifecycleState[],
   ): Promise<any[]> {
     const now = Date.now();
     const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -222,29 +237,41 @@ class StoredTokenChecker {
     return timeSinceLastCheck >= this.config.minTimeSinceLastCheck;
   }
 
-  private async evaluateToken(token: any): Promise<boolean> {
+  private async evaluateToken(
+    token: any,
+    prefetchedTokenInfo?: JupiterRecentToken | null,
+  ): Promise<boolean> {
     try {
       // Step 1: Re-check Jupiter tradability with current parameters
       LOG.debug(`Validating ${token.symbol || "Unknown"}...`);
-      const validation = await validateJupiterToken(token.mint, {
-        minLiquiditySol: this.config.minLiquiditySol,
-        maxBuyTax: parseInt(process.env.MAX_BUY_TAX_PCT || "5"),
-        maxSellTax: parseInt(process.env.MAX_SELL_TAX_PCT || "5"),
-        // Same default polarity as jupiterDiscovery.service.ts: required unless
-        // explicitly disabled, not opt-in-only-when-explicitly-true. Both callers
-        // of validateJupiterToken must agree here or a fresh discovery and a
-        // re-evaluated stored token get different safety guarantees for free.
-        requireMintDisabled: process.env.REQUIRE_MINT_DISABLED !== "false",
-        requireFreezeDisabled: process.env.REQUIRE_FREEZE_DISABLED !== "false",
-        requireLpLocked: process.env.REQUIRE_LP_LOCKED === "true",
-      });
+      const validation = await validateJupiterToken(
+        token.mint,
+        {
+          minLiquiditySol: this.config.minLiquiditySol,
+          maxBuyTax: parseInt(process.env.MAX_BUY_TAX_PCT || "5"),
+          maxSellTax: parseInt(process.env.MAX_SELL_TAX_PCT || "5"),
+          // Same default polarity as jupiterDiscovery.service.ts: required unless
+          // explicitly disabled, not opt-in-only-when-explicitly-true. Both callers
+          // of validateJupiterToken must agree here or a fresh discovery and a
+          // re-evaluated stored token get different safety guarantees for free.
+          requireMintDisabled: process.env.REQUIRE_MINT_DISABLED !== "false",
+          requireFreezeDisabled:
+            process.env.REQUIRE_FREEZE_DISABLED !== "false",
+          requireLpLocked: process.env.REQUIRE_LP_LOCKED === "true",
+        },
+        // Deliberately no liquiditySol override — this is a re-check of
+        // possibly-stale stored data, so liquidity must come from a fresh
+        // lookup/estimate, not the (potentially days-old) DB value.
+        undefined,
+        prefetchedTokenInfo,
+      );
 
       if (!validation.approved) {
         LOG.debug(
           {
             reason: validation.reason,
           },
-          `Validation failed for ${token.symbol || "Unknown"}`
+          `Validation failed for ${token.symbol || "Unknown"}`,
         );
         return false;
       }
@@ -254,7 +281,7 @@ class StoredTokenChecker {
           lpSol: validation.details.liquiditySol,
           mint: token.mint.substring(0, 8),
         },
-        `✅ ${token.symbol || "Unknown"} passed validation!`
+        `✅ ${token.symbol || "Unknown"} passed validation!`,
       );
 
       // Emit to frontend
@@ -265,16 +292,17 @@ class StoredTokenChecker {
         LOG.info(
           `🎯 Starting validation pipeline for stored token ${
             token.symbol || "Unknown"
-          }...`
+          }...`,
         );
 
         // Fans out across the operator wallet plus every eligible funded,
         // auto-trade-enabled user wallet, same as jupiterDiscovery.service.ts.
         // See multiUserExecution.service.ts.
-        const fanOutResults = await multiUserExecutionService.runPipelineForAllEligibleWallets(
-          token.mint,
-          validation.details.liquiditySol
-        );
+        const fanOutResults =
+          await multiUserExecutionService.runPipelineForAllEligibleWallets(
+            token.mint,
+            validation.details.liquiditySol,
+          );
 
         let anySucceeded = false;
         for (const { ownerWallet, result: pipelineResult } of fanOutResults) {
@@ -285,7 +313,7 @@ class StoredTokenChecker {
                 failedStage: pipelineResult.failedStage,
                 reason: pipelineResult.reason,
               },
-              `Pipeline failed for ${token.symbol || "Unknown"}`
+              `Pipeline failed for ${token.symbol || "Unknown"}`,
             );
             continue;
           }
@@ -293,7 +321,7 @@ class StoredTokenChecker {
           anySucceeded = true;
           LOG.info(
             { wallet: ownerWallet },
-            `✅ ${token.symbol || "Unknown"} passed full pipeline!`
+            `✅ ${token.symbol || "Unknown"} passed full pipeline!`,
           );
 
           // Same as jupiterDiscovery.service.ts's buy path — without this,
@@ -316,7 +344,7 @@ class StoredTokenChecker {
             token: token.mint,
             wallet: ownerWallet,
             amount: Math.round(
-              (pipelineResult.executionResult?.amountSol ?? 0) * 1e9
+              (pipelineResult.executionResult?.amountSol ?? 0) * 1e9,
             ),
             price: pipelineResult.executionResult?.actualPrice,
             pnl: 0,

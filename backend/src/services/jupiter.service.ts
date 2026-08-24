@@ -16,36 +16,108 @@ export const SOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 // Several independent pipelines (tokenDiscovery, jupiterDiscovery, autoBuyer,
-// validationPipeline, storedTokenChecker) all funnel through this one file and
-// can each fire Jupiter calls for multiple tokens in the same instant — a real
-// API key raises the rate limit but doesn't remove it, and that burst pattern
-// was still tripping 429s even with a valid key. Space requests out first
-// (like birdeye.service.ts's throttledRequest) to avoid the burst in the first
-// place, then retry with backoff on whatever 429 still gets through.
-let lastRequestAt = 0;
+// tradeValidation, storedTokenChecker) all funnel through this one file and
+// can each fire Jupiter calls for multiple tokens in the same instant. The
+// previous approach here just checked "has enough time passed since the last
+// request" — but that check-then-set isn't atomic across independent async
+// call chains: several chains can all read the same stale `lastRequestAt`,
+// each conclude they're clear to fire, and burst anyway. This queue instead
+// gives every outgoing Jupiter request a single, real dispatch point: one
+// FIFO queue, a hard concurrency cap, and a minimum spacing between dispatch
+// times, enforced centrally rather than hoped for.
+const MAX_CONCURRENT_REQUESTS = Number(
+  process.env.JUPITER_MAX_CONCURRENT_REQUESTS ?? 4
+);
 const MIN_REQUEST_SPACING_MS = Number(
   process.env.JUPITER_MIN_REQUEST_SPACING_MS ?? 150
+);
+
+interface QueuedRequest {
+  run: () => Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (err: unknown) => void;
+}
+
+const requestQueue: QueuedRequest[] = [];
+let activeRequests = 0;
+let lastDispatchAt = 0;
+let pumpTimer: ReturnType<typeof setTimeout> | null = null;
+
+function pumpQueue(): void {
+  if (pumpTimer) return; // a pump is already scheduled; it will re-check on fire
+  if (activeRequests >= MAX_CONCURRENT_REQUESTS || requestQueue.length === 0) {
+    return;
+  }
+
+  const wait = lastDispatchAt + MIN_REQUEST_SPACING_MS - Date.now();
+  if (wait > 0) {
+    pumpTimer = setTimeout(() => {
+      pumpTimer = null;
+      pumpQueue();
+    }, wait);
+    return;
+  }
+
+  const item = requestQueue.shift()!;
+  lastDispatchAt = Date.now();
+  activeRequests++;
+  item.run().then(
+    (result) => {
+      activeRequests--;
+      item.resolve(result);
+      pumpQueue();
+    },
+    (err) => {
+      activeRequests--;
+      item.reject(err);
+      pumpQueue();
+    }
+  );
+
+  // Concurrency slot may still be free (or spacing may already be clear for
+  // the next one) — try to dispatch more right away instead of waiting for
+  // this one to settle.
+  pumpQueue();
+}
+
+function scheduleJupiterRequest<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    requestQueue.push({
+      run: fn,
+      resolve: resolve as (value: unknown) => void,
+      reject,
+    });
+    pumpQueue();
+  });
+}
+
+const DEFAULT_RETRIES = Number(process.env.JUPITER_MAX_RETRIES ?? 4);
+const RETRY_BACKOFF_BASE_MS = Number(
+  process.env.JUPITER_RETRY_BACKOFF_BASE_MS ?? 1000
 );
 
 async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
-  retries = 2
+  attempt = 0,
+  retries = DEFAULT_RETRIES
 ): Promise<T> {
-  const wait = lastRequestAt + MIN_REQUEST_SPACING_MS - Date.now();
-  if (wait > 0) {
-    await new Promise((resolve) => setTimeout(resolve, wait));
-  }
-  lastRequestAt = Date.now();
-
   try {
-    return await fn();
+    return await scheduleJupiterRequest(fn);
   } catch (err: any) {
-    if (err?.response?.status === 429 && retries > 0) {
-      const backoffMs = 1200 * (3 - retries);
-      LOG.warn(`Jupiter ${label} 429 — retrying in ${backoffMs}ms (${retries} left)`);
+    if (err?.response?.status === 429 && attempt < retries) {
+      // Exponential backoff (1s, 2s, 4s, 8s, ...) plus a little jitter so a
+      // batch of requests that all got 429'd together don't all retry in
+      // lockstep and immediately collide again.
+      const backoffMs =
+        RETRY_BACKOFF_BASE_MS * 2 ** attempt + Math.floor(Math.random() * 250);
+      LOG.warn(
+        `Jupiter ${label} 429 — retrying in ${backoffMs}ms (attempt ${
+          attempt + 1
+        }/${retries})`
+      );
       await new Promise((resolve) => setTimeout(resolve, backoffMs));
-      return withRetry(fn, label, retries - 1);
+      return withRetry(fn, label, attempt + 1, retries);
     }
     throw err;
   }
@@ -483,10 +555,134 @@ class JupiterService {
       return null;
     }
   }
+
+  /**
+   * Same lookup as getTokenInfo(), but for many mints in one request.
+   * /tokens/v2/search accepts a comma-separated query and returns matches
+   * for all of them together — anything validating a whole batch of tokens
+   * at once (discovery's per-cycle batch, a stored-token sweep) should use
+   * this instead of one getTokenInfo() call per mint; that's what was
+   * turning a 4-30 token batch into 4-30 separate rate-limited requests.
+   * Chunked at 100 mints per call per Jupiter's documented query limit.
+   */
+  async getTokenInfoBatch(
+    mints: string[]
+  ): Promise<Map<string, JupiterRecentToken>> {
+    const result = new Map<string, JupiterRecentToken>();
+    const uniqueMints = [...new Set(mints)];
+    if (uniqueMints.length === 0) return result;
+
+    const CHUNK_SIZE = 100;
+    for (let i = 0; i < uniqueMints.length; i += CHUNK_SIZE) {
+      const chunk = uniqueMints.slice(i, i + CHUNK_SIZE);
+      try {
+        const { data } = await withRetry(
+          () =>
+            axios.get(`${this.baseUrl}/tokens/v2/search`, {
+              params: { query: chunk.join(",") },
+              headers: this.headers(),
+              timeout: 10000,
+            }),
+          "getTokenInfoBatch"
+        );
+
+        if (Array.isArray(data)) {
+          for (const raw of data) {
+            const mapped = mapRecentToken(raw);
+            result.set(mapped.mint, mapped);
+          }
+        }
+      } catch (err: any) {
+        LOG.warn(
+          { err: err?.message ?? String(err), count: chunk.length },
+          "Jupiter batch token info lookup failed"
+        );
+        // Leave this chunk's mints unresolved (absent from the map) rather
+        // than failing the whole batch — callers already treat a missing
+        // entry the same as getTokenInfo() returning null.
+      }
+    }
+
+    return result;
+  }
 }
 
 const jupiterService = new JupiterService();
 export default jupiterService;
+
+// Minimum size for the reference-liquidity probe below — small enough not
+// to matter for a real buy, large enough that price-impact stops rounding
+// to zero in Jupiter's response even on a fairly thin pool.
+const MIN_REFERENCE_PROBE_USD = 25;
+
+/**
+ * Liquidity for a token, resolved defensively.
+ *
+ * getTokenInfo()'s /tokens/v2/search catalog and getQuote()'s /swap/v1/quote
+ * are two independent Jupiter systems on different update cadences — a
+ * brand-new token can have a real, routable pool (quote succeeds) while the
+ * search catalog hasn't indexed it yet (tokenInfo is null, or its liquidity
+ * field is 0). Treating that catalog gap as "$0 liquidity" rejects a token
+ * Jupiter can actually fill.
+ *
+ * Prefers the catalog figure when it's present (cheap, no extra request).
+ * When it's missing or zero, falls back to a price-impact-implied estimate
+ * from one real reference-sized quote — the same routing engine the actual
+ * trade will use — instead of assuming zero. If even that reference-sized
+ * quote can't route, that IS genuine evidence of thin liquidity, not an API
+ * miss, so it's reported as $0 rather than "unavailable".
+ */
+export async function resolveLiquidityUsd(
+  tokenMint: string,
+  minLiquidityUsdHint: number,
+  tokenInfo: JupiterRecentToken | null,
+  solPriceUsd: number
+): Promise<{
+  liquidityUSD: number;
+  source: "metadata" | "impact-estimate" | "unavailable";
+}> {
+  if (tokenInfo?.liquidity) {
+    return { liquidityUSD: tokenInfo.liquidity, source: "metadata" };
+  }
+  if (solPriceUsd <= 0) {
+    return { liquidityUSD: 0, source: "unavailable" };
+  }
+
+  const referenceAmountUsd = Math.max(
+    minLiquidityUsdHint * 0.05,
+    MIN_REFERENCE_PROBE_USD
+  );
+  const referenceLamports = Math.round(
+    (referenceAmountUsd / solPriceUsd) * 1e9
+  );
+  const referenceQuote = await jupiterService.getQuote(
+    SOL_MINT,
+    tokenMint,
+    referenceLamports,
+    500
+  );
+
+  if (!referenceQuote) {
+    return { liquidityUSD: 0, source: "impact-estimate" };
+  }
+
+  const impact = referenceQuote.priceImpactPct;
+  if (!Number.isFinite(impact) || impact < 0) {
+    return { liquidityUSD: 0, source: "unavailable" };
+  }
+  if (impact === 0) {
+    // Immeasurably small impact from moving referenceAmountUsd — the pool is
+    // at least comfortably deeper than that reference size.
+    return { liquidityUSD: referenceAmountUsd * 20, source: "impact-estimate" };
+  }
+
+  // Constant-product approximation: for a small trade relative to pool
+  // depth, price impact ≈ amountIn / reserveIn. Jupiter's own "liquidity"
+  // figure is the combined USD value of both sides of the pool, so double
+  // the implied one-sided reserve to match that convention.
+  const estimated = (2 * referenceAmountUsd) / impact;
+  return { liquidityUSD: estimated, source: "impact-estimate" };
+}
 
 // Named convenience exports matching the old raydium.service.ts call-site shape,
 // so downstream files can migrate with a mostly mechanical import swap.
@@ -510,6 +706,8 @@ export const getRecentJupiterTokens = (limit?: number) =>
   jupiterService.getRecentTokens(limit);
 
 export const getJupiterTokenInfo = (mint: string) => jupiterService.getTokenInfo(mint);
+export const getJupiterTokenInfoBatch = (mints: string[]) =>
+  jupiterService.getTokenInfoBatch(mints);
 
 /**
  * Build an unsigned swap transaction for client-side (frontend wallet) signing.

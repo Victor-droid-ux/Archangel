@@ -52,8 +52,11 @@ class JupiterDiscoveryService {
     };
 
     LOG.info(
-      { minLiquiditySol: this.config.minLiquiditySol, autoBuy: this.config.autoBuyEnabled },
-      "Jupiter discovery service initialized"
+      {
+        minLiquiditySol: this.config.minLiquiditySol,
+        autoBuy: this.config.autoBuyEnabled,
+      },
+      "Jupiter discovery service initialized",
     );
   }
 
@@ -68,9 +71,14 @@ class JupiterDiscoveryService {
       return;
     }
     this.isWatching = true;
-    LOG.info("🎧 Starting Jupiter token discovery (polling recent-tokens feed)...");
+    LOG.info(
+      "🎧 Starting Jupiter token discovery (polling recent-tokens feed)...",
+    );
 
-    const tick = () => this.poll().catch((err) => LOG.error({ err: err.message }, "Poll tick error"));
+    const tick = () =>
+      this.poll().catch((err) =>
+        LOG.error({ err: err.message }, "Poll tick error"),
+      );
     tick();
     this.intervalHandle = setInterval(tick, this.config.pollIntervalMs);
   }
@@ -84,7 +92,9 @@ class JupiterDiscoveryService {
 
   private async poll() {
     const tokens = await jupiterService.getRecentTokens(100);
-    const fresh = tokens.filter((t) => t.mint && !this.detectedTokens.has(t.mint));
+    const fresh = tokens.filter(
+      (t) => t.mint && !this.detectedTokens.has(t.mint),
+    );
 
     for (const token of fresh) {
       this.detectedTokens.add(token.mint);
@@ -94,7 +104,12 @@ class JupiterDiscoveryService {
       }
       this.activeValidations++;
       this.processToken(token)
-        .catch((err) => LOG.error({ err: err.message, mint: token.mint }, "Token processing error"))
+        .catch((err) =>
+          LOG.error(
+            { err: err.message, mint: token.mint },
+            "Token processing error",
+          ),
+        )
         .finally(() => this.activeValidations--);
     }
 
@@ -107,7 +122,10 @@ class JupiterDiscoveryService {
   private async processToken(token: JupiterRecentToken) {
     const existingToken = await dbService.getTokenState(token.mint);
     if (existingToken) {
-      LOG.debug({ mint: token.mint.slice(0, 8), state: existingToken.state }, "Already processed");
+      LOG.debug(
+        { mint: token.mint.slice(0, 8), state: existingToken.state },
+        "Already processed",
+      );
       return;
     }
 
@@ -131,7 +149,10 @@ class JupiterDiscoveryService {
       // than a hardcoded $150 — that was inconsistent with the rest of the
       // codebase and would silently skip/admit the wrong tokens whenever
       // real SOL price drifts from $150.
-      LOG.debug({ mint: token.mint.slice(0, 8), liquidity: token.liquidity }, "Below liquidity floor, skipping for now");
+      LOG.debug(
+        { mint: token.mint.slice(0, 8), liquidity: token.liquidity },
+        "Below liquidity floor, skipping for now",
+      );
       if (this.io) {
         this.io.emit("jupiter:token_skipped", {
           mint: token.mint,
@@ -152,14 +173,22 @@ class JupiterDiscoveryService {
       });
     }
 
-    const validation = await validateJupiterToken(token.mint, {
-      minLiquiditySol: this.config.minLiquiditySol,
-      maxBuyTax: this.config.maxBuyTax,
-      maxSellTax: this.config.maxSellTax,
-      requireMintDisabled: this.config.requireMintDisabled,
-      requireFreezeDisabled: this.config.requireFreezeDisabled,
-      requireLpLocked: this.config.requireLpLocked,
-    });
+    const validation = await validateJupiterToken(
+      token.mint,
+      {
+        minLiquiditySol: this.config.minLiquiditySol,
+        maxBuyTax: this.config.maxBuyTax,
+        maxSellTax: this.config.maxSellTax,
+        requireMintDisabled: this.config.requireMintDisabled,
+        requireFreezeDisabled: this.config.requireFreezeDisabled,
+        requireLpLocked: this.config.requireLpLocked,
+      },
+      // token.liquidity is straight from the same /tokens/v2/recent poll
+      // that just discovered this token — fresher and more reliable than
+      // having validateJupiterToken re-query Jupiter's search endpoint for
+      // it a few lines later.
+      solPriceUsd > 0 ? token.liquidity / solPriceUsd : undefined,
+    );
 
     await dbService.upsertTokenState({
       mint: token.mint,
@@ -179,7 +208,7 @@ class JupiterDiscoveryService {
     if (!validation.approved) {
       LOG.warn(
         { mint: token.mint.slice(0, 8), filters: validation.failedFilters },
-        `⚠️ Token failed validation: ${validation.reason}`
+        `⚠️ Token failed validation: ${validation.reason}`,
       );
       if (this.io) {
         this.io.emit("jupiter:validation_failed", {
@@ -194,7 +223,7 @@ class JupiterDiscoveryService {
 
     LOG.info(
       { mint: token.mint.slice(0, 8), filters: validation.passedFilters },
-      `✅ Token passed all safety checks (eligible for auto-buy): ${token.symbol}`
+      `✅ Token passed all safety checks (eligible for auto-buy): ${token.symbol}`,
     );
     if (this.io) {
       this.io.emit("jupiter:validation_passed", {
@@ -206,7 +235,9 @@ class JupiterDiscoveryService {
 
     if (!this.config.autoBuyEnabled) return;
 
-    LOG.info(`🚀 Starting validation pipeline for auto-buy: ${token.symbol}...`);
+    LOG.info(
+      `🚀 Starting validation pipeline for auto-buy: ${token.symbol}...`,
+    );
     // Fans out across the operator wallet plus every eligible funded,
     // auto-trade-enabled user wallet — each independently risk-checked and
     // executed with its own capital. See multiUserExecution.service.ts.
@@ -215,10 +246,11 @@ class JupiterDiscoveryService {
     // so for now every connected dashboard sees every wallet's auto-buy
     // activity for this event type (trade history/positions reads are
     // already wallet-scoped; this is a live-feed-only gap).
-    const fanOutResults = await multiUserExecutionService.runPipelineForAllEligibleWallets(
-      token.mint,
-      validation.details.liquiditySol
-    );
+    const fanOutResults =
+      await multiUserExecutionService.runPipelineForAllEligibleWallets(
+        token.mint,
+        validation.details.liquiditySol,
+      );
 
     for (const { ownerWallet, result: pipelineResult } of fanOutResults) {
       if (!pipelineResult.success) {
@@ -230,7 +262,7 @@ class JupiterDiscoveryService {
             stageName: pipelineResult.failedStageName,
             reason: pipelineResult.reason,
           },
-          `❌ Pipeline failed at Stage ${pipelineResult.failedStage}: ${pipelineResult.failedStageName}`
+          `❌ Pipeline failed at Stage ${pipelineResult.failedStage}: ${pipelineResult.failedStageName}`,
         );
         emitToWalletOrGlobal(this.io, ownerWallet, "jupiter:pipeline_failed", {
           mint: token.mint,
@@ -250,7 +282,7 @@ class JupiterDiscoveryService {
           wallet: ownerWallet,
           signature: pipelineResult.executionResult?.signature,
         },
-        `✅ Pipeline completed successfully! Buy executed via Jupiter.`
+        `✅ Pipeline completed successfully! Buy executed via Jupiter.`,
       );
 
       if (pipelineResult.executionResult) {
@@ -271,7 +303,7 @@ class JupiterDiscoveryService {
         token: token.mint,
         wallet: ownerWallet,
         amount: Math.round(
-          (pipelineResult.executionResult?.amountSol ?? 0) * 1e9
+          (pipelineResult.executionResult?.amountSol ?? 0) * 1e9,
         ),
         price: pipelineResult.executionResult?.actualPrice,
         pnl: 0,

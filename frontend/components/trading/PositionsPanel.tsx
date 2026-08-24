@@ -19,6 +19,8 @@ import {
 
 type Position = {
   token: string;
+  wallet?: string;
+  custody?: "self" | "custodial" | null;
   netSol: number;
   avgBuyPrice?: number;
   currentPrice?: number;
@@ -129,15 +131,16 @@ export const PositionsPanel: React.FC = () => {
                   const pctDisplay = pnlFraction * 100;
                   const pnlColor =
                     pctDisplay >= 0 ? "text-green-400" : "text-red-400";
+                  const positionKey = `${p.token}:${p.wallet ?? ""}:${p.custody ?? "legacy"}`;
                   const trailing = allTrailingData.get(p.token);
-                  const isExpanded = expanded === p.token;
+                  const isExpanded = expanded === positionKey;
 
                   return (
-                    <React.Fragment key={p.token}>
+                    <React.Fragment key={positionKey}>
                       <tr
                         className="border-b border-base-300 hover:bg-base-300/20 transition cursor-pointer"
                         onClick={() =>
-                          setExpanded(isExpanded ? null : p.token)
+                          setExpanded(isExpanded ? null : positionKey)
                         }
                       >
                         <td className="py-2 text-gray-500">
@@ -184,9 +187,8 @@ export const PositionsPanel: React.FC = () => {
                               className="inline-flex items-center gap-1 text-orange-400"
                               title={`Armed at +${trailing.trailingActivationPct}% — exits on a ${trailing.trailingStopPct}% pullback from peak`}
                             >
-                              <TrendingDown className="h-3 w-3" />
-                              −{trailing.drawdownFromPeak.toFixed(1)}% from
-                              peak
+                              <TrendingDown className="h-3 w-3" />−
+                              {trailing.drawdownFromPeak.toFixed(1)}% from peak
                             </span>
                           ) : (
                             <span className="text-gray-600">Not armed</span>

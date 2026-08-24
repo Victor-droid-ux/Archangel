@@ -1,4 +1,9 @@
-import jupiterService, { SOL_MINT, getSolPriceUsd } from "./jupiter.service.js";
+import jupiterService, {
+  SOL_MINT,
+  getSolPriceUsd,
+  resolveLiquidityUsd,
+  type JupiterRecentToken,
+} from "./jupiter.service.js";
 import { getLogger } from "../utils/logger.js";
 
 const log = getLogger("tokenLifecycle");
@@ -32,9 +37,16 @@ export interface TokenLifecycleResult {
 
 /**
  * Validate a token's tradability via Jupiter: a real quote + real liquidity.
+ *
+ * `prefetchedTokenInfo` lets a batch caller (validateTokenBatch) pass in a
+ * tokenInfo it already fetched for the whole batch in one request, instead
+ * of this function doing its own per-mint /tokens/v2/search call. Pass
+ * `undefined` (the default) to have it fetched here for a standalone call;
+ * pass `null` explicitly if the batch lookup ran but didn't find this mint.
  */
 export async function validateTokenLifecycle(
-  tokenMint: string
+  tokenMint: string,
+  prefetchedTokenInfo?: JupiterRecentToken | null
 ): Promise<TokenLifecycleResult> {
   const result: TokenLifecycleResult = {
     mint: tokenMint,
@@ -48,10 +60,15 @@ export async function validateTokenLifecycle(
     log.info(`Validating lifecycle for token ${tokenMint.slice(0, 8)}...`);
 
     const smallAmountLamports = 1_000_000; // 0.001 SOL
-    const [quote, tokenInfo] = await Promise.all([
+    const needsTokenInfoFetch = prefetchedTokenInfo === undefined;
+    const [quote, fetchedTokenInfo, solPriceUsd] = await Promise.all([
       jupiterService.getQuote(SOL_MINT, tokenMint, smallAmountLamports, 500),
-      jupiterService.getTokenInfo(tokenMint),
+      needsTokenInfoFetch
+        ? jupiterService.getTokenInfo(tokenMint)
+        : Promise.resolve(prefetchedTokenInfo ?? null),
+      getSolPriceUsd(),
     ]);
+    const tokenInfo = fetchedTokenInfo;
 
     if (tokenInfo?.firstPoolId) {
       result.poolAddress = tokenInfo.firstPoolId;
@@ -65,15 +82,24 @@ export async function validateTokenLifecycle(
       return result;
     }
 
-    // tokenInfo.liquidity is USD (Jupiter's raw field, same as everywhere
-    // else it's consumed in this codebase) — was previously written straight
-    // into a field named liquiditySOL with no conversion, so a token with
-    // e.g. $50 of real liquidity read as "50 SOL", ~1000x over the 0.05 SOL
-    // threshold this value is gated against downstream (sniperStrategy.ts).
-    // That made the liquidity gate on this discovery path pass for
-    // essentially any token regardless of real liquidity.
-    const liquidityUSD = tokenInfo?.liquidity ?? 0;
-    const solPriceUsd = await getSolPriceUsd();
+    // tokenInfo?.liquidity comes from a separate Jupiter lookup
+    // (/tokens/v2/search) than the quote above (/swap/v1/quote) — a catalog
+    // miss/lag there must not read as "$0 liquidity" when the quote just
+    // proved a real route exists. resolveLiquidityUsd() falls back to a
+    // price-impact estimate from an actual quote instead of trusting a zero.
+    //
+    // (This also carries forward a fix from before this batching change: the
+    // liquidity figure is USD and must be divided by the SOL price to become
+    // "SOL" — it was previously written straight into liquiditySOL with no
+    // conversion, which made the ~0.05 SOL threshold this gates against
+    // downstream pass for essentially any token regardless of real liquidity.)
+    const minLiquidityUsdHint = 0.05 * solPriceUsd; // rough USD equivalent of the downstream 0.05 SOL floor
+    const { liquidityUSD } = await resolveLiquidityUsd(
+      tokenMint,
+      minLiquidityUsdHint,
+      tokenInfo,
+      solPriceUsd
+    );
     const liquiditySOL = solPriceUsd > 0 ? liquidityUSD / solPriceUsd : 0;
     result.liquiditySOL = liquiditySOL;
     result.hasLiquidity = liquiditySOL > 0;
@@ -122,8 +148,17 @@ export async function validateTokenBatch(tokenMints: string[]): Promise<{
 }> {
   log.info(`Batch validating ${tokenMints.length} tokens...`);
 
+  // One batched /tokens/v2/search call for the whole set instead of each
+  // validateTokenLifecycle() call doing its own — this is what was turning
+  // a routine 4-30 token discovery cycle into 4-30 separate rate-limited
+  // requests, stacking on top of whatever autoBuyer/storedTokenChecker were
+  // firing at the same time.
+  const tokenInfoByMint = await jupiterService.getTokenInfoBatch(tokenMints);
+
   const results = await Promise.all(
-    tokenMints.map((mint) => validateTokenLifecycle(mint))
+    tokenMints.map((mint) =>
+      validateTokenLifecycle(mint, tokenInfoByMint.get(mint) ?? null)
+    )
   );
 
   const tradable = results.filter((r) => r.isTradable);

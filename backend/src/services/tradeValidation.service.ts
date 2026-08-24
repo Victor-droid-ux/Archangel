@@ -11,7 +11,11 @@
  * executable route right now or it doesn't; there's no separate pre-pool stage.)
  */
 
-import jupiterService, { SOL_MINT, getSolPriceUsd } from "./jupiter.service.js";
+import jupiterService, {
+  SOL_MINT,
+  getSolPriceUsd,
+  resolveLiquidityUsd,
+} from "./jupiter.service.js";
 import birdeyeService from "./birdeye.service.js";
 import {
   getHolderDistribution,
@@ -74,7 +78,7 @@ export interface TradeValidationResult {
  * CONDITION 1: Confirm the token has a real, sufficiently-liquid Jupiter route
  */
 async function checkJupiterTradable(
-  tokenMint: string
+  tokenMint: string,
 ): Promise<{ metrics: JupiterLiquidityMetrics; passed: boolean }> {
   try {
     const smallAmountLamports = 1_000_000; // 0.001 SOL test
@@ -98,12 +102,22 @@ async function checkJupiterTradable(
       };
     }
 
-    const liquidityUSD = tokenInfo?.liquidity ?? 0;
-    const liquiditySOL = solPriceUsd > 0 ? liquidityUSD / solPriceUsd : 0;
-
     // Aggressive mode: $1,500 minimum. Safe mode: $5,000 minimum.
     const tradingMode = process.env.TRADING_MODE || "aggressive";
     const minLiquidityUSD = tradingMode === "safe" ? 5000 : 1500;
+
+    // tokenInfo?.liquidity comes from a *separate* Jupiter lookup
+    // (/tokens/v2/search) than the quote above (/swap/v1/quote) — a catalog
+    // miss there must not read as "$0 liquidity" when the quote we just got
+    // proves a real route exists. Falls back to a price-impact estimate
+    // instead of trusting a zero. See resolveLiquidityUsd's own doc comment.
+    const { liquidityUSD, source: liquiditySource } = await resolveLiquidityUsd(
+      tokenMint,
+      minLiquidityUSD,
+      tokenInfo,
+      solPriceUsd,
+    );
+    const liquiditySOL = solPriceUsd > 0 ? liquidityUSD / solPriceUsd : 0;
     const meetsMinimum = liquidityUSD >= minLiquidityUSD;
 
     const metrics: JupiterLiquidityMetrics = {
@@ -120,10 +134,10 @@ async function checkJupiterTradable(
 
     log.info(
       `Token ${tokenMint.slice(0, 8)}... Jupiter liquidity: ${liquiditySOL.toFixed(
-        2
-      )} SOL ($${liquidityUSD.toFixed(0)}) | Min: $${minLiquidityUSD} (${tradingMode} mode) | Condition 1: ${
+        2,
+      )} SOL ($${liquidityUSD.toFixed(0)}, source: ${liquiditySource}) | Min: $${minLiquidityUSD} (${tradingMode} mode) | Condition 1: ${
         passed ? "✅ PASS" : "❌ FAIL"
-      }`
+      }`,
     );
 
     return { metrics, passed };
@@ -166,7 +180,9 @@ async function checkNoEarlyDump(tokenMint: string): Promise<boolean> {
     const dropPct = (high - low) / high;
     return dropPct < 0.6;
   } catch (err) {
-    log.debug(`Early-dump check unavailable for ${tokenMint.slice(0, 8)}...: ${err}`);
+    log.debug(
+      `Early-dump check unavailable for ${tokenMint.slice(0, 8)}...: ${err}`,
+    );
     return true; // no data — same honest-degradation reasoning as above
   }
 }
@@ -176,7 +192,7 @@ async function checkNoEarlyDump(tokenMint: string): Promise<boolean> {
  */
 async function performSafetyChecks(
   tokenMint: string,
-  poolAddress?: string
+  poolAddress?: string,
 ): Promise<{ checks: SafetyChecks; passed: boolean }> {
   try {
     // Prefer Jupiter's own audit data (already fetched during discovery, cheap here too)
@@ -190,7 +206,10 @@ async function performSafetyChecks(
       creatorHoldings,
       top3Combined,
       available: holderDataAvailable,
-    } = await getHolderDistribution(tokenMint);
+    } = await getHolderDistribution(tokenMint, {
+      creatorAddress: tokenInfo?.devAddress,
+      excludeOwners: [poolAddress, tokenInfo?.firstPoolId],
+    });
 
     let canSell = false;
     try {
@@ -203,21 +222,21 @@ async function performSafetyChecks(
         SOL_MINT,
         tokenMint,
         1_000_000, // 0.001 SOL
-        1000
+        1000,
       );
       if (probeBuyQuote?.outAmount) {
         const testQuote = await jupiterService.getQuote(
           tokenMint,
           SOL_MINT,
           probeBuyQuote.outAmount,
-          1000 // High slippage tolerance for test
+          1000, // High slippage tolerance for test
         );
         if (testQuote && testQuote.outAmount > 0) {
           canSell = true;
           log.debug(
             `Test sell quote successful for ${tokenMint.slice(0, 8)}... - ${
               testQuote.outAmount
-            } lamports expected`
+            } lamports expected`,
           );
         }
       }
@@ -286,7 +305,7 @@ async function performSafetyChecks(
         taxAcceptable ? "✅" : "❌"
       }
       ✓ Honeypot: ${notHoneypot ? "✅ CLEAR" : "❌ FLAGGED/UNVERIFIED"}
-      → Condition 2: ${passed ? "✅ PASS" : "❌ FAIL"}`
+      → Condition 2: ${passed ? "✅ PASS" : "❌ FAIL"}`,
     );
 
     return { checks, passed };
@@ -313,13 +332,12 @@ async function performSafetyChecks(
  * MAIN VALIDATION: Check both conditions and approve/reject trade
  */
 export async function validateTradeOpportunity(
-  tokenMint: string
+  tokenMint: string,
 ): Promise<TradeValidationResult> {
   log.info(`🔍 Validating trade opportunity for ${tokenMint.slice(0, 8)}...`);
 
-  const { metrics: jupiterMetrics, passed: condition1 } = await checkJupiterTradable(
-    tokenMint
-  );
+  const { metrics: jupiterMetrics, passed: condition1 } =
+    await checkJupiterTradable(tokenMint);
 
   // Skip the (expensive) safety checks entirely if there's no route/liquidity at all
   const { checks: safetyChecks, passed: condition2 } = condition1
@@ -349,7 +367,7 @@ export async function validateTradeOpportunity(
     reason = "✅ All conditions passed - SNIPE OPPORTUNITY!";
   } else if (!condition1) {
     reason = `❌ No Jupiter route or insufficient liquidity ($${jupiterMetrics.liquidityUSD.toFixed(
-      0
+      0,
     )})`;
   } else {
     reason = "❌ Failed safety checks - SCAM RISK";
@@ -370,7 +388,7 @@ export async function validateTradeOpportunity(
   log.info(
     `🎯 Validation result: ${recommendation} - ${reason} | C1: ${
       condition1 ? "✅" : "❌"
-    } C2: ${condition2 ? "✅" : "❌"}`
+    } C2: ${condition2 ? "✅" : "❌"}`,
   );
 
   return result;
@@ -380,19 +398,19 @@ export async function validateTradeOpportunity(
  * Batch validate multiple tokens
  */
 export async function validateBatchTradeOpportunities(
-  tokenMints: string[]
+  tokenMints: string[],
 ): Promise<TradeValidationResult[]> {
   log.info(`📊 Batch validating ${tokenMints.length} trade opportunities...`);
 
   const results = await Promise.all(
-    tokenMints.map((mint) => validateTradeOpportunity(mint))
+    tokenMints.map((mint) => validateTradeOpportunity(mint)),
   );
 
   const approved = results.filter((r) => r.approved);
   const ignored = results.filter((r) => !r.approved);
 
   log.info(
-    `📊 Batch results: ${approved.length} APPROVED | ${ignored.length} IGNORED`
+    `📊 Batch results: ${approved.length} APPROVED | ${ignored.length} IGNORED`,
   );
 
   return results;

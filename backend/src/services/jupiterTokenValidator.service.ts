@@ -1,6 +1,10 @@
 // backend/src/services/jupiterTokenValidator.service.ts
 import { getLogger } from "../utils/logger.js";
-import jupiterService, { getSolPriceUsd } from "./jupiter.service.js";
+import jupiterService, {
+  getSolPriceUsd,
+  resolveLiquidityUsd,
+  type JupiterRecentToken,
+} from "./jupiter.service.js";
 import {
   fetchRugCheckReport,
   getHolderDistribution,
@@ -41,11 +45,18 @@ interface ValidationResult {
  * Comprehensive token validation before allowing an auto-buy.
  * Liquidity + mint/freeze authority come straight from Jupiter's /tokens/v2 audit
  * data (already fetched during discovery) instead of a separate on-chain RPC call.
+ *
+ * `prefetchedTokenInfo` lets a caller checking many tokens in one pass (e.g.
+ * storedTokenChecker's per-cycle sweep) supply a tokenInfo it already fetched
+ * via jupiterService.getTokenInfoBatch(), instead of this function doing its
+ * own per-mint /tokens/v2/search call. Leave undefined for a standalone call;
+ * pass `null` explicitly if the batch lookup ran but didn't find this mint.
  */
 export async function validateJupiterToken(
   tokenMint: string,
   config: ValidationConfig,
-  liquiditySol?: number
+  liquiditySol?: number,
+  prefetchedTokenInfo?: JupiterRecentToken | null,
 ): Promise<ValidationResult> {
   const passedFilters: string[] = [];
   const failedFilters: string[] = [];
@@ -53,13 +64,37 @@ export async function validateJupiterToken(
   try {
     LOG.info(`🔍 Validating token for ${tokenMint.slice(0, 8)}...`);
 
-    const tokenInfo = await jupiterService.getTokenInfo(tokenMint);
+    const solPriceUsd = await getSolPriceUsd();
+    const tokenInfo =
+      prefetchedTokenInfo !== undefined
+        ? prefetchedTokenInfo
+        : await jupiterService.getTokenInfo(tokenMint);
 
     // Step 1: Check liquidity
     LOG.debug("Checking liquidity...");
-    const liquidityValue =
-      liquiditySol ??
-      (tokenInfo?.liquidity ? tokenInfo.liquidity / (await getSolPriceUsd()) : 0);
+    let liquidityValue: number;
+    if (liquiditySol != null) {
+      // Caller already has a fresh, reliable liquidity figure (e.g. straight
+      // from the same /tokens/v2/recent poll that just discovered this
+      // token) — use it instead of re-querying Jupiter's search catalog,
+      // which is both redundant here and the exact lookup that lags/misses
+      // for brand-new mints.
+      liquidityValue = liquiditySol;
+    } else {
+      // tokenInfo?.liquidity comes from a separate Jupiter lookup
+      // (/tokens/v2/search) than routing — a catalog miss there must not
+      // read as "$0 liquidity" on its own; fall back to a price-impact
+      // estimate from an actual quote instead of trusting a zero.
+      const minLiquidityUsdHint = config.minLiquiditySol * solPriceUsd;
+      const resolved = await resolveLiquidityUsd(
+        tokenMint,
+        minLiquidityUsdHint,
+        tokenInfo,
+        solPriceUsd,
+      );
+      liquidityValue =
+        solPriceUsd > 0 ? resolved.liquidityUSD / solPriceUsd : 0;
+    }
 
     if (liquidityValue >= config.minLiquiditySol) {
       passedFilters.push(`liquidity_check_${config.minLiquiditySol}_sol`);
@@ -67,7 +102,7 @@ export async function validateJupiterToken(
     } else {
       failedFilters.push(`liquidity_check_${config.minLiquiditySol}_sol`);
       LOG.warn(
-        `❌ Liquidity too low: ${liquidityValue.toFixed(2)} SOL < ${config.minLiquiditySol} SOL`
+        `❌ Liquidity too low: ${liquidityValue.toFixed(2)} SOL < ${config.minLiquiditySol} SOL`,
       );
       return {
         approved: false,
@@ -113,7 +148,7 @@ export async function validateJupiterToken(
     // Early exit if critical checks failed (skip slow API calls)
     if (failedFilters.length > 0) {
       LOG.debug(
-        `Skipping slow checks - already failed ${failedFilters.length} critical checks`
+        `Skipping slow checks - already failed ${failedFilters.length} critical checks`,
       );
       return {
         approved: false,
@@ -153,7 +188,9 @@ export async function validateJupiterToken(
         LOG.info(`✅ Buy tax acceptable: ${taxes.buyTax}%`);
       } else {
         failedFilters.push(`buy_tax_under_${config.maxBuyTax}_pct`);
-        LOG.warn(`❌ Buy tax too high: ${taxes.buyTax}% > ${config.maxBuyTax}%`);
+        LOG.warn(
+          `❌ Buy tax too high: ${taxes.buyTax}% > ${config.maxBuyTax}%`,
+        );
       }
 
       if (taxes.sellTax <= config.maxSellTax) {
@@ -161,7 +198,9 @@ export async function validateJupiterToken(
         LOG.info(`✅ Sell tax acceptable: ${taxes.sellTax}%`);
       } else {
         failedFilters.push(`sell_tax_under_${config.maxSellTax}_pct`);
-        LOG.warn(`❌ Sell tax too high: ${taxes.sellTax}% > ${config.maxSellTax}%`);
+        LOG.warn(
+          `❌ Sell tax too high: ${taxes.sellTax}% > ${config.maxSellTax}%`,
+        );
       }
     }
 
@@ -170,7 +209,9 @@ export async function validateJupiterToken(
     const isHoneypot = report.available ? report.isHoneypot : true;
     if (!report.available) {
       failedFilters.push("honeypot_check");
-      LOG.warn("❌ RugCheck unavailable — cannot verify honeypot status, failing closed");
+      LOG.warn(
+        "❌ RugCheck unavailable — cannot verify honeypot status, failing closed",
+      );
     } else if (!isHoneypot) {
       passedFilters.push("honeypot_check");
       LOG.info("✅ Not a honeypot");
@@ -184,7 +225,9 @@ export async function validateJupiterToken(
     if (config.requireLpLocked) {
       if (!report.available) {
         failedFilters.push("lp_locked");
-        LOG.warn("❌ RugCheck unavailable — cannot verify LP lock status, failing closed");
+        LOG.warn(
+          "❌ RugCheck unavailable — cannot verify LP lock status, failing closed",
+        );
       } else {
         lpLocked = report.lpLocked;
         if (lpLocked) {
@@ -203,7 +246,10 @@ export async function validateJupiterToken(
     // screening entirely depending on which discovery mechanism found it.
     const maxCreatorPct = config.maxCreatorHoldingsPct ?? 20;
     const maxTop3Pct = config.maxTop3HoldingsPct ?? 60;
-    const holderDist = await getHolderDistribution(tokenMint);
+    const holderDist = await getHolderDistribution(tokenMint, {
+      creatorAddress: tokenInfo?.devAddress,
+      excludeOwners: [tokenInfo?.firstPoolId],
+    });
     const creatorBelowLimit =
       holderDist.available && holderDist.creatorHoldings <= maxCreatorPct;
     const top3BelowLimit =
@@ -216,17 +262,25 @@ export async function validateJupiterToken(
     } else {
       if (creatorBelowLimit) {
         passedFilters.push(`creator_holdings_under_${maxCreatorPct}_pct`);
-        LOG.info(`✅ Creator holdings acceptable: ${holderDist.creatorHoldings.toFixed(1)}%`);
+        LOG.info(
+          `✅ Creator holdings acceptable: ${holderDist.creatorHoldings.toFixed(1)}%`,
+        );
       } else {
         failedFilters.push(`creator_holdings_under_${maxCreatorPct}_pct`);
-        LOG.warn(`❌ Creator holds too much: ${holderDist.creatorHoldings.toFixed(1)}% > ${maxCreatorPct}%`);
+        LOG.warn(
+          `❌ Creator holds too much: ${holderDist.creatorHoldings.toFixed(1)}% > ${maxCreatorPct}%`,
+        );
       }
       if (top3BelowLimit) {
         passedFilters.push(`top3_holdings_under_${maxTop3Pct}_pct`);
-        LOG.info(`✅ Top-3 holdings acceptable: ${holderDist.top3Combined.toFixed(1)}%`);
+        LOG.info(
+          `✅ Top-3 holdings acceptable: ${holderDist.top3Combined.toFixed(1)}%`,
+        );
       } else {
         failedFilters.push(`top3_holdings_under_${maxTop3Pct}_pct`);
-        LOG.warn(`❌ Top-3 holds too much: ${holderDist.top3Combined.toFixed(1)}% > ${maxTop3Pct}%`);
+        LOG.warn(
+          `❌ Top-3 holds too much: ${holderDist.top3Combined.toFixed(1)}% > ${maxTop3Pct}%`,
+        );
       }
     }
 
@@ -246,16 +300,25 @@ export async function validateJupiterToken(
     if (approved) {
       LOG.info(
         { passed: passedFilters.length, failed: failedFilters.length },
-        `✅ Token validation PASSED for ${tokenMint.slice(0, 8)}`
+        `✅ Token validation PASSED for ${tokenMint.slice(0, 8)}`,
       );
     } else {
       LOG.warn(
-        { passed: passedFilters.length, failed: failedFilters.length, failedChecks: failedFilters },
-        `❌ Token validation FAILED for ${tokenMint.slice(0, 8)}`
+        {
+          passed: passedFilters.length,
+          failed: failedFilters.length,
+          failedChecks: failedFilters,
+        },
+        `❌ Token validation FAILED for ${tokenMint.slice(0, 8)}`,
       );
     }
 
-    const result: ValidationResult = { approved, passedFilters, failedFilters, details };
+    const result: ValidationResult = {
+      approved,
+      passedFilters,
+      failedFilters,
+      details,
+    };
     if (!approved) {
       result.reason = `Failed ${failedFilters.length} validation check(s)`;
     }
@@ -279,4 +342,3 @@ export async function validateJupiterToken(
     };
   }
 }
-

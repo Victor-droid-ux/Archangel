@@ -11,7 +11,7 @@
 // with a real mark-to-market using each open position's live Jupiter price,
 // the same calculation positions.route.ts already does per-position.
 import dbService from "./db.service.js";
-import { getJupiterTokenInfo, getSolPriceUsd } from "./jupiter.service.js";
+import { getJupiterTokenInfoBatch, getSolPriceUsd } from "./jupiter.service.js";
 import depositTrackerService from "./depositTracker.service.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -30,7 +30,7 @@ export interface PortfolioValuation {
 }
 
 export async function getPortfolioValuation(
-  wallet: string
+  wallet: string,
 ): Promise<PortfolioValuation> {
   const [pnl, positions, totalDepositedSol, solPriceUsd] = await Promise.all([
     dbService.getPortfolioPnL(wallet),
@@ -39,11 +39,17 @@ export async function getPortfolioValuation(
     getSolPriceUsd(),
   ]);
 
+  const tokenInfoByMint = await getJupiterTokenInfoBatch(
+    positions
+      .filter((pos) => pos.avgBuyPrice && pos.netSol > 0)
+      .map((pos) => pos.token),
+  );
+
   let unrealizedPnlSol = 0;
   for (const pos of positions) {
     if (!pos.avgBuyPrice || pos.netSol <= 0) continue;
     try {
-      const info = await getJupiterTokenInfo(pos.token);
+      const info = tokenInfoByMint.get(pos.token);
       if (info && solPriceUsd > 0) {
         const currentPrice = info.usdPrice / solPriceUsd;
         unrealizedPnlSol +=
@@ -52,7 +58,7 @@ export async function getPortfolioValuation(
     } catch (err: any) {
       log.warn(
         { wallet, token: pos.token.slice(0, 8), err: err?.message },
-        "Failed to price an open position for unrealized PnL — excluding it from this snapshot"
+        "Failed to price an open position for unrealized PnL — excluding it from this snapshot",
       );
     }
   }

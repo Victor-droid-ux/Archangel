@@ -27,11 +27,13 @@ export interface RugCheckReport {
  * reached/parsed — callers must fail their checks closed on that, not assume
  * the token is safe just because the check couldn't run.
  */
-export async function fetchRugCheckReport(tokenMint: string): Promise<RugCheckReport> {
+export async function fetchRugCheckReport(
+  tokenMint: string,
+): Promise<RugCheckReport> {
   try {
     const response = await axios.get(
       `https://api.rugcheck.xyz/v1/tokens/${tokenMint}/report`,
-      { timeout: 5000 }
+      { timeout: 5000 },
     );
     if (!response.data) {
       return {
@@ -50,13 +52,17 @@ export async function fetchRugCheckReport(tokenMint: string): Promise<RugCheckRe
     const isHoneypot = risks.some(
       (r) =>
         r.name?.toLowerCase().includes("honeypot") ||
-        r.name?.toLowerCase().includes("cannot sell")
+        r.name?.toLowerCase().includes("cannot sell"),
     );
 
-    const lpLockedPct = Number(market.lp?.lpLockedPct ?? market.lpLockedPct ?? 0);
-    const unlockedRisk = risks.some((r) =>
-      r.name?.toLowerCase().includes("lp") &&
-      (r.name?.toLowerCase().includes("unlock") || r.name?.toLowerCase().includes("not locked"))
+    const lpLockedPct = Number(
+      market.lp?.lpLockedPct ?? market.lpLockedPct ?? 0,
+    );
+    const unlockedRisk = risks.some(
+      (r) =>
+        r.name?.toLowerCase().includes("lp") &&
+        (r.name?.toLowerCase().includes("unlock") ||
+          r.name?.toLowerCase().includes("not locked")),
     );
     const lpLocked = lpLockedPct >= 80 && !unlockedRisk;
 
@@ -86,45 +92,93 @@ export interface HolderDistribution {
   available: boolean;
 }
 
+const SPL_TOKEN_PROGRAM_ID = new PublicKey(
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+);
+
 /**
  * Top-holder concentration, straight from on-chain token account data.
  * `available: false` on an RPC error — callers must fail closed, not treat a
  * failed lookup as "0% concentrated" (maximally decentralized).
+ *
+ * `creatorAddress` (Jupiter's `devAddress`, when known) is used to compute
+ * creatorHoldings directly, instead of assuming the largest holder IS the
+ * creator. On a freshly launched pool, the single largest balance is very
+ * often the AMM's own vault, not the deployer — without this, a token whose
+ * pool happens to hold >20% would fail creator_holdings checks regardless of
+ * what the actual deployer wallet holds, and a deployer who split holdings
+ * across several wallets each individually under the threshold would pass
+ * despite controlling far more supply collectively.
+ *
+ * `excludeOwners` (typically the pool/AMM address) is dropped from the
+ * ranking entirely before computing top3Combined, for the same reason — the
+ * pool's balance is liquidity, not a wallet that can independently dump.
+ * Best-effort: this only reliably excludes the pool where its pool-state
+ * address is also the authority holding its token vault (true for some but
+ * not necessarily every AMM/launchpad program) — it's not a guarantee every
+ * pool-controlled account gets caught.
  */
 export async function getHolderDistribution(
-  tokenMint: string
+  tokenMint: string,
+  options: {
+    creatorAddress?: string | null | undefined;
+    excludeOwners?: (string | null | undefined)[] | undefined;
+  } = {},
 ): Promise<HolderDistribution> {
   try {
     const connection = getConnection();
     const mintPubkey = new PublicKey(tokenMint);
 
     const tokenAccounts = await connection.getProgramAccounts(
-      new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+      SPL_TOKEN_PROGRAM_ID,
       {
         filters: [
           { dataSize: 165 },
           { memcmp: { offset: 0, bytes: mintPubkey.toBase58() } },
         ],
-      }
+      },
     );
 
-    const holdings = tokenAccounts
+    // SPL token account layout: mint (bytes 0-32), owner (32-64), amount (64-72).
+    // account.pubkey is the token account's OWN address, not the wallet that
+    // owns it — the owner has to be decoded from the account data itself.
+    const allHoldings = tokenAccounts
       .map((account) => {
-        const amount = account.account.data.readBigUInt64LE(64);
-        return { amount: Number(amount), owner: account.pubkey.toBase58() };
+        const data = account.account.data;
+        const amount = Number(data.readBigUInt64LE(64));
+        const owner = new PublicKey(data.subarray(32, 64)).toBase58();
+        return { amount, owner };
       })
-      .filter((h) => h.amount > 0)
-      .sort((a, b) => b.amount - a.amount);
+      .filter((h) => h.amount > 0);
 
-    if (holdings.length === 0) {
+    if (allHoldings.length === 0) {
       return { creatorHoldings: 0, top3Combined: 0, available: true };
     }
 
-    const totalSupply = holdings.reduce((sum, h) => sum + h.amount, 0);
+    // Total supply denominator includes everything, pool included — a pool
+    // legitimately holding most of supply isn't wrong, it's just not
+    // "concentration risk" in the sense these two metrics are meant to catch.
+    const totalSupply = allHoldings.reduce((sum, h) => sum + h.amount, 0);
+
+    const excludeSet = new Set(
+      (options.excludeOwners ?? []).filter((a): a is string => !!a),
+    );
+    const rankedHoldings = allHoldings
+      .filter((h) => !excludeSet.has(h.owner))
+      .sort((a, b) => b.amount - a.amount);
+
+    const creatorHolding = options.creatorAddress
+      ? allHoldings.find((h) => h.owner === options.creatorAddress)
+      : rankedHoldings[0]; // no known deployer wallet — fall back to largest non-pool holder
     const creatorHoldings =
-      holdings.length > 0 && holdings[0] ? (holdings[0].amount / totalSupply) * 100 : 0;
-    const top3Amount = holdings.slice(0, 3).reduce((sum, h) => sum + h.amount, 0);
-    const top3Combined = (top3Amount / totalSupply) * 100;
+      creatorHolding && totalSupply > 0
+        ? (creatorHolding.amount / totalSupply) * 100
+        : 0;
+
+    const top3Amount = rankedHoldings
+      .slice(0, 3)
+      .reduce((sum, h) => sum + h.amount, 0);
+    const top3Combined = totalSupply > 0 ? (top3Amount / totalSupply) * 100 : 0;
 
     return { creatorHoldings, top3Combined, available: true };
   } catch (err) {
@@ -139,7 +193,7 @@ export async function getHolderDistribution(
  */
 export async function checkPoolStillLive(
   tokenMint: string,
-  poolAddress?: string
+  poolAddress?: string,
 ): Promise<boolean> {
   if (!poolAddress) {
     LOG.debug({ tokenMint }, "No pool address available for LP-removal check");
@@ -150,7 +204,9 @@ export async function checkPoolStillLive(
     const info = await connection.getAccountInfo(new PublicKey(poolAddress));
     return !!info && info.lamports > 0;
   } catch (err) {
-    LOG.warn(`Failed to check pool liveness for ${tokenMint.slice(0, 8)}...: ${err}`);
+    LOG.warn(
+      `Failed to check pool liveness for ${tokenMint.slice(0, 8)}...: ${err}`,
+    );
     return false;
   }
 }
