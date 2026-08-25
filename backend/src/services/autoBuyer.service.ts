@@ -6,23 +6,20 @@ import dbService, { TradeRecord } from "./db.service.js";
 import { getLogger } from "../utils/logger.js";
 import { Connection, PublicKey, Commitment } from "@solana/web3.js";
 import { hasSufficientBalance, getBalanceInSol } from "./solana.service.js";
-import { validateTradeOpportunity } from "./tradeValidation.service.js";
-import { observeMarketBehavior } from "./marketBehavior.service.js";
-import strategyEngine from "../strategies/index.js";
-import { getTokenHistory } from "../strategies/utils.js";
+import { validateFastLaunchOpportunity } from "./tradeValidation.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
 import { canExecuteTrade } from "./riskManagement.service.js";
 import {
   executeFirstTranche,
-  executeTestSell,
-  waitForPullback,
   executeSecondTranche,
 } from "./trancheBuyer.service.js";
-import multiUserExecutionService from "./multiUserExecution.service.js";
+import multiUserExecutionService, {
+  launchAgeWithinWindow,
+} from "./multiUserExecution.service.js";
 import { WalletContext } from "./validationPipeline.service.js";
 import {
-  getEffectiveMaxTokenAgeSeconds,
   getEffectiveLaunchWindowSeconds,
+  getEffectiveConfig,
 } from "./traderConfig.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 import { withWalletLock } from "../utils/walletMutex.js";
@@ -120,45 +117,14 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
     return;
   }
 
-  // Max Token Age and Launch Window are each wallet's own setting now — see
-  // the per-wallet check in the fan-out loop below, not a shared gate here.
+  // The launch window is each wallet's own setting — see the per-wallet
+  // check in the fan-out loop below, not a shared gate here.
 
   try {
-    // --- STRATEGY ENGINE: Evaluate all strategies before validation ---
-    LOG.info({ mint }, "⚡ Evaluating trading strategies...");
-    const { priceHistory, liquidityHistory, volumeHistory } =
-      await getTokenHistory(mint);
-    const strategyContext = {
-      mint,
-      priceHistory,
-      liquidityHistory,
-      volumeHistory,
-      currentPrice: token.priceSol ?? 0,
-      currentLiquidity: token.liquiditySOL ?? token.liquidity ?? 0,
-      currentVolume: token.volume24h ?? 0,
-      // registerAutoBuyCandidate is only ever invoked for freshly discovered
-      // pools/mints (on-chain mint watcher, pool watcher, graduation watcher),
-      // which by definition have no price/liquidity history yet. justLaunched
-      // lets sniperStrategy evaluate these instead of every strategy failing
-      // closed on "not enough history".
-      tokenMeta: { ...token, justLaunched: token.justLaunched ?? true },
-    };
-    const strategyResult = await strategyEngine.getBestSignal(strategyContext);
-    if (!strategyResult || !strategyResult.shouldBuy) {
-      LOG.info(
-        { mint, reason: strategyResult?.reason },
-        "⏭️ No strategy signaled a buy"
-      );
-      return;
-    }
-    LOG.info(
-      { mint, strategy: strategyResult.reason },
-      "✅ Strategy signaled a buy, proceeding to validation..."
-    );
-
-    // --- Continue with existing validation pipeline ---
+    // Launch sniping uses fast intrinsic checks; historical strategy approval
+    // is intentionally not required because new tokens have no history yet.
     LOG.info({ mint }, "🔍 Validating token with 3 CRITICAL CONDITIONS...");
-    const validation = await validateTradeOpportunity(mint);
+    const validation = await validateFastLaunchOpportunity(mint);
     io.emit("validationResult", {
       ...validation,
       token: {
@@ -178,30 +144,12 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
           recommendation: validation.recommendation,
           reason: validation.reason,
         },
-        `⏭️ Skipping trade: ${validation.reason}`
+        `⏭️ Skipping trade: ${validation.reason}`,
       );
       return;
     }
 
-    LOG.info(
-      { mint },
-      "✅ All 3 conditions PASSED - Checking market behavior..."
-    );
-
-    // STAGE 5: 30-Second Market Behavior Observation
-    const poolAddress = validation.jupiterMetrics.poolAddress || "";
-    const behaviorMetrics = await observeMarketBehavior(mint, poolAddress);
-
-    if (!behaviorMetrics.allChecksPassed) {
-      LOG.info({ mint }, `⏭️ Skipping trade: Failed 30-second behavior check`);
-      await dbService.blacklistToken(
-        mint,
-        "Failed 30-second market behavior observation"
-      );
-      return;
-    }
-
-    LOG.info({ mint }, "✅ Market behavior check PASSED");
+    LOG.info({ mint }, "✅ Fast intrinsic checks passed; evaluating wallets");
 
     // Real token decimals — token-intrinsic, doesn't depend on which wallet
     // ends up buying, so this is fetched once and reused across the fan-out
@@ -210,7 +158,7 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
     if (decimals === null) {
       LOG.warn(
         { mint },
-        "⏭️ Skipping trade: could not verify real token decimals — refusing to guess on a value that determines cost basis"
+        "⏭️ Skipping trade: could not verify real token decimals — refusing to guess on a value that determines cost basis",
       );
       return;
     }
@@ -220,7 +168,8 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
     // enabled user's custodial hot wallet), each independently sized,
     // risk-checked, and executed with its own capital. Same pattern as
     // jupiterDiscovery.service.ts / storedTokenChecker.service.ts.
-    const eligibleWallets = await multiUserExecutionService.getEligibleWallets();
+    const eligibleWallets =
+      await multiUserExecutionService.getEligibleWallets();
     let lastTrade: TradeRecord | null = null;
     // The age captured at the top of this function, before any of the
     // pipeline's own processing time could inflate it — undefined when
@@ -233,47 +182,102 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
       // trusted from the eligibleWallets snapshot above — closes the window
       // where Stop Auto Trade disables the flag after this fan-out started
       // but before this specific wallet's turn came up.
-      if (!(await multiUserExecutionService.isAutoTradeCurrentlyEnabled(walletContext.ownerWallet))) {
+      if (
+        !(await multiUserExecutionService.isAutoTradeCurrentlyEnabled(
+          walletContext.ownerWallet,
+        ))
+      ) {
         LOG.debug(
           { mint, wallet: walletContext.ownerWallet },
-          "⏭️ Skipping wallet: auto-trade was disabled after this run started"
+          "⏭️ Skipping wallet: auto-trade was disabled after this run started",
         );
         continue;
       }
 
+      const launchMetrics = {
+        marketCapUSD: Number(token.launchMarketCapUSD ?? token.marketCapUSD),
+        marketCapSOL: Number(token.launchMarketCapSOL ?? token.marketCapSol),
+        liquidityUSD: Number(token.launchLiquidityUSD ?? token.liquidity),
+        liquiditySOL: Number(token.launchLiquiditySOL ?? token.liquiditySOL),
+      };
+      const config = await getEffectiveConfig(walletContext.ownerWallet, mint);
+      const launchMetricsAvailable = Object.values(launchMetrics).every(
+        (value) => Number.isFinite(value),
+      );
+      const launchMetricsWithinLimits =
+        launchMetricsAvailable &&
+        launchMetrics.marketCapUSD >= config.minMarketCapUsd &&
+        launchMetrics.marketCapUSD <= config.maxMarketCapUsd &&
+        launchMetrics.marketCapSOL >= config.minMarketCapSol &&
+        launchMetrics.marketCapSOL <= config.maxMarketCapSol &&
+        launchMetrics.liquidityUSD >= config.minLiquidityUsd &&
+        launchMetrics.liquidityUSD <= config.maxLiquidityUsd &&
+        launchMetrics.liquiditySOL >= config.minLiquiditySol &&
+        launchMetrics.liquiditySOL <= config.maxLiquiditySol;
+
+      if (!launchMetricsWithinLimits) {
+        LOG.info(
+          { mint, wallet: walletContext.ownerWallet, launchMetrics, config },
+          "Skipping wallet: launch market cap/liquidity is outside its configured limits",
+        );
+        emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
+          type: "launch_metrics_out_of_range",
+          mint,
+          reason:
+            "Launch market cap or liquidity is outside your configured limits",
+          message:
+            "Launch market cap or liquidity is outside your configured limits",
+          launchMetrics,
+          limits: {
+            minMarketCapUSD: config.minMarketCapUsd,
+            maxMarketCapUSD: config.maxMarketCapUsd,
+            minMarketCapSOL: config.minMarketCapSol,
+            maxMarketCapSOL: config.maxMarketCapSol,
+            minLiquidityUSD: config.minLiquidityUsd,
+            maxLiquidityUSD: config.maxLiquidityUsd,
+            minLiquiditySOL: config.minLiquiditySol,
+            maxLiquiditySOL: config.maxLiquiditySol,
+          },
+        });
+        continue;
+      }
+
       if (ageSeconds !== undefined) {
-        const [maxAgeSeconds, launchWindow] = await Promise.all([
-          getEffectiveMaxTokenAgeSeconds(walletContext.ownerWallet),
-          getEffectiveLaunchWindowSeconds(walletContext.ownerWallet),
-        ]);
+        const launchWindow = await getEffectiveLaunchWindowSeconds(
+          walletContext.ownerWallet,
+        );
 
-        if (ageSeconds > maxAgeSeconds) {
+        if (
+          !launchWindow ||
+          !launchAgeWithinWindow(token.pairCreatedAt, Date.now(), launchWindow)
+        ) {
           LOG.debug(
-            { mint, wallet: walletContext.ownerWallet, ageSeconds, maxAgeSeconds },
-            "⏭️ Skipping wallet: token older than this wallet's Max Token Age"
-          );
-          emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
-            type: "token_too_old",
-            mint,
-            reason: `Token is ${ageSeconds.toFixed(0)}s old — older than your Max Token Age (${maxAgeSeconds}s)`,
-            message: `Token is ${ageSeconds.toFixed(0)}s old — older than your Max Token Age (${maxAgeSeconds}s)`,
-          });
-          continue;
-        }
-
-        if (ageSeconds < launchWindow.min || ageSeconds > launchWindow.max) {
-          LOG.debug(
-            { mint, wallet: walletContext.ownerWallet, ageSeconds, launchWindow },
-            "⏳ Skipping wallet: token not within this wallet's launch window"
+            {
+              mint,
+              wallet: walletContext.ownerWallet,
+              ageSeconds,
+              launchWindow,
+            },
+            "⏳ Skipping wallet: token not within this wallet's launch window",
           );
           emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
             type: "launch_window",
             mint,
-            reason: `Not within your launch window (${launchWindow.min}-${launchWindow.max}s) — token is ${ageSeconds.toFixed(0)}s old`,
-            message: `Not within your launch window (${launchWindow.min}-${launchWindow.max}s)`,
+            reason: launchWindow
+              ? `Not within your launch window (${launchWindow.min}-${launchWindow.max}s) — token is ${ageSeconds.toFixed(0)}s old`
+              : "Launch window is not configured",
+            message: launchWindow
+              ? `Not within your launch window (${launchWindow.min}-${launchWindow.max}s)`
+              : "Launch window is not configured",
           });
           continue;
         }
+      } else {
+        LOG.info(
+          { mint, wallet: walletContext.ownerWallet },
+          "Skipping wallet: pool creation time is missing",
+        );
+        continue;
       }
 
       // Serialized per wallet (see walletMutex.ts) — if this wallet already
@@ -281,7 +285,7 @@ export async function registerAutoBuyCandidate(io: Server, token: any) {
       // it to finish and sizes against the balance actually left afterward,
       // rather than racing it off the same stale balance reading.
       const trade = await withWalletLock(walletContext.ownerWallet, () =>
-        executeAutoBuyForWallet(io, mint, decimals, walletContext)
+        executeAutoBuyForWallet(io, mint, decimals, walletContext, config),
       );
       if (trade) lastTrade = trade;
     }
@@ -301,7 +305,8 @@ async function executeAutoBuyForWallet(
   io: Server,
   mint: string,
   decimals: number,
-  walletContext: WalletContext
+  walletContext: WalletContext,
+  walletConfig: Awaited<ReturnType<typeof getEffectiveConfig>>,
 ): Promise<TradeRecord | null> {
   const wallet = walletContext.publicKey;
   try {
@@ -315,17 +320,26 @@ async function executeAutoBuyForWallet(
     const walletBalance = await getBalanceInSol(wallet);
     const riskPct = ENV.AUTO_TRADE_PERCENT_OF_BALANCE;
     const minTradeSol = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
-    const buySol = walletBalance * riskPct;
+    const buySol = Math.min(
+      walletBalance * riskPct,
+      walletConfig.maxTradeAmountSol,
+    );
 
     if (buySol < minTradeSol) {
       const neededBalance = minTradeSol / riskPct;
       LOG.info(
-        { mint, wallet: walletContext.ownerWallet, walletBalance, buySol, minTradeSol },
+        {
+          mint,
+          wallet: walletContext.ownerWallet,
+          walletBalance,
+          buySol,
+          minTradeSol,
+        },
         `⏭️ Skipping trade: wallet balance too low for a meaningful trade size ` +
           `(${walletBalance.toFixed(4)} SOL × ${(riskPct * 100).toFixed(
-            0
+            0,
           )}% = ${buySol.toFixed(4)} SOL, below the ${minTradeSol} SOL minimum — ` +
-          `needs ~${neededBalance.toFixed(2)} SOL total to clear it)`
+          `needs ~${neededBalance.toFixed(2)} SOL total to clear it)`,
       );
       return null;
     }
@@ -338,7 +352,7 @@ async function executeAutoBuyForWallet(
     if (!riskCheck.allowed) {
       LOG.warn(
         { mint, reason: riskCheck.reason },
-        `⏭️ Skipping trade: Risk limit exceeded`
+        `⏭️ Skipping trade: Risk limit exceeded`,
       );
       emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
         type: "risk_limit",
@@ -351,12 +365,22 @@ async function executeAutoBuyForWallet(
 
     LOG.info(
       { mint, buySol, openPositions: riskCheck.currentRisk.openPositions },
-      "✅ Risk check PASSED - Proceeding with buy execution"
+      "✅ Risk check PASSED - Proceeding with buy execution",
     );
 
     const quote = await getJupiterQuote(SOL_MINT, mint, lamports, 500);
     if (!quote?.outAmount) {
       LOG.info({ mint }, "Not tradable / no Jupiter quote");
+      return null;
+    }
+    const sellQuote = await getJupiterQuote(
+      mint,
+      SOL_MINT,
+      quote.outAmount,
+      1000,
+    );
+    if (!sellQuote?.outAmount) {
+      LOG.info({ mint }, "Skipping launch buy: no executable sell route");
       return null;
     }
 
@@ -378,7 +402,7 @@ async function executeAutoBuyForWallet(
             requiredSol: buySol,
             mint,
           },
-          "Insufficient balance for auto-buy"
+          "Insufficient balance for auto-buy",
         );
         emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
           type: "insufficient_balance",
@@ -401,13 +425,13 @@ async function executeAutoBuyForWallet(
       wallet,
       useReal,
       decimals,
-      walletContext.keypair
+      walletContext.keypair,
     );
 
     if (!tranche1Result.success) {
       LOG.error(
         { mint, error: tranche1Result.error },
-        "First tranche failed - aborting buy"
+        "First tranche failed - aborting buy",
       );
       emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
         type: "tranche1_failed",
@@ -428,76 +452,8 @@ async function executeAutoBuyForWallet(
         price: firstPrice,
         signature: tranche1Result.signature,
       },
-      "✅ First tranche (60%) executed"
+      "✅ First tranche (60%) executed",
     );
-
-    // TEST SELL: Verify liquidity with 0.5% sell
-    LOG.info({ mint }, "🧪 Executing 0.5% test sell to verify liquidity...");
-
-    // decimals already declared earlier
-    const testSellResult = await executeTestSell(
-      mint,
-      firstTokenQty,
-      decimals,
-      wallet,
-      useReal,
-      walletContext.keypair
-    );
-
-    if (!testSellResult.success) {
-      LOG.error(
-        { mint, error: testSellResult.error },
-        "❌ TEST SELL FAILED - EMERGENCY EXIT!"
-      );
-
-      // Emergency exit: sell ALL tokens from first tranche
-      if (useReal && firstTokenQty > 0) {
-        const emergencyBase = Math.floor(firstTokenQty * 10 ** decimals);
-        LOG.warn(
-          { mint, tokenQty: firstTokenQty },
-          "⚠️ Emergency selling all tokens from first tranche"
-        );
-
-        try {
-          const emergencySwap = await executeJupiterSwap({
-            inputMint: mint,
-            outputMint: SOL_MINT,
-            amount: emergencyBase,
-            userPublicKey: wallet,
-            slippageBps: 500, // Higher slippage for emergency
-            signer: walletContext.keypair,
-          });
-
-          if (emergencySwap.success) {
-            LOG.info(
-              { mint, signature: emergencySwap.signature },
-              "Emergency exit completed"
-            );
-            emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeError", {
-              type: "test_sell_failed_emergency_exit",
-              mint,
-              reason: testSellResult.error,
-              message: `Test sell failed (${testSellResult.error}) — emergency-exited your first tranche`,
-              emergencyExitSignature: emergencySwap.signature,
-            });
-          } else {
-            LOG.error(
-              { mint, error: emergencySwap.error },
-              "Emergency exit failed!"
-            );
-          }
-        } catch (emergencyErr: any) {
-          LOG.error(
-            { mint, err: emergencyErr.message || emergencyErr },
-            "Emergency exit exception"
-          );
-        }
-      }
-
-      return null; // Abort - do not proceed to second tranche
-    }
-
-    LOG.info({ mint }, "✅ Test sell passed - liquidity verified");
 
     // Record first tranche trade under the OWNER's wallet — the address a
     // dashboard viewer actually recognizes and queries by, not the
@@ -519,10 +475,12 @@ async function executeAutoBuyForWallet(
       custody: "custodial" as const,
     };
 
-    await dbService.addTrade(trade1);
+    const savedTrade1 = await dbService.addTrade(trade1);
     await dbService.updatePositionMetadata(mint, walletContext.ownerWallet, {
       firstTrancheEntry: Date.now(),
       remainingPct: 100, // Full position after first buy
+      tpPct: walletConfig.takeProfitPct,
+      slPct: walletConfig.stopLossPct,
     });
 
     emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeFeed", {
@@ -533,12 +491,7 @@ async function executeAutoBuyForWallet(
       tranche: "1 of 2 (60%)",
     });
 
-    LOG.info({ mint }, "💤 Waiting for pullback before second tranche...");
-
-    // Wait for pullback (2% dip or 5-minute timeout)
-    const pullbackResult = await waitForPullback(mint, firstPrice, 300000);
-
-    // TRANCHE 2: Buy remaining 40%
+    // TRANCHE 2: Buy remaining 40% immediately for launch-sniper entry
     LOG.info({ mint }, "📊 Executing second tranche (40%)");
 
     const tranche2Result = await executeSecondTranche(
@@ -547,13 +500,13 @@ async function executeAutoBuyForWallet(
       wallet,
       useReal,
       decimals,
-      walletContext.keypair
+      walletContext.keypair,
     );
 
     if (!tranche2Result.success) {
       LOG.warn(
         { mint, error: tranche2Result.error },
-        "Second tranche failed - continuing with first tranche only"
+        "Second tranche failed - continuing with first tranche only",
       );
       // Not a critical failure - we still have 60% position. Unlike
       // jupiterDiscovery.service.ts / storedTokenChecker.service.ts, this
@@ -566,7 +519,15 @@ async function executeAutoBuyForWallet(
         wallet: walletContext.ownerWallet,
         entryTime: Date.now(),
       });
-      return null;
+      emitToWalletOrGlobal(io, walletContext.ownerWallet, "tradeFeed", {
+        ...trade1,
+        auto: true,
+        reason: "partial_buy",
+        tranche: "1 of 2 (60%)",
+        secondTrancheFailed: true,
+        secondTrancheError: tranche2Result.error,
+      });
+      return savedTrade1;
     }
 
     const secondTokenQty = tranche2Result.tokenQty || 0;
@@ -579,7 +540,7 @@ async function executeAutoBuyForWallet(
         price: secondPrice,
         signature: tranche2Result.signature,
       },
-      "✅ Second tranche (40%) executed"
+      "✅ Second tranche (40%) executed",
     );
 
     // Record second tranche trade — under the OWNER's wallet, same reason
@@ -626,7 +587,7 @@ async function executeAutoBuyForWallet(
         tranche1Price: firstPrice,
         tranche2Price: secondPrice,
       },
-      "🎯 2-tranche buy completed successfully"
+      "🎯 2-tranche buy completed successfully",
     );
 
     pnlTrackerService.startTracking({

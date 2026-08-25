@@ -164,6 +164,8 @@ export type TokenState = {
   source: "jupiter" | "other";
 
   marketCapUSD?: number;
+  launchMarketCapUSD?: number;
+  launchMarketCapSOL?: number;
   buyVolume?: number;
   sellVolume?: number;
 
@@ -171,6 +173,10 @@ export type TokenState = {
   jupiterTradable?: boolean;
   liquidityUSD?: number;
   liquiditySOL?: number;
+  launchLiquidityUSD?: number;
+  launchLiquiditySOL?: number;
+  poolCreatedAt?: Date;
+  launchSnapshotAt?: Date;
   poolAddress?: string;
   creatorAddress?: string; // token dev/creator wallet, used by emergencyExit's creator-sell trigger
 
@@ -245,6 +251,8 @@ export type PositionMetadata = {
   remainingPct?: number;
   firstTrancheEntry?: number;
   secondTrancheEntry?: number;
+  tpPct?: number;
+  slPct?: number;
   // Consecutive sell-attempt failures for this position (any exit path —
   // emergency, tiered, or final TP/SL) and when the most recent attempt
   // happened. Lets monitor.service.ts back off and stop re-notifying every
@@ -256,6 +264,16 @@ export type PositionMetadata = {
   updatedAt: Date;
 };
 
+export type DiscoveryClaim = {
+  mint: string;
+  ownerId: string;
+  status: "claimed" | "completed";
+  claimedAt: Date;
+  leaseUntil: Date;
+  completedAt?: Date;
+};
+
+let discoveryClaimsCol: Collection<DiscoveryClaim> | null = null;
 let client: MongoClient | null = null;
 let db: Db | null = null;
 let tradesCol: Collection<TradeRecord> | null = null;
@@ -277,6 +295,7 @@ export async function connect() {
   positionMetadataCol = db.collection<PositionMetadata>("positionMetadata");
   tokenStateCol = db.collection<TokenState>("tokenStates");
   userSettingsCol = db.collection<UserSettings>("userSettings");
+  discoveryClaimsCol = db.collection<DiscoveryClaim>("discoveryClaims");
   // New collection for old token analytics (optional, or store in tokenStates)
   // const oldTokenStateCol = db.collection<OldTokenState>("oldTokenStates");
   await tradesCol.createIndex({ timestamp: -1 });
@@ -303,12 +322,17 @@ export async function connect() {
   }
   await positionMetadataCol.createIndex(
     { token: 1, wallet: 1 },
-    { unique: true }
+    { unique: true },
   );
   await tokenStateCol.createIndex({ mint: 1 }, { unique: true });
   await tokenStateCol.createIndex({ state: 1 });
   await tokenStateCol.createIndex({ updatedAt: -1 });
   await userSettingsCol.createIndex({ wallet: 1 }, { unique: true });
+  await discoveryClaimsCol.createIndex({ mint: 1 }, { unique: true });
+  await discoveryClaimsCol.createIndex(
+    { completedAt: 1 },
+    { expireAfterSeconds: 24 * 60 * 60 },
+  );
   // ensure stats doc exists
   const existing = await statsCol.findOne({});
   if (!existing) {
@@ -330,7 +354,7 @@ export async function addTrade(
   tr: Omit<
     Partial<TradeRecord>,
     "amountSol" | "amountLamports" | "timestamp"
-  > & { amount: number; timestamp?: Date | string }
+  > & { amount: number; timestamp?: Date | string },
 ) {
   if (!db) await connect();
   const timestamp = tr.timestamp ? new Date(tr.timestamp as any) : new Date();
@@ -384,7 +408,7 @@ export async function addTrade(
         },
         $set: { lastUpdated: new Date() },
       },
-      { returnDocument: "after" }
+      { returnDocument: "after" },
     );
 
     // recompute winRate & percent (real trades only, same reasoning as above)
@@ -408,11 +432,96 @@ export async function addTrade(
           totalProfitPercent,
           portfolioValue: (statsDoc.portfolioValue || 0) + pnlSol,
         },
-      }
+      },
     );
   }
 
   return record;
+}
+
+export async function claimDiscoveryMint(
+  mint: string,
+  ownerId: string,
+  leaseMs = 2 * 60 * 1000,
+): Promise<boolean> {
+  if (!db) await connect();
+  const now = new Date();
+  const reclaimBefore = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const leaseUntil = new Date(now.getTime() + leaseMs);
+
+  const claimed = await discoveryClaimsCol!.findOneAndUpdate(
+    {
+      mint,
+      $or: [
+        { status: "claimed", leaseUntil: { $lte: now } },
+        { status: "completed", completedAt: { $lte: reclaimBefore } },
+      ],
+    },
+    {
+      $set: { ownerId, status: "claimed", claimedAt: now, leaseUntil },
+      $unset: { completedAt: "" },
+    },
+    { returnDocument: "after" },
+  );
+  if (claimed?.ownerId === ownerId) return true;
+
+  try {
+    const inserted = await discoveryClaimsCol!.insertOne({
+      mint,
+      ownerId,
+      status: "claimed",
+      claimedAt: now,
+      leaseUntil,
+    });
+    return inserted.acknowledged;
+  } catch (err: any) {
+    if (err?.code === 11000) return false;
+    throw err;
+  }
+}
+
+export async function completeDiscoveryMint(
+  mint: string,
+  ownerId: string,
+): Promise<boolean> {
+  if (!db) await connect();
+  const result = await discoveryClaimsCol!.updateOne(
+    { mint, ownerId, status: "claimed" },
+    {
+      $set: {
+        status: "completed",
+        completedAt: new Date(),
+        leaseUntil: new Date(),
+      },
+    },
+  );
+  return result.modifiedCount === 1;
+}
+
+export async function renewDiscoveryMint(
+  mint: string,
+  ownerId: string,
+  leaseMs = 2 * 60 * 1000,
+): Promise<boolean> {
+  if (!db) await connect();
+  const result = await discoveryClaimsCol!.updateOne(
+    { mint, ownerId, status: "claimed" },
+    { $set: { leaseUntil: new Date(Date.now() + leaseMs) } },
+  );
+  return result.modifiedCount === 1;
+}
+
+export async function releaseDiscoveryMint(
+  mint: string,
+  ownerId: string,
+): Promise<boolean> {
+  if (!db) await connect();
+  const result = await discoveryClaimsCol!.deleteOne({
+    mint,
+    ownerId,
+    status: "claimed",
+  });
+  return result.deletedCount === 1;
 }
 
 /**
@@ -443,7 +552,7 @@ export async function getTotalTradesCount(wallet: string): Promise<number> {
 export async function getTrades(
   limit = 50,
   includeSimulated = false,
-  viewerWallet?: string
+  viewerWallet?: string,
 ) {
   if (!db) await connect();
   const filter = {
@@ -456,7 +565,7 @@ export async function getTrades(
 // Same floor used by monitor.service.ts to decide a position is economically
 // closed despite floating-point residue leaving netSol at a tiny nonzero value.
 const POSITION_DUST_THRESHOLD_SOL = Number(
-  process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
+  process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005,
 );
 
 const EMPTY_STATS = {
@@ -492,7 +601,7 @@ export async function getStats(viewerWallet?: string) {
     getPortfolioPnL(viewerWallet),
   ]);
   const openTrades = positions.filter(
-    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL
+    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL,
   ).length;
   return {
     portfolioValue: pnl.openPositionsValue,
@@ -531,10 +640,34 @@ export type Position = {
   remainingPct?: number; // Track remaining position percentage (starts at 100)
   firstTrancheEntry?: number; // Timestamp of first 60% buy
   secondTrancheEntry?: number; // Timestamp of second 40% buy
+  tpPct?: number;
+  slPct?: number;
   firstBuyAt?: Date; // Earliest buy fill for this token — used for the SL grace period
   sellFailureCount?: number; // Consecutive failed sell attempts — see PositionMetadata
   lastSellAttemptAt?: Date;
 };
+
+export async function recoverPositionCostBasis(
+  token: string,
+  wallet: string,
+): Promise<number | null> {
+  if (!db) await connect();
+  const buys = await tradesCol!
+    .find({ token, wallet, type: "buy", simulated: { $ne: true } })
+    .toArray();
+  let spentSol = 0;
+  let tokenQuantity = 0;
+  for (const buy of buys) {
+    const amountSol = Number(buy.amountLamports) / 1e9;
+    if (!Number.isFinite(amountSol) || amountSol <= 0) continue;
+    const price = Number(buy.price);
+    if (!Number.isFinite(price) || price <= 0) continue;
+    spentSol += amountSol;
+    tokenQuantity += amountSol / price;
+  }
+  if (spentSol <= 0 || tokenQuantity <= 0) return null;
+  return spentSol / tokenQuantity;
+}
 
 export async function getPositions(viewerWallet?: string): Promise<Position[]> {
   if (!db) await connect();
@@ -545,7 +678,12 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
       // viewerWalletFilter() is {} (no restriction) unless a specific
       // viewer's wallet was passed in — internal risk/monitoring callers
       // never pass one, so their view of "all real positions" is unchanged.
-      { $match: { simulated: { $ne: true }, ...viewerWalletFilter(viewerWallet) } },
+      {
+        $match: {
+          simulated: { $ne: true },
+          ...viewerWalletFilter(viewerWallet),
+        },
+      },
       {
         $group: {
           // Compound identity: two different wallets holding the same token
@@ -575,10 +713,7 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
             $sum: {
               $cond: [
                 {
-                  $and: [
-                    { $eq: ["$type", "buy"] },
-                    { $gt: ["$price", 0] },
-                  ],
+                  $and: [{ $eq: ["$type", "buy"] }, { $gt: ["$price", 0] }],
                 },
                 { $divide: ["$amountLamports", "$price"] },
                 0,
@@ -644,6 +779,8 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
       if (metadata.lastSellAttemptAt !== undefined) {
         pos.lastSellAttemptAt = metadata.lastSellAttemptAt;
       }
+      if (metadata.tpPct !== undefined) pos.tpPct = metadata.tpPct;
+      if (metadata.slPct !== undefined) pos.slPct = metadata.slPct;
     }
   }
 
@@ -653,7 +790,7 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
 export async function updatePositionMetadata(
   token: string,
   wallet: string,
-  updates: Partial<Omit<PositionMetadata, "token" | "wallet" | "updatedAt">>
+  updates: Partial<Omit<PositionMetadata, "token" | "wallet" | "updatedAt">>,
 ): Promise<void> {
   if (!db) await connect();
   await positionMetadataCol!.updateOne(
@@ -665,7 +802,7 @@ export async function updatePositionMetadata(
       },
       $setOnInsert: { token, wallet },
     },
-    { upsert: true }
+    { upsert: true },
   );
 }
 
@@ -674,7 +811,7 @@ export async function updateStats(updates: Partial<StatsDoc>) {
   const out = await statsCol!.findOneAndUpdate(
     {},
     { $set: { ...updates, lastUpdated: new Date() } },
-    { returnDocument: "after" }
+    { returnDocument: "after" },
   );
   // openTrades is never trustworthy from the stored document alone — it's a
   // point-in-time snapshot from whenever it was last $set (often never, since
@@ -685,7 +822,7 @@ export async function updateStats(updates: Partial<StatsDoc>) {
   // merge won't catch since 0 is not null/undefined.
   const positions = await getPositions();
   const openTrades = positions.filter(
-    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL
+    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL,
   ).length;
   return { ...out!, openTrades };
 }
@@ -694,7 +831,7 @@ export async function updateStats(updates: Partial<StatsDoc>) {
    WATCHLIST FUNCTIONS
 ---------------------------------------- */
 export async function addToWatchlist(
-  token: Omit<WatchlistToken, "_id" | "addedAt">
+  token: Omit<WatchlistToken, "_id" | "addedAt">,
 ) {
   if (!db) await connect();
 
@@ -737,7 +874,7 @@ export async function removeFromWatchlist(mint: string, userId?: string) {
 export async function updateWatchlistAlert(
   mint: string,
   priceAlert: WatchlistToken["priceAlert"],
-  userId?: string
+  userId?: string,
 ) {
   if (!db) await connect();
   const filter: any = { mint };
@@ -759,7 +896,7 @@ export async function updateWatchlistAlert(
  * Calculate comprehensive portfolio P&L
  */
 export async function getPortfolioPnL(
-  viewerWallet?: string
+  viewerWallet?: string,
 ): Promise<PortfolioPnL> {
   if (!db) await connect();
 
@@ -926,7 +1063,7 @@ export async function getTokenPnL(viewerWallet?: string): Promise<TokenPnL[]> {
  */
 export async function getPnLHistory(
   days: number = 30,
-  viewerWallet?: string
+  viewerWallet?: string,
 ): Promise<
   Array<{
     date: string;
@@ -991,12 +1128,21 @@ export async function getPnLHistory(
  * Token State Management (for new trade rules)
  */
 export async function upsertTokenState(
-  tokenState: Omit<TokenState, "_id" | "updatedAt">
+  tokenState: Omit<TokenState, "_id" | "updatedAt">,
 ): Promise<void> {
   if (!db) await connect();
 
   // Separate detectedAt from other fields to avoid MongoDB conflict
-  const { detectedAt, ...updateFields } = tokenState;
+  const {
+    detectedAt,
+    launchMarketCapUSD,
+    launchMarketCapSOL,
+    launchLiquidityUSD,
+    launchLiquiditySOL,
+    poolCreatedAt,
+    launchSnapshotAt,
+    ...updateFields
+  } = tokenState;
 
   await tokenStateCol!.updateOne(
     { mint: tokenState.mint },
@@ -1007,9 +1153,15 @@ export async function upsertTokenState(
       },
       $setOnInsert: {
         detectedAt: detectedAt || new Date(),
+        ...(launchMarketCapUSD !== undefined && { launchMarketCapUSD }),
+        ...(launchMarketCapSOL !== undefined && { launchMarketCapSOL }),
+        ...(launchLiquidityUSD !== undefined && { launchLiquidityUSD }),
+        ...(launchLiquiditySOL !== undefined && { launchLiquiditySOL }),
+        ...(poolCreatedAt !== undefined && { poolCreatedAt }),
+        ...(launchSnapshotAt !== undefined && { launchSnapshotAt }),
       },
     },
-    { upsert: true }
+    { upsert: true },
   );
 }
 
@@ -1019,7 +1171,7 @@ export async function getTokenState(mint: string): Promise<TokenState | null> {
 }
 
 export async function getTokensByState(
-  state: TokenLifecycleState
+  state: TokenLifecycleState,
 ): Promise<TokenState[]> {
   if (!db) await connect();
   return await tokenStateCol!.find({ state }).sort({ updatedAt: -1 }).toArray();
@@ -1031,7 +1183,7 @@ export async function getTokensByStates(
     limit?: number;
     minCreatedAt?: Date;
     hasPool?: boolean;
-  }
+  },
 ): Promise<TokenState[]> {
   if (!db) await connect();
 
@@ -1056,7 +1208,7 @@ export async function getTokensByStates(
 
 export async function updateTokenState(
   mint: string,
-  updates: Partial<Omit<TokenState, "_id" | "mint">>
+  updates: Partial<Omit<TokenState, "_id" | "mint">>,
 ): Promise<void> {
   if (!db) await connect();
   await tokenStateCol!.updateOne(
@@ -1066,13 +1218,13 @@ export async function updateTokenState(
         ...updates,
         updatedAt: new Date(),
       },
-    }
+    },
   );
 }
 
 export async function blacklistToken(
   mint: string,
-  reason: string
+  reason: string,
 ): Promise<void> {
   if (!db) await connect();
   await tokenStateCol!.updateOne(
@@ -1084,12 +1236,12 @@ export async function blacklistToken(
         blacklistReason: reason,
         updatedAt: new Date(),
       },
-    }
+    },
   );
 }
 
 export async function getUserSettings(
-  wallet: string
+  wallet: string,
 ): Promise<UserSettings | null> {
   if (!db) await connect();
   return userSettingsCol!.findOne({ wallet });
@@ -1097,7 +1249,7 @@ export async function getUserSettings(
 
 export async function saveUserSettings(
   wallet: string,
-  settings: Omit<UserSettings, "wallet" | "updatedAt">
+  settings: Omit<UserSettings, "wallet" | "updatedAt">,
 ): Promise<UserSettings> {
   if (!db) await connect();
   const result = await userSettingsCol!.findOneAndUpdate(
@@ -1106,7 +1258,7 @@ export async function saveUserSettings(
       $set: { ...settings, updatedAt: new Date() },
       $setOnInsert: { wallet },
     },
-    { upsert: true, returnDocument: "after" }
+    { upsert: true, returnDocument: "after" },
   );
   return result!;
 }
@@ -1126,6 +1278,7 @@ export default {
   getTotalTradesCount,
   getStats,
   getPositions,
+  recoverPositionCostBasis,
   updateStats,
   updatePositionMetadata,
   addToWatchlist,
@@ -1137,6 +1290,10 @@ export default {
   getPnLHistory,
   upsertTokenState,
   getTokenState,
+  claimDiscoveryMint,
+  completeDiscoveryMint,
+  renewDiscoveryMint,
+  releaseDiscoveryMint,
   getTokensByState,
   getTokensByStates,
   updateTokenState,

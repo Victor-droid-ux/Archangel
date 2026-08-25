@@ -15,6 +15,7 @@ import { PublicKey, Keypair } from "@solana/web3.js";
 import dbService from "./db.service.js";
 import { canExecuteTrade } from "./riskManagement.service.js";
 import { ENV } from "../utils/env.js";
+import { getEffectiveConfig } from "./traderConfig.service.js";
 
 /**
  * Identifies which wallet a pipeline run buys/sells for — the custodial
@@ -83,18 +84,22 @@ class ValidationPipelineService {
   // this used to default to 0.5 here vs 0.05 there, a 10x gap for what should be
   // one agreed-upon "is this pool real" threshold across every caller.
   private readonly MIN_LP_SOL = parseFloat(
-    process.env.MIN_JUPITER_LIQUIDITY_SOL || "0.05"
+    process.env.MIN_JUPITER_LIQUIDITY_SOL || "0.05",
   );
   // Was a bare literal with no override, unlike every sibling threshold in
   // this class. Default kept the same (49%) to avoid silently changing
   // trading behavior — this just makes it tunable.
-  private readonly MAX_SLIPPAGE = Number(process.env.MAX_PIPELINE_SLIPPAGE_PCT ?? 49);
+  private readonly MAX_SLIPPAGE = Number(
+    process.env.MAX_PIPELINE_SLIPPAGE_PCT ?? 49,
+  );
   // Floor below which a trade is too small to be worth executing, not a hard
   // trade-size constant — the actual buy amount is computed per-run in
   // runPipeline() as a percentage of live wallet balance (see there for why).
-  private readonly MIN_TRADE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
+  private readonly MIN_TRADE_SOL = Number(
+    process.env.MIN_AUTO_TRADE_SOL ?? 0.003,
+  );
   private readonly AUTO_BUY_SLIPPAGE = parseFloat(
-    process.env.AUTO_BUY_SLIPPAGE_PCT || "10"
+    process.env.AUTO_BUY_SLIPPAGE_PCT || "10",
   );
   // Jupiter's quote/swap APIs take slippage in basis points, not percent
   private get AUTO_BUY_SLIPPAGE_BPS(): number {
@@ -107,11 +112,11 @@ class ValidationPipelineService {
   async runPipeline(
     tokenMint: string,
     lpSol: number,
-    walletContext: WalletContext = defaultWalletContext()
+    walletContext: WalletContext = defaultWalletContext(),
   ): Promise<PipelineResult> {
     LOG.info(
       { wallet: walletContext.ownerWallet },
-      `🚀 Starting 8-stage validation pipeline for ${tokenMint.slice(0, 8)}...`
+      `🚀 Starting 8-stage validation pipeline for ${tokenMint.slice(0, 8)}...`,
     );
 
     const results: ValidationResult[] = [];
@@ -128,7 +133,11 @@ class ValidationPipelineService {
     // real buy this pipeline executes.
     const walletBalance = await getBalanceInSol(wallet);
     const riskPct = ENV.AUTO_TRADE_PERCENT_OF_BALANCE;
-    const buySol = walletBalance * riskPct;
+    const config = await getEffectiveConfig(
+      walletContext.ownerWallet,
+      tokenMint,
+    );
+    const buySol = Math.min(walletBalance * riskPct, config.maxTradeAmountSol);
 
     if (buySol < this.MIN_TRADE_SOL) {
       const neededBalance = this.MIN_TRADE_SOL / riskPct;
@@ -163,9 +172,14 @@ class ValidationPipelineService {
         tokenMint,
         0,
         "Risk Management",
-        stage0.reason || "Unknown"
+        stage0.reason || "Unknown",
       );
-      return this.buildFailureResult(0, "Risk Management", stage0.reason, results);
+      return this.buildFailureResult(
+        0,
+        "Risk Management",
+        stage0.reason,
+        results,
+      );
     }
 
     // Stage 1: JUPITER DISCOVERY
@@ -176,13 +190,13 @@ class ValidationPipelineService {
         tokenMint,
         1,
         "Jupiter Discovery",
-        stage1.reason || "Unknown"
+        stage1.reason || "Unknown",
       );
       return this.buildFailureResult(
         1,
         "Jupiter Discovery",
         stage1.reason,
-        results
+        results,
       );
     }
 
@@ -194,13 +208,13 @@ class ValidationPipelineService {
         tokenMint,
         2,
         "Jupiter Routing Test",
-        stage2.reason || "Unknown"
+        stage2.reason || "Unknown",
       );
       return this.buildFailureResult(
         2,
         "Jupiter Routing Test",
         stage2.reason,
-        results
+        results,
       );
     }
 
@@ -212,13 +226,13 @@ class ValidationPipelineService {
         tokenMint,
         3,
         "Authority Check",
-        stage3.reason || "Unknown"
+        stage3.reason || "Unknown",
       );
       return this.buildFailureResult(
         3,
         "Authority Check",
         stage3.reason,
-        results
+        results,
       );
     }
 
@@ -230,13 +244,13 @@ class ValidationPipelineService {
         tokenMint,
         4,
         "Birdeye Market Health",
-        stage4.reason || "Unknown"
+        stage4.reason || "Unknown",
       );
       return this.buildFailureResult(
         4,
         "Birdeye Market Health",
         stage4.reason,
-        results
+        results,
       );
     }
 
@@ -244,7 +258,7 @@ class ValidationPipelineService {
     const stage5 = await this.stage5_jupiterPreExecution(
       tokenMint,
       buySol,
-      wallet
+      wallet,
     );
     results.push(stage5);
     if (!stage5.passed) {
@@ -252,31 +266,35 @@ class ValidationPipelineService {
         tokenMint,
         5,
         "Jupiter Pre-Execution",
-        stage5.reason || "Unknown"
+        stage5.reason || "Unknown",
       );
       return this.buildFailureResult(
         5,
         "Jupiter Pre-Execution",
         stage5.reason,
-        results
+        results,
       );
     }
 
     // Stage 6: JUPITER EXECUTION (BUY)
-    const stage6 = await this.stage6_jupiterBuy(tokenMint, buySol, walletContext);
+    const stage6 = await this.stage6_jupiterBuy(
+      tokenMint,
+      buySol,
+      walletContext,
+    );
     results.push(stage6);
     if (!stage6.passed) {
       await this.logFailure(
         tokenMint,
         6,
         "Jupiter Buy Execution",
-        stage6.reason || "Unknown"
+        stage6.reason || "Unknown",
       );
       return this.buildFailureResult(
         6,
         "Jupiter Buy Execution",
         stage6.reason,
-        results
+        results,
       );
     }
 
@@ -295,7 +313,7 @@ class ValidationPipelineService {
    */
   private async stage1_jupiterDiscovery(
     tokenMint: string,
-    lpSol: number
+    lpSol: number,
   ): Promise<ValidationResult> {
     LOG.info(`[Stage 1] 🔍 Jupiter Discovery for ${tokenMint.slice(0, 8)}...`);
 
@@ -346,10 +364,10 @@ class ValidationPipelineService {
    * Make sure Jupiter can actually perform swaps
    */
   private async stage2_jupiterRoutingTest(
-    tokenMint: string
+    tokenMint: string,
   ): Promise<ValidationResult> {
     LOG.info(
-      `[Stage 2] 🔍 Jupiter Routing Test for ${tokenMint.slice(0, 8)}...`
+      `[Stage 2] 🔍 Jupiter Routing Test for ${tokenMint.slice(0, 8)}...`,
     );
 
     try {
@@ -360,7 +378,7 @@ class ValidationPipelineService {
         SOL_MINT,
         tokenMint,
         testAmount,
-        this.AUTO_BUY_SLIPPAGE_BPS
+        this.AUTO_BUY_SLIPPAGE_BPS,
       );
 
       if (!buyQuote || !buyQuote.outAmount) {
@@ -377,7 +395,7 @@ class ValidationPipelineService {
         tokenMint,
         SOL_MINT,
         Number(buyQuote.outAmount),
-        this.AUTO_BUY_SLIPPAGE_BPS
+        this.AUTO_BUY_SLIPPAGE_BPS,
       );
 
       if (!sellQuote || !sellQuote.outAmount) {
@@ -407,7 +425,7 @@ class ValidationPipelineService {
       }
 
       LOG.info(
-        `[Stage 2] ✅ Jupiter Routing Test PASSED (bidirectional trading works)`
+        `[Stage 2] ✅ Jupiter Routing Test PASSED (bidirectional trading works)`,
       );
       return {
         passed: true,
@@ -435,11 +453,9 @@ class ValidationPipelineService {
    * routing test (a real honeypot can't produce a sell quote at all).
    */
   private async stage3_authorityCheck(
-    tokenMint: string
+    tokenMint: string,
   ): Promise<ValidationResult> {
-    LOG.info(
-      `[Stage 3] 🔍 Authority Check for ${tokenMint.slice(0, 8)}...`
-    );
+    LOG.info(`[Stage 3] 🔍 Authority Check for ${tokenMint.slice(0, 8)}...`);
 
     try {
       const info = await getJupiterTokenInfo(tokenMint);
@@ -495,16 +511,16 @@ class ValidationPipelineService {
    */
   private async stage4_birdeyeMarketHealth(
     tokenMint: string,
-    buySol: number
+    buySol: number,
   ): Promise<ValidationResult> {
     LOG.info(
-      `[Stage 4] 🔍 Birdeye Market Health for ${tokenMint.slice(0, 8)}...`
+      `[Stage 4] 🔍 Birdeye Market Health for ${tokenMint.slice(0, 8)}...`,
     );
 
     try {
       const healthResult = await birdeyeService.checkMarketHealth(
         tokenMint,
-        buySol
+        buySol,
       );
 
       if (!healthResult.isHealthy) {
@@ -543,10 +559,10 @@ class ValidationPipelineService {
   private async stage5_jupiterPreExecution(
     tokenMint: string,
     buySol: number,
-    wallet: string
+    wallet: string,
   ): Promise<ValidationResult> {
     LOG.info(
-      `[Stage 5] 🔍 Jupiter Pre-Execution Check for ${tokenMint.slice(0, 8)}...`
+      `[Stage 5] 🔍 Jupiter Pre-Execution Check for ${tokenMint.slice(0, 8)}...`,
     );
 
     try {
@@ -556,7 +572,7 @@ class ValidationPipelineService {
         SOL_MINT,
         tokenMint,
         lamports,
-        this.AUTO_BUY_SLIPPAGE_BPS
+        this.AUTO_BUY_SLIPPAGE_BPS,
       );
 
       if (!quote || !quote.outAmount) {
@@ -614,11 +630,11 @@ class ValidationPipelineService {
   private async stage6_jupiterBuy(
     tokenMint: string,
     buySol: number,
-    walletContext: WalletContext
+    walletContext: WalletContext,
   ): Promise<ValidationResult> {
     const wallet = walletContext.publicKey;
     LOG.info(
-      `[Stage 6] 🚀 Jupiter Buy Execution for ${tokenMint.slice(0, 8)}...`
+      `[Stage 6] 🚀 Jupiter Buy Execution for ${tokenMint.slice(0, 8)}...`,
     );
 
     try {
@@ -628,7 +644,7 @@ class ValidationPipelineService {
         SOL_MINT,
         tokenMint,
         lamports,
-        this.AUTO_BUY_SLIPPAGE_BPS
+        this.AUTO_BUY_SLIPPAGE_BPS,
       );
 
       if (!quote || !quote.outAmount) {
@@ -677,11 +693,16 @@ class ValidationPipelineService {
       // silently trusting a last-resort guess if both fail.
       let decimals: number | null = null;
       const jupInfo = await getJupiterTokenInfo(tokenMint);
-      if (typeof jupInfo?.decimals === "number" && Number.isFinite(jupInfo.decimals)) {
+      if (
+        typeof jupInfo?.decimals === "number" &&
+        Number.isFinite(jupInfo.decimals)
+      ) {
         decimals = jupInfo.decimals;
       } else {
         try {
-          const info = await getConnection().getParsedAccountInfo(new PublicKey(tokenMint));
+          const info = await getConnection().getParsedAccountInfo(
+            new PublicKey(tokenMint),
+          );
           const d = (info.value?.data as any)?.parsed?.info?.decimals;
           if (typeof d === "number" && Number.isFinite(d)) decimals = d;
         } catch {
@@ -691,7 +712,7 @@ class ValidationPipelineService {
       if (decimals === null) {
         LOG.error(
           { tokenMint },
-          "Could not determine real token decimals — recording cost basis with an assumed value of 9, verify this trade manually"
+          "Could not determine real token decimals — recording cost basis with an assumed value of 9, verify this trade manually",
         );
         decimals = 9;
       }
@@ -726,7 +747,7 @@ class ValidationPipelineService {
       });
 
       LOG.info(
-        `[Stage 6] ✅ Jupiter Buy Execution PASSED (${swapResult.signature})`
+        `[Stage 6] ✅ Jupiter Buy Execution PASSED (${swapResult.signature})`,
       );
       return {
         passed: true,
@@ -750,7 +771,7 @@ class ValidationPipelineService {
     stage: number,
     stageName: string,
     reason: string | undefined,
-    results: ValidationResult[]
+    results: ValidationResult[],
   ): PipelineResult {
     return {
       success: false,
@@ -765,15 +786,15 @@ class ValidationPipelineService {
     tokenMint: string,
     stage: number,
     stageName: string,
-    reason: string
+    reason: string,
   ): Promise<void> {
     try {
       // TODO: Store in database for analysis
       LOG.warn(
         `❌ Token ${tokenMint.slice(
           0,
-          8
-        )} FAILED at Stage ${stage} (${stageName}): ${reason}`
+          8,
+        )} FAILED at Stage ${stage} (${stageName}): ${reason}`,
       );
     } catch (error: any) {
       LOG.error(`Error logging failure: ${error.message}`);

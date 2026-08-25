@@ -16,7 +16,11 @@ import validationPipelineService, {
   PipelineResult,
 } from "./validationPipeline.service.js";
 import userWalletService from "./userWallet.service.js";
-import { getTraderConfig } from "./traderConfig.service.js";
+import {
+  getEffectiveConfig,
+  getEffectiveLaunchWindowSeconds,
+  getTraderConfig,
+} from "./traderConfig.service.js";
 import { loadKeypairFromEnv } from "./solana.service.js";
 import dbService from "./db.service.js";
 import { withWalletLock } from "../utils/walletMutex.js";
@@ -31,6 +35,54 @@ const MIN_FUNDED_BALANCE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
 
 const OPERATOR_WALLET =
   process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
+
+export interface LaunchMetrics {
+  marketCapUSD: number;
+  marketCapSOL: number;
+  liquidityUSD: number;
+  liquiditySOL: number;
+}
+
+export function launchMetricsWithinLimits(
+  metrics: LaunchMetrics,
+  config: Awaited<ReturnType<typeof getEffectiveConfig>>,
+): boolean {
+  return (
+    Object.values(metrics).every((value) => Number.isFinite(value)) &&
+    metrics.marketCapUSD >= config.minMarketCapUsd &&
+    metrics.marketCapUSD <= config.maxMarketCapUsd &&
+    metrics.marketCapSOL >= config.minMarketCapSol &&
+    metrics.marketCapSOL <= config.maxMarketCapSol &&
+    metrics.liquidityUSD >= config.minLiquidityUsd &&
+    metrics.liquidityUSD <= config.maxLiquidityUsd &&
+    metrics.liquiditySOL >= config.minLiquiditySol &&
+    metrics.liquiditySOL <= config.maxLiquiditySol
+  );
+}
+
+export function launchMetricsFromTokenState(
+  state: Awaited<ReturnType<typeof dbService.getTokenState>>,
+): LaunchMetrics | null {
+  if (!state) return null;
+  return {
+    marketCapUSD: Number(state.launchMarketCapUSD),
+    marketCapSOL: Number(state.launchMarketCapSOL),
+    liquidityUSD: Number(state.launchLiquidityUSD),
+    liquiditySOL: Number(state.launchLiquiditySOL),
+  };
+}
+
+export function launchAgeWithinWindow(
+  poolCreatedAt: Date | string | undefined,
+  now: number,
+  window: { min: number; max: number },
+): boolean {
+  if (!poolCreatedAt) return false;
+  const createdAt = new Date(poolCreatedAt).getTime();
+  if (!Number.isFinite(createdAt)) return false;
+  const ageSeconds = (now - createdAt) / 1000;
+  return ageSeconds >= window.min && ageSeconds <= window.max;
+}
 
 function operatorWalletContext(): WalletContext {
   const keypair = loadKeypairFromEnv();
@@ -69,7 +121,7 @@ async function isUnderTradeCap(wallet: string): Promise<boolean> {
  * below.
  */
 export async function isAutoTradeCurrentlyEnabled(
-  ownerWallet: string
+  ownerWallet: string,
 ): Promise<boolean> {
   const config = await getTraderConfig(ownerWallet);
   if (ownerWallet === OPERATOR_WALLET) {
@@ -104,7 +156,7 @@ export async function getEligibleWallets(): Promise<WalletContext[]> {
   } else {
     LOG.info(
       { wallet: operatorCtx.ownerWallet },
-      "Operator wallet excluded from this round: auto-trade disabled or Max Total Trades reached"
+      "Operator wallet excluded from this round: auto-trade disabled or Max Total Trades reached",
     );
   }
 
@@ -115,7 +167,7 @@ export async function getEligibleWallets(): Promise<WalletContext[]> {
       if (!config?.globalSettings?.autoTradeEnabled) continue;
 
       const { balanceSol } = (await userWalletService.getUserWalletBalanceSol(
-        uw.ownerWallet
+        uw.ownerWallet,
       )) ?? { balanceSol: 0 };
       if (balanceSol < MIN_FUNDED_BALANCE_SOL) continue;
 
@@ -125,13 +177,15 @@ export async function getEligibleWallets(): Promise<WalletContext[]> {
         if (tradesTaken >= maxTotalTrades) {
           LOG.info(
             { ownerWallet: uw.ownerWallet, tradesTaken, maxTotalTrades },
-            "Wallet excluded from this round: Max Total Trades reached"
+            "Wallet excluded from this round: Max Total Trades reached",
           );
           continue;
         }
       }
 
-      const keypair = await userWalletService.getUserWalletKeypair(uw.ownerWallet);
+      const keypair = await userWalletService.getUserWalletKeypair(
+        uw.ownerWallet,
+      );
       if (!keypair) continue;
 
       eligible.push({
@@ -142,7 +196,7 @@ export async function getEligibleWallets(): Promise<WalletContext[]> {
     } catch (err: any) {
       LOG.error(
         { ownerWallet: uw.ownerWallet, err: err?.message },
-        "Failed to evaluate wallet for auto-trade eligibility — skipping it"
+        "Failed to evaluate wallet for auto-trade eligibility — skipping it",
       );
     }
   }
@@ -165,10 +219,13 @@ export interface FanOutResult {
  */
 export async function runPipelineForAllEligibleWallets(
   tokenMint: string,
-  lpSol: number
+  lpSol: number,
 ): Promise<FanOutResult[]> {
   const wallets = await getEligibleWallets();
   const results: FanOutResult[] = [];
+  const launchMetrics = launchMetricsFromTokenState(
+    await dbService.getTokenState(tokenMint),
+  );
 
   for (const walletContext of wallets) {
     try {
@@ -179,7 +236,7 @@ export async function runPipelineForAllEligibleWallets(
       if (!(await isAutoTradeCurrentlyEnabled(walletContext.ownerWallet))) {
         LOG.info(
           { ownerWallet: walletContext.ownerWallet, tokenMint },
-          "Skipping wallet: auto-trade was disabled after this run started"
+          "Skipping wallet: auto-trade was disabled after this run started",
         );
         results.push({
           ownerWallet: walletContext.ownerWallet,
@@ -192,6 +249,36 @@ export async function runPipelineForAllEligibleWallets(
         continue;
       }
 
+      const config = await getEffectiveConfig(
+        walletContext.ownerWallet,
+        tokenMint,
+      );
+      if (!launchMetrics || !launchMetricsWithinLimits(launchMetrics, config)) {
+        LOG.info(
+          { ownerWallet: walletContext.ownerWallet, tokenMint, launchMetrics },
+          "Skipping wallet: launch market cap/liquidity is outside its configured limits",
+        );
+        continue;
+      }
+
+      const launchWindow = await getEffectiveLaunchWindowSeconds(
+        walletContext.ownerWallet,
+      );
+      if (
+        !launchWindow ||
+        !launchAgeWithinWindow(
+          (await dbService.getTokenState(tokenMint))?.poolCreatedAt,
+          Date.now(),
+          launchWindow,
+        )
+      ) {
+        LOG.info(
+          { ownerWallet: walletContext.ownerWallet, tokenMint, launchWindow },
+          "Skipping wallet: token is outside its configured launch window",
+        );
+        continue;
+      }
+
       // Serialized per wallet (see walletMutex.ts) — this pipeline and
       // autoBuyer.service.ts's both size trades as a percentage of live
       // balance, so a wallet with a buy already in flight (from either
@@ -199,13 +286,29 @@ export async function runPipelineForAllEligibleWallets(
       // the same stale balance concurrently. This one waits its turn and
       // sizes against whatever's actually left afterward.
       const result = await withWalletLock(walletContext.ownerWallet, () =>
-        validationPipelineService.runPipeline(tokenMint, lpSol, walletContext)
+        validationPipelineService.runPipeline(tokenMint, lpSol, walletContext),
       );
+      if (result.success && result.executionResult) {
+        await dbService.updatePositionMetadata(
+          tokenMint,
+          walletContext.ownerWallet,
+          {
+            tpPct: config.takeProfitPct,
+            slPct: config.stopLossPct,
+            firstTrancheEntry: Date.now(),
+            remainingPct: 100,
+          },
+        );
+      }
       results.push({ ownerWallet: walletContext.ownerWallet, result });
     } catch (err: any) {
       LOG.error(
-        { ownerWallet: walletContext.ownerWallet, tokenMint, err: err?.message },
-        "Pipeline run failed unexpectedly for this wallet — continuing with the rest"
+        {
+          ownerWallet: walletContext.ownerWallet,
+          tokenMint,
+          err: err?.message,
+        },
+        "Pipeline run failed unexpectedly for this wallet — continuing with the rest",
       );
       results.push({
         ownerWallet: walletContext.ownerWallet,

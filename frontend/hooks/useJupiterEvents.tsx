@@ -89,11 +89,15 @@ export function useJupiterEvents() {
 
     switch (lastMessage.event) {
       case "jupiter:token_detected":
-        setTokensDetected((prev) => [lastMessage.payload, ...prev].slice(0, 50));
+        setTokensDetected((prev) =>
+          [lastMessage.payload, ...prev].slice(0, 50)
+        );
         break;
 
       case "jupiter:token_skipped":
-        setTokensSkipped((prev) => [lastMessage.payload, ...prev].slice(0, 100));
+        setTokensSkipped((prev) =>
+          [lastMessage.payload, ...prev].slice(0, 100)
+        );
         break;
 
       case "jupiter:validation_passed":
@@ -123,7 +127,8 @@ export function useJupiterEvents() {
       case "pnl:update":
         setPnlUpdates((prev) => {
           const updated = new Map(prev);
-          updated.set(lastMessage.payload.tokenMint, lastMessage.payload);
+          const key = `${lastMessage.payload.wallet ?? ""}:${lastMessage.payload.tokenMint}`;
+          updated.set(key, lastMessage.payload);
           return updated;
         });
         break;
@@ -143,9 +148,12 @@ export function useJupiterEvents() {
     latestPipelineSuccess: pipelineSuccess[0],
     latestPipelineFailed: pipelineFailed[0],
     totalTokensSkipped: tokensSkipped.length,
-    skipReasons: tokensSkipped.reduce((acc, skip) => {
-      acc[skip.reason] = (acc[skip.reason] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>),
+    skipReasons: tokensSkipped.reduce(
+      (acc, skip) => {
+        acc[skip.reason] = (acc[skip.reason] || 0) + 1;
+        return acc;
+      },
+      {} as Record<string, number>
+    ),
   };
 }

@@ -36,7 +36,8 @@ All new features added (P&L tracking, watchlist, price alerts, caching) are now 
   maxMarketCapSol: number; // Max market cap in SOL
   minMarketCapUsd: number; // Min market cap in USD
   maxMarketCapUsd: number; // Max market cap in USD
-  maxTokenAgeHours: number; // Max token age in hours
+  minSecondsSinceLaunch: number; // Earliest launch age in seconds
+  maxSecondsSinceLaunch: number; // Latest launch age in seconds
   minTokenScore: number; // Min score (0-100)
   takeProfitPct: number; // Take profit percentage
   stopLossPct: number; // Stop loss percentage
@@ -116,7 +117,7 @@ socket.on("tokenFeed", ({ tokens }) => {
   // Update token list with scores/risk levels
   tokens.forEach((token) => {
     console.log(
-      `${token.symbol}: Score ${token.score}, Risk ${token.riskLevel}`
+      `${token.symbol}: Score ${token.score}, Risk ${token.riskLevel}`,
     );
   });
 });
@@ -124,14 +125,14 @@ socket.on("tokenFeed", ({ tokens }) => {
 // Trades
 socket.on("tradeFeed", (trade) => {
   console.log(
-    `Trade: ${trade.type} ${trade.symbol} - P&L: ${trade.pnlSol} SOL`
+    `Trade: ${trade.type} ${trade.symbol} - P&L: ${trade.pnlSol} SOL`,
   );
 });
 
 // Portfolio P&L (Auto-broadcast every 30s)
 socket.on("pnl:update", (pnl) => {
   console.log(
-    `Portfolio P&L: ${pnl.totalPnlSol} SOL (${pnl.winRate}% win rate)`
+    `Portfolio P&L: ${pnl.totalPnlSol} SOL (${pnl.winRate}% win rate)`,
   );
 });
 
@@ -143,7 +144,7 @@ socket.on("watchlist:update", (tokens) => {
 // Price Alerts
 socket.on("priceAlert:triggered", (alert) => {
   console.log(
-    `🚨 Alert: ${alert.symbol} ${alert.condition} $${alert.targetPrice}`
+    `🚨 Alert: ${alert.symbol} ${alert.condition} $${alert.targetPrice}`,
   );
   // Show notification to user
 });
@@ -311,7 +312,7 @@ socket.on("tokenFeed", ({ tokens }) => {
   console.log(
     `🪙 ${tokens.length} tokens (avg score: ${
       tokens.reduce((sum, t) => sum + (t.score || 0), 0) / tokens.length
-    })`
+    })`,
   );
 });
 ```
@@ -352,7 +353,8 @@ Get current runtime configuration.
     "maxMarketCapSol": 1000000,
     "minMarketCapUsd": 1000,
     "maxMarketCapUsd": 200000000,
-    "maxTokenAgeHours": 24,
+    "minSecondsSinceLaunch": 10,
+    "maxSecondsSinceLaunch": 60,
     "minTokenScore": 30,
     "takeProfitPct": 0.1,
     "stopLossPct": 0.02

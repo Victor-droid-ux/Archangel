@@ -14,6 +14,11 @@ import dbService from "./db.service.js";
 import multiUserExecutionService from "./multiUserExecution.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
+import {
+  claimMint,
+  completeMint,
+  releaseMint,
+} from "./discoveryCoordinator.service.js";
 
 const LOG = getLogger("jupiter-discovery");
 
@@ -97,11 +102,11 @@ class JupiterDiscoveryService {
     );
 
     for (const token of fresh) {
-      this.detectedTokens.add(token.mint);
       if (this.activeValidations >= this.CONCURRENT_VALIDATIONS) {
-        // Backpressure: skip this tick, it'll be picked up again if still "recent" next poll
+        // Backpressure: leave the mint unmarked so a later poll can retry it.
         continue;
       }
+      this.detectedTokens.add(token.mint);
       this.activeValidations++;
       this.processToken(token)
         .catch((err) =>
@@ -129,6 +134,8 @@ class JupiterDiscoveryService {
       return;
     }
 
+    const solPriceUsd = await getSolPriceUsd();
+
     await dbService.upsertTokenState({
       mint: token.mint,
       symbol: token.symbol || "UNKNOWN",
@@ -137,12 +144,23 @@ class JupiterDiscoveryService {
       source: "jupiter",
       liquiditySOL: 0,
       liquidityUSD: token.liquidity,
+      launchMarketCapUSD: token.mcap,
+      ...(solPriceUsd > 0 && {
+        launchMarketCapSOL: token.mcap / solPriceUsd,
+      }),
+      launchLiquidityUSD: token.liquidity,
+      ...(solPriceUsd > 0 && {
+        launchLiquiditySOL: token.liquidity / solPriceUsd,
+      }),
+      ...(token.firstPoolCreatedAt && {
+        poolCreatedAt: new Date(token.firstPoolCreatedAt),
+      }),
+      launchSnapshotAt: new Date(),
       poolAddress: token.firstPoolId || "",
       ...(token.devAddress ? { creatorAddress: token.devAddress } : {}),
       detectedAt: new Date(),
     });
 
-    const solPriceUsd = await getSolPriceUsd();
     if (token.liquidity < this.config.minLiquiditySol * solPriceUsd) {
       // rough USD floor before spending a full validation pass; validateJupiterToken
       // does the precise SOL-denominated check. Uses a live SOL price rather
@@ -199,6 +217,18 @@ class JupiterDiscoveryService {
       jupiterTradable: validation.approved,
       liquiditySOL: validation.details.liquiditySol,
       liquidityUSD: token.liquidity,
+      launchMarketCapUSD: token.mcap,
+      ...(solPriceUsd > 0 && {
+        launchMarketCapSOL: token.mcap / solPriceUsd,
+      }),
+      launchLiquidityUSD: token.liquidity,
+      ...(solPriceUsd > 0 && {
+        launchLiquiditySOL: token.liquidity / solPriceUsd,
+      }),
+      ...(token.firstPoolCreatedAt && {
+        poolCreatedAt: new Date(token.firstPoolCreatedAt),
+      }),
+      launchSnapshotAt: new Date(),
       poolAddress: token.firstPoolId || "",
       ...(token.devAddress ? { creatorAddress: token.devAddress } : {}),
       detectedAt: new Date(),
@@ -233,7 +263,7 @@ class JupiterDiscoveryService {
       });
     }
 
-    if (!this.config.autoBuyEnabled) return;
+    if (!this.config.autoBuyEnabled || !(await claimMint(token.mint))) return;
 
     LOG.info(
       `🚀 Starting validation pipeline for auto-buy: ${token.symbol}...`,
@@ -246,11 +276,18 @@ class JupiterDiscoveryService {
     // so for now every connected dashboard sees every wallet's auto-buy
     // activity for this event type (trade history/positions reads are
     // already wallet-scoped; this is a live-feed-only gap).
-    const fanOutResults =
-      await multiUserExecutionService.runPipelineForAllEligibleWallets(
-        token.mint,
-        validation.details.liquiditySol,
-      );
+    let fanOutResults;
+    try {
+      fanOutResults =
+        await multiUserExecutionService.runPipelineForAllEligibleWallets(
+          token.mint,
+          validation.details.liquiditySol,
+        );
+    } catch (err) {
+      await releaseMint(token.mint);
+      throw err;
+    }
+    await completeMint(token.mint);
 
     for (const { ownerWallet, result: pipelineResult } of fanOutResults) {
       if (!pipelineResult.success) {

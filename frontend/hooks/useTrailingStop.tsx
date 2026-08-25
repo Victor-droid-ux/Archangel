@@ -6,6 +6,7 @@ import { useSocket } from "@hooks/useSocket";
 
 export interface TrailingStopData {
   token: string;
+  wallet?: string;
   currentPnlPct: number;
   highestPnlPct: number;
   trailingActivated: boolean;
@@ -35,7 +36,7 @@ export function useTrailingStop(tokenMint?: string) {
       // Update all positions map
       setAllTrailingData((prev) => {
         const updated = new Map(prev);
-        updated.set(data.token, data);
+        updated.set(`${data.wallet ?? ""}:${data.token}`, data);
         return updated;
       });
 
@@ -52,15 +53,21 @@ export function useTrailingStop(tokenMint?: string) {
     connected,
     // Helper functions
     isTrailingActive: (token?: string): boolean => {
-      const data = token ? allTrailingData.get(token) : trailingData;
+      const data = token
+        ? allTrailingData.get(`${trailingData?.wallet ?? ""}:${token}`)
+        : trailingData;
       return data?.trailingActivated ?? false;
     },
     getHighestPnl: (token?: string): number => {
-      const data = token ? allTrailingData.get(token) : trailingData;
+      const data = token
+        ? allTrailingData.get(`${trailingData?.wallet ?? ""}:${token}`)
+        : trailingData;
       return data?.highestPnlPct ?? 0;
     },
     getDrawdown: (token?: string): number => {
-      const data = token ? allTrailingData.get(token) : trailingData;
+      const data = token
+        ? allTrailingData.get(`${trailingData?.wallet ?? ""}:${token}`)
+        : trailingData;
       return data?.drawdownFromPeak ?? 0;
     },
   };

@@ -28,8 +28,8 @@ export default function SettingsPage() {
         <div className="kicker mb-1">Configuration</div>
         <h1 className="text-3xl font-bold text-white mb-1">Settings</h1>
         <p className="text-base-content/50 text-sm">
-          Manual-trade defaults live here; auto-trade strategy rules are
-          global, per wallet — edit those separately below.
+          Manual-trade defaults live here; auto-trade strategy rules are global,
+          per wallet — edit those separately below.
         </p>
       </motion.div>
 
@@ -54,7 +54,7 @@ export default function SettingsPage() {
             Global Auto-Trade Rules
           </h2>
           <p className="text-sm text-base-content/50 mt-1">
-            Market cap range, take-profit/stop-loss, token age, and
+            Market cap range, launch window, take-profit/stop-loss, and
             auto-trading eligibility applied across all tokens.
           </p>
         </div>

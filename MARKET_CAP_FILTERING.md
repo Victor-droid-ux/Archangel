@@ -65,7 +65,8 @@ All market cap settings can now be updated via API without restarting the server
   maxMarketCapSol: number,      // Max MC in SOL (default: 1000000)
   minMarketCapUsd: number,      // Min MC in USD (default: 1000)
   maxMarketCapUsd: number,      // Max MC in USD (default: 200000000)
-  maxTokenAgeHours: number,     // Max token age (default: 24)
+  minSecondsSinceLaunch: number, // Earliest launch age (default: 10)
+  maxSecondsSinceLaunch: number, // Latest launch age (default: 60)
   minTokenScore: number,        // Min score 0-100 (default: 30)
   takeProfitPct: number,        // TP % (default: 0.1)
   stopLossPct: number           // SL % (default: 0.02)
@@ -92,7 +93,8 @@ GET /api/config
     "maxMarketCapSol": 1000000,
     "minMarketCapUsd": 1000,
     "maxMarketCapUsd": 200000000,
-    "maxTokenAgeHours": 24,
+    "minSecondsSinceLaunch": 10,
+    "maxSecondsSinceLaunch": 60,
     "minTokenScore": 30,
     "takeProfitPct": 0.1,
     "stopLossPct": 0.02
@@ -307,8 +309,9 @@ MAX_MARKETCAP_SOL=1000000
 MIN_MARKETCAP_USD=1000
 MAX_MARKETCAP_USD=200000000
 
-# Other Filters
-MAX_TOKEN_AGE_HOURS=24
+# Launch Window
+MIN_SECONDS_SINCE_LAUNCH=10
+MAX_SECONDS_SINCE_LAUNCH=60
 MIN_TOKEN_SCORE=30
 
 # Trading Parameters

@@ -37,6 +37,9 @@ export interface JupiterLiquidityMetrics {
   holderCount: number;
   poolAddress?: string;
   meetsMinimumLiquidity: boolean;
+  buyRouteAvailable?: boolean;
+  sellRouteAvailable?: boolean;
+  buyPriceImpactPct?: number;
 }
 
 /**
@@ -392,6 +395,108 @@ export async function validateTradeOpportunity(
   );
 
   return result;
+}
+
+export async function validateFastLaunchOpportunity(
+  tokenMint: string,
+): Promise<TradeValidationResult> {
+  const timestamp = Date.now();
+  try {
+    const [tokenInfo, solPriceUsd, buyQuote] = await Promise.all([
+      jupiterService.getTokenInfo(tokenMint),
+      getSolPriceUsd(),
+      jupiterService.getQuote(SOL_MINT, tokenMint, 1_000_000, 1000),
+    ]);
+    const sellQuote = buyQuote?.outAmount
+      ? await jupiterService.getQuote(
+          tokenMint,
+          SOL_MINT,
+          buyQuote.outAmount,
+          1000,
+        )
+      : null;
+    const liquidityUSD = Number(tokenInfo?.liquidity ?? 0);
+    const liquiditySOL = solPriceUsd > 0 ? liquidityUSD / solPriceUsd : 0;
+    const mintDisabled = tokenInfo?.mintAuthorityDisabled === true;
+    const freezeDisabled = tokenInfo?.freezeAuthorityDisabled === true;
+    const approved = Boolean(
+      tokenInfo &&
+      buyQuote?.outAmount &&
+      sellQuote?.outAmount &&
+      mintDisabled &&
+      freezeDisabled &&
+      Number.isFinite(liquiditySOL) &&
+      liquiditySOL > 0 &&
+      (buyQuote.priceImpactPct ?? 0) <=
+        Number(process.env.MAX_PIPELINE_PRICE_IMPACT_PCT ?? 30),
+    );
+    const safetyChecks: SafetyChecks = {
+      canSell: Boolean(sellQuote?.outAmount),
+      mintAuthority: mintDisabled ? null : "unknown",
+      freezeAuthority: freezeDisabled ? null : "unknown",
+      firstThreeCandlesValid: true,
+      lpRemovable: false,
+      buyTax: 0,
+      sellTax: 0,
+      isHoneypot: false,
+      allChecksPassed: approved,
+    };
+    const jupiterMetrics: JupiterLiquidityMetrics = {
+      exists: Boolean(buyQuote?.outAmount),
+      buyRouteAvailable: Boolean(buyQuote?.outAmount),
+      sellRouteAvailable: Boolean(sellQuote?.outAmount),
+      buyPriceImpactPct: Number(buyQuote?.priceImpactPct ?? 0),
+      liquiditySOL,
+      liquidityUSD,
+      mcapUSD: Number(tokenInfo?.mcap ?? 0),
+      holderCount: Number(tokenInfo?.holderCount ?? 0),
+      meetsMinimumLiquidity: liquiditySOL > 0,
+      ...(tokenInfo?.firstPoolId ? { poolAddress: tokenInfo.firstPoolId } : {}),
+    };
+    return {
+      mint: tokenMint,
+      approved,
+      jupiterMetrics,
+      condition1Passed: Boolean(buyQuote?.outAmount && sellQuote?.outAmount),
+      safetyChecks,
+      condition2Passed: approved,
+      recommendation: approved ? "BUY" : "IGNORE",
+      reason: approved
+        ? "Fast launch checks passed"
+        : "Fast launch checks failed",
+      timestamp,
+    };
+  } catch (err: any) {
+    log.warn({ tokenMint, err: err?.message }, "Fast launch validation failed");
+    return {
+      mint: tokenMint,
+      approved: false,
+      jupiterMetrics: {
+        exists: false,
+        liquiditySOL: 0,
+        liquidityUSD: 0,
+        mcapUSD: 0,
+        holderCount: 0,
+        meetsMinimumLiquidity: false,
+      },
+      condition1Passed: false,
+      safetyChecks: {
+        canSell: false,
+        mintAuthority: "unknown",
+        freezeAuthority: "unknown",
+        firstThreeCandlesValid: false,
+        lpRemovable: false,
+        buyTax: 0,
+        sellTax: 0,
+        isHoneypot: true,
+        allChecksPassed: false,
+      },
+      condition2Passed: false,
+      recommendation: "IGNORE",
+      reason: "Fast launch validation unavailable",
+      timestamp,
+    };
+  }
 }
 
 /**

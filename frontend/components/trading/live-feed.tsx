@@ -98,6 +98,18 @@ export default function LiveFeed() {
         message = `Trailing Stop (Final 10%): ${payload.exitReason || ""}`;
       }
 
+      if (payload?.reason === "take_profit") {
+        message = `SELL Take profit (${((payload.pnl ?? 0) * 100).toFixed(2)}%)`;
+      }
+
+      if (payload?.reason === "stop_loss") {
+        message = `SELL Stop loss (${((payload.pnl ?? 0) * 100).toFixed(2)}%)`;
+      }
+
+      if (payload?.reason === "partial_buy") {
+        message = `BUY Partial position: ${payload.tranche || "first tranche"}`;
+      }
+
       const incoming: TradeLog = {
         id: crypto.randomUUID(),
         time: now,
@@ -112,7 +124,10 @@ export default function LiveFeed() {
 
       // Also feed the shared store so TradeHistory (a separate component
       // reading the same useStats() state) reflects live trades too.
-      if (type === "buy" || type === "sell") {
+      if (
+        (type === "buy" || type === "sell") &&
+        payload?.reason !== "partial_buy"
+      ) {
         addTrade({
           id: incoming.id,
           type,
@@ -141,12 +156,6 @@ export default function LiveFeed() {
         updateStats((prev) => ({
           totalProfitSol: prev.totalProfitSol + profitSol,
           tradeVolumeSol: prev.tradeVolumeSol + amountSol,
-          openTrades:
-            type === "buy"
-              ? prev.openTrades + 1
-              : type === "sell"
-              ? Math.max(prev.openTrades - 1, 0)
-              : prev.openTrades,
         }));
       }
       return;
@@ -189,8 +198,8 @@ export default function LiveFeed() {
     summary.totalProfit > 0
       ? "rgba(34,197,94,0.3)"
       : summary.totalProfit < 0
-      ? "rgba(239,68,68,0.3)"
-      : "rgba(148,163,184,0.15)";
+        ? "rgba(239,68,68,0.3)"
+        : "rgba(148,163,184,0.15)";
 
   return (
     <div className="bg-base-200 rounded-xl p-4 h-[26rem] flex flex-col border border-base-300 shadow-lg relative">
@@ -223,8 +232,8 @@ export default function LiveFeed() {
                 log.type === "buy"
                   ? "bg-green-900/30 text-green-400"
                   : log.type === "sell"
-                  ? "bg-red-900/30 text-red-400"
-                  : "bg-slate-800/30 text-slate-300"
+                    ? "bg-red-900/30 text-red-400"
+                    : "bg-slate-800/30 text-slate-300"
               }`}
             >
               <div className="flex justify-between items-center">

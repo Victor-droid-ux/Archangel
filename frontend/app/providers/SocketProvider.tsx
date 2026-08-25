@@ -60,55 +60,14 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({
     const onConnect = () => setConnected(true);
     const onDisconnect = () => setConnected(false);
     const onConnectError = () => setConnected(false);
-    const onUpdate = (data: any) => {
-      setLastMessage({
-        event: data?.event ?? "update",
-        payload: data?.payload ?? data,
-      });
-    };
-    const onTradeFeed = (payload: any) =>
-      setLastMessage({ event: "tradeFeed", payload });
-    const onTokenFeed = (payload: any) =>
-      setLastMessage({ event: "tokenFeed", payload });
-    const onPriceUpdate = (payload: any) =>
-      setLastMessage({ event: "priceUpdate", payload });
-    const onValidationResult = (payload: any) =>
-      setLastMessage({ event: "validationResult", payload });
-    const onTradeError = (payload: any) =>
-      setLastMessage({ event: "tradeError", payload });
-    const onPnlUpdate = (payload: any) =>
-      setLastMessage({ event: "pnl:update", payload });
-    const onWalletBalance = (payload: any) =>
-      setLastMessage({ event: "wallet:balance", payload });
-    const onTrailingUpdate = (payload: any) =>
-      setLastMessage({ event: "position:trailingUpdate", payload });
-
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("connect_error", onConnectError);
-    socket.on("update", onUpdate);
-    socket.on("tradeFeed", onTradeFeed);
-    socket.on("tokenFeed", onTokenFeed);
-    socket.on("priceUpdate", onPriceUpdate);
-    socket.on("validationResult", onValidationResult);
-    socket.on("tradeError", onTradeError);
-    socket.on("pnl:update", onPnlUpdate);
-    socket.on("wallet:balance", onWalletBalance);
-    socket.on("position:trailingUpdate", onTrailingUpdate);
 
     return () => {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
       socket.off("connect_error", onConnectError);
-      socket.off("update", onUpdate);
-      socket.off("tradeFeed", onTradeFeed);
-      socket.off("tokenFeed", onTokenFeed);
-      socket.off("priceUpdate", onPriceUpdate);
-      socket.off("validationResult", onValidationResult);
-      socket.off("tradeError", onTradeError);
-      socket.off("pnl:update", onPnlUpdate);
-      socket.off("wallet:balance", onWalletBalance);
-      socket.off("position:trailingUpdate", onTrailingUpdate);
     };
   }, []);
 

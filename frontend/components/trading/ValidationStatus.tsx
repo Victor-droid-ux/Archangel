@@ -12,6 +12,9 @@ interface JupiterLiquidityMetrics {
   holderCount: number;
   poolAddress?: string;
   meetsMinimumLiquidity: boolean;
+  buyRouteAvailable?: boolean;
+  sellRouteAvailable?: boolean;
+  buyPriceImpactPct?: number;
 }
 
 interface SafetyChecks {
@@ -104,11 +107,32 @@ export function ValidationStatus({ validation }: ValidationStatusProps) {
           </div>
           <div className="ml-6 space-y-1 text-xs text-muted-foreground">
             <div className="flex justify-between">
-              <span>Route Exists:</span>
+              <span>Buy Route:</span>
               <span className="font-mono">
-                {validation.jupiterMetrics.exists ? "✅ Yes" : "❌ No"}
+                {(validation.jupiterMetrics.buyRouteAvailable ??
+                validation.jupiterMetrics.exists)
+                  ? "✅ Yes"
+                  : "❌ No"}
               </span>
             </div>
+            <div className="flex justify-between">
+              <span>Sell Route:</span>
+              <span className="font-mono">
+                {validation.jupiterMetrics.sellRouteAvailable === undefined
+                  ? "—"
+                  : validation.jupiterMetrics.sellRouteAvailable
+                    ? "✅ Yes"
+                    : "❌ No"}
+              </span>
+            </div>
+            {validation.jupiterMetrics.buyPriceImpactPct !== undefined && (
+              <div className="flex justify-between">
+                <span>Buy Price Impact:</span>
+                <span className="font-mono">
+                  {validation.jupiterMetrics.buyPriceImpactPct.toFixed(2)}%
+                </span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span>Liquidity (SOL):</span>
               <span className="font-mono">
@@ -154,7 +178,7 @@ export function ValidationStatus({ validation }: ValidationStatusProps) {
           </div>
           <div className="ml-6 space-y-1 text-xs text-muted-foreground">
             <div className="flex justify-between">
-              <span>Test Sell:</span>
+              <span>Sell Route Check:</span>
               <span className="font-mono">
                 {validation.safetyChecks.canSell ? "✅ Pass" : "❌ Fail"}
               </span>

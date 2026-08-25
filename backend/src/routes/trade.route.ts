@@ -52,10 +52,14 @@ router.get("/manual-buy-candidates", async (req, res) => {
         // Newest-tradable-first — confirmedTradableAt is when it actually
         // cleared validation; detectedAt (first seen at all) as a fallback
         // for any row missing it.
-        tradableAt: (t.confirmedTradableAt ?? t.detectedAt)?.toISOString?.() ?? null,
+        tradableAt:
+          (t.confirmedTradableAt ?? t.detectedAt)?.toISOString?.() ?? null,
       }))
       .filter((c) => c.tradableAt && new Date(c.tradableAt).getTime() >= cutoff)
-      .sort((a, b) => new Date(b.tradableAt!).getTime() - new Date(a.tradableAt!).getTime())
+      .sort(
+        (a, b) =>
+          new Date(b.tradableAt!).getTime() - new Date(a.tradableAt!).getTime(),
+      )
       .slice(0, limit);
     return res.json({ success: true, candidates });
   } catch (err: any) {
@@ -168,14 +172,8 @@ router.post("/validate", async (req, res) => {
  */
 router.post("/prepare", async (req, res) => {
   try {
-    const {
-      type,
-      inputMint,
-      outputMint,
-      wallet,
-      amountLamports,
-      slippageBps,
-    } = req.body;
+    const { type, inputMint, outputMint, wallet, amountLamports, slippageBps } =
+      req.body;
 
     if (!type || !outputMint || !wallet || !amountLamports) {
       return res.status(400).json({
@@ -217,7 +215,7 @@ router.post("/prepare", async (req, res) => {
     // call bypasses entirely — this endpoint would prepare (and /confirm
     // would happily execute) a buy regardless of whether the user's own
     // trigger condition was actually met.
-    if (type === "buy" && config.triggerMarketCapSol) {
+    if (type === "buy") {
       let currentMarketCapSol = 0;
       try {
         const [tokenInfo, solPriceUsd] = await Promise.all([
@@ -230,31 +228,32 @@ router.post("/prepare", async (req, res) => {
         logger.warn(
           `Failed to fetch market cap for trigger check on ${tokenMint.slice(
             0,
-            8
-          )}...: ${err.message}`
+            8,
+          )}...: ${err.message}`,
         );
       }
 
-      const shouldTrigger = await shouldTriggerTrade(
-        wallet,
-        tokenMint,
-        currentMarketCapSol
-      );
+      const shouldTrigger =
+        Number.isFinite(currentMarketCapSol) &&
+        currentMarketCapSol >= config.minMarketCapSol &&
+        currentMarketCapSol <= config.maxMarketCapSol &&
+        (!config.triggerMarketCapSol ||
+          currentMarketCapSol >= config.triggerMarketCapSol);
       if (!shouldTrigger) {
         logger.info(
           `⏭️ Trade not triggered: ${tokenMint.slice(
             0,
-            8
+            8,
           )}... current MC ${currentMarketCapSol.toFixed(
-            2
+            2,
           )} SOL has not reached configured trigger ${
             config.triggerMarketCapSol
-          } SOL`
+          } SOL`,
         );
         return res.status(400).json({
           success: false,
           message: `Market cap (${currentMarketCapSol.toFixed(
-            2
+            2,
           )} SOL) has not reached the configured trigger (${
             config.triggerMarketCapSol
           } SOL)`,
@@ -263,14 +262,14 @@ router.post("/prepare", async (req, res) => {
     }
 
     logger.info(
-      `Preparing Jupiter ${type} trade for token ${tokenMint.slice(0, 8)}...`
+      `Preparing Jupiter ${type} trade for token ${tokenMint.slice(0, 8)}...`,
     );
 
     const quote = await getJupiterQuote(
       finalInputMint,
       finalOutputMint,
       amountLamports,
-      slippageBps || 100
+      slippageBps || 100,
     );
 
     if (!quote) {
@@ -281,8 +280,8 @@ router.post("/prepare", async (req, res) => {
       logger.error(
         `No Jupiter quote available for ${tokenMint.slice(
           0,
-          8
-        )}... - ${errorMessage}`
+          8,
+        )}... - ${errorMessage}`,
       );
 
       return res.status(400).json({
@@ -338,7 +337,13 @@ router.post("/confirm", async (req, res) => {
       slippageBps,
     } = req.body;
 
-    if (!type || !token || !amountLamports) {
+    if (
+      (type !== "buy" && type !== "sell") ||
+      !token ||
+      !wallet ||
+      !Number.isInteger(amountLamports) ||
+      amountLamports <= 0
+    ) {
       return res.status(400).json({
         success: false,
         message: "Missing required parameters",
@@ -357,15 +362,22 @@ router.post("/confirm", async (req, res) => {
 
     // Deserialize and send the client-signed transaction
     logger.info(
-      `Executing ${type} trade via Jupiter for token ${token.slice(0, 8)}...`
+      `Executing ${type} trade via Jupiter for token ${token.slice(0, 8)}...`,
     );
 
     const connection = new Connection(
       process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
-      "confirmed"
+      "confirmed",
     );
     const txBuffer = Buffer.from(signedTransaction, "base64");
     const versionedTx = VersionedTransaction.deserialize(txBuffer);
+    const actualSigner = versionedTx.message.staticAccountKeys[0]?.toBase58();
+    if (!actualSigner || actualSigner !== wallet) {
+      return res.status(400).json({
+        success: false,
+        message: "Signed transaction fee payer does not match wallet",
+      });
+    }
 
     // Send transaction to Solana
     signature = await connection.sendTransaction(versionedTx, {
@@ -384,12 +396,12 @@ router.post("/confirm", async (req, res) => {
         blockhash: latestBlockhash.blockhash,
         lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
       },
-      "confirmed"
+      "confirmed",
     );
 
     if (confirmation.value.err) {
       throw new Error(
-        `Transaction failed: ${JSON.stringify(confirmation.value.err)}`
+        `Transaction failed: ${JSON.stringify(confirmation.value.err)}`,
       );
     }
 
@@ -399,19 +411,6 @@ router.post("/confirm", async (req, res) => {
     // only happens if its fee-payer's signature verified against the fee
     // payer's own key (enforced by the Solana runtime itself), so the fee
     // payer IS the real, cryptographically-proven signer.
-    const actualSigner = versionedTx.message.staticAccountKeys[0]?.toBase58();
-    if (wallet && actualSigner && wallet !== actualSigner) {
-      logger.warn(
-        `Client-claimed wallet ${String(wallet).slice(
-          0,
-          8
-        )}... does not match the transaction's actual signer ${actualSigner.slice(
-          0,
-          8
-        )}... — using the verified signer`
-      );
-    }
-
     // Real price (SOL per token) from a fresh same-direction quote — this used to
     // be Math.random(), which fabricated the recorded price/PnL for every trade
     // regardless of whether it succeeded. This is still a post-trade estimate
@@ -425,15 +424,19 @@ router.post("/confirm", async (req, res) => {
         type === "buy" ? "So11111111111111111111111111111111111111112" : token;
       const quoteOutputMint =
         type === "buy" ? token : "So11111111111111111111111111111111111111112";
-      const priceQuote = await getJupiterQuote(
-        quoteInputMint,
-        quoteOutputMint,
-        amountLamports,
-        slippageBps || 500
-      );
+      const [priceQuote, tokenInfo] = await Promise.all([
+        getJupiterQuote(
+          quoteInputMint,
+          quoteOutputMint,
+          amountLamports,
+          slippageBps || 500,
+        ),
+        getJupiterTokenInfo(token),
+      ]);
       if (priceQuote?.outAmount) {
         const solAmount = amountLamports / 1e9;
-        const tokenAmount = Number(priceQuote.outAmount) / 1e9;
+        const tokenDecimals = Number(tokenInfo?.decimals ?? 9);
+        const tokenAmount = Number(priceQuote.outAmount) / 10 ** tokenDecimals;
         price =
           type === "buy" ? solAmount / tokenAmount : tokenAmount / solAmount;
       }
@@ -547,10 +550,10 @@ router.post("/calculate-risk", async (req, res) => {
 
     logger.info(
       `Risk calculation: Balance=${balance.toFixed(
-        4
+        4,
       )} SOL, Risk=${calculatedPercent.toFixed(
-        2
-      )}%, Amount=${calculatedAmount.toFixed(4)} SOL`
+        2,
+      )}%, Amount=${calculatedAmount.toFixed(4)} SOL`,
     );
 
     return res.json({

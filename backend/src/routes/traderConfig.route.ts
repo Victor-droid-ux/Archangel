@@ -53,7 +53,7 @@ router.get("/:walletAddress", async (req: Request, res: Response) => {
     const { walletAddress } = req.params;
     log.info(
       { walletAddress },
-      "GET /api/trader-config/:walletAddress request"
+      "GET /api/trader-config/:walletAddress request",
     );
 
     if (!walletAddress) {
@@ -116,39 +116,11 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
 
     if (!requireWalletAuth(req, res)) return;
 
-    // Max Token Age is user-entered as {value, unit} on the frontend and
-    // normalized to seconds before it ever reaches here — validate it landed
-    // as a real, positive, finite number rather than letting a bad value
-    // silently reach the bot (e.g. 0 would reject almost every token; NaN
-    // would make every comparison against it false, which is a fail-open on
-    // a safety-relevant filter, not fail-closed).
-    if (settings && "maxTokenAgeSeconds" in settings) {
-      const v = settings.maxTokenAgeSeconds;
-      const isValid =
-        v === null ||
-        v === undefined ||
-        (typeof v === "number" && Number.isFinite(v) && v > 0);
-      if (!isValid) {
-        return res.status(400).json({
-          success: false,
-          error:
-            "maxTokenAgeSeconds must be a positive number (or omitted/null to clear it)",
-        });
-      }
-      // 30 days — generous ceiling, just guards against a stray extra zero
-      // or unit-conversion mistake producing an absurd value.
-      if (typeof v === "number" && v > 30 * 24 * 3600) {
-        return res.status(400).json({
-          success: false,
-          error: "maxTokenAgeSeconds cannot exceed 30 days (2592000 seconds)",
-        });
-      }
-    }
-
-    // Launch window (min/max seconds since a token's pool was created) —
-    // same fail-closed reasoning as maxTokenAgeSeconds above: a bad value
-    // here silently rejects or accepts every token for this wallet.
-    for (const field of ["minSecondsSinceLaunch", "maxSecondsSinceLaunch"] as const) {
+    // Launch window (min/max seconds since a token's pool was created).
+    for (const field of [
+      "minSecondsSinceLaunch",
+      "maxSecondsSinceLaunch",
+    ] as const) {
       if (settings && field in settings) {
         const v = settings[field];
         const isValid =
@@ -177,7 +149,88 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
     ) {
       return res.status(400).json({
         success: false,
-        error: "minSecondsSinceLaunch cannot be greater than maxSecondsSinceLaunch",
+        error:
+          "minSecondsSinceLaunch cannot be greater than maxSecondsSinceLaunch",
+      });
+    }
+
+    const rangePairs = [
+      ["minMarketCapSol", "maxMarketCapSol"],
+      ["minMarketCapUsd", "maxMarketCapUsd"],
+      ["minLiquiditySol", "maxLiquiditySol"],
+      ["minLiquidityUsd", "maxLiquidityUsd"],
+    ] as const;
+    for (const [minField, maxField] of rangePairs) {
+      const min = settings?.[minField];
+      const max = settings?.[maxField];
+      for (const [field, value] of [
+        [minField, min],
+        [maxField, max],
+      ] as const) {
+        if (
+          value !== undefined &&
+          (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: `${field} must be a finite non-negative number`,
+          });
+        }
+      }
+      if (typeof min === "number" && typeof max === "number" && min > max) {
+        return res.status(400).json({
+          success: false,
+          error: `${minField} cannot be greater than ${maxField}`,
+        });
+      }
+    }
+
+    for (const field of ["takeProfitPct", "stopLossPct"] as const) {
+      const value = settings?.[field];
+      if (
+        value !== undefined &&
+        (typeof value !== "number" ||
+          !Number.isFinite(value) ||
+          value < 0 ||
+          value > 1)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: `${field} must be between 0 and 1`,
+        });
+      }
+    }
+
+    if (
+      settings?.maxTradeAmountSol !== undefined &&
+      (typeof settings.maxTradeAmountSol !== "number" ||
+        !Number.isFinite(settings.maxTradeAmountSol) ||
+        settings.maxTradeAmountSol <= 0)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "maxTradeAmountSol must be a finite positive number",
+      });
+    }
+    if (
+      settings?.minTokenScore !== undefined &&
+      (typeof settings.minTokenScore !== "number" ||
+        !Number.isFinite(settings.minTokenScore) ||
+        settings.minTokenScore < 0 ||
+        settings.minTokenScore > 100)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "minTokenScore must be between 0 and 100",
+      });
+    }
+    if (
+      settings?.autoTradeEnabled !== undefined &&
+      typeof settings.autoTradeEnabled !== "boolean"
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "autoTradeEnabled must be a boolean",
       });
     }
 
@@ -189,7 +242,10 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
       const isValid =
         v === null ||
         v === undefined ||
-        (typeof v === "number" && Number.isFinite(v) && Number.isInteger(v) && v > 0);
+        (typeof v === "number" &&
+          Number.isFinite(v) &&
+          Number.isInteger(v) &&
+          v > 0);
       if (!isValid) {
         return res.status(400).json({
           success: false,
@@ -243,7 +299,7 @@ router.put(
         req.body ?? {};
       log.info(
         { walletAddress, mint },
-        "PUT /api/trader-config/:walletAddress/token/:mint request"
+        "PUT /api/trader-config/:walletAddress/token/:mint request",
       );
 
       if (!walletAddress || !mint) {
@@ -276,7 +332,7 @@ router.put(
         error: err.message,
       });
     }
-  }
+  },
 );
 
 /**
@@ -319,7 +375,7 @@ router.delete(
         error: err.message,
       });
     }
-  }
+  },
 );
 
 /**
@@ -334,7 +390,7 @@ router.get(
       const { walletAddress, mint } = req.params;
       log.info(
         { walletAddress, mint },
-        "GET /api/trader-config/:walletAddress/effective/:mint request"
+        "GET /api/trader-config/:walletAddress/effective/:mint request",
       );
 
       if (!walletAddress || !mint) {
@@ -356,7 +412,7 @@ router.get(
         error: err.message,
       });
     }
-  }
+  },
 );
 
 export default router;

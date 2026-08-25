@@ -13,6 +13,11 @@ import {
   type TokenLifecycleResult,
 } from "./tokenLifecycle.service.js";
 import { addTrackedToken } from "./tokenPrice.service.js";
+import {
+  claimMint,
+  completeMint,
+  releaseMint,
+} from "./discoveryCoordinator.service.js";
 
 const log = getLogger("tokenDiscovery");
 
@@ -85,11 +90,6 @@ function assessRugPullRisk(t: JupiterRecentToken): "low" | "medium" | "high" {
   return "low";
 }
 
-function getTokenAgeHours(firstPoolCreatedAt: number): number | undefined {
-  if (!firstPoolCreatedAt) return undefined;
-  return (Date.now() - firstPoolCreatedAt) / (1000 * 60 * 60);
-}
-
 export type CandidateToken = {
   symbol?: string;
   mint: string;
@@ -97,9 +97,9 @@ export type CandidateToken = {
   priceSol: number | null;
   liquidity: number | null; // USD
   marketCapSol: number | null;
+  marketCapUSD?: number | null;
   score?: number;
   riskLevel?: "low" | "medium" | "high";
-  age?: number | undefined; // hours since first pool
   pairCreatedAt?: number | undefined; // ms epoch, used by autoBuyer's launch-window filter
   holderCount?: number;
   organicScore?: number;
@@ -109,6 +109,11 @@ export type CandidateToken = {
   isTradable?: boolean;
   hasLiquidity?: boolean;
   liquiditySOL?: number | undefined;
+  liquidityUSD?: number | undefined;
+  launchMarketCapUSD?: number | undefined;
+  launchMarketCapSOL?: number | undefined;
+  launchLiquidityUSD?: number | undefined;
+  launchLiquiditySOL?: number | undefined;
   poolAddress?: string | undefined;
 };
 
@@ -132,7 +137,7 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
   const config = getRuntimeConfig();
 
   log.info(
-    `Starting token watcher (Jupiter recent-tokens feed) intervalMs=${intervalMs} MIN_SCORE=${config.minTokenScore}`
+    `Starting token watcher (Jupiter recent-tokens feed) intervalMs=${intervalMs} MIN_SCORE=${config.minTokenScore}`,
   );
 
   const tick = async () => {
@@ -147,16 +152,17 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
 
       const runtimeConfig = getRuntimeConfig();
 
-      // No age filtering here anymore — Max Token Age and Launch Window are
-      // now each wallet's own setting (see traderConfig.service.ts's
-      // getEffectiveMaxTokenAgeSeconds/getEffectiveLaunchWindowSeconds),
+      // No age filtering here anymore — the launch window is each wallet's
+      // own setting (see traderConfig.service.ts's
+      // getEffectiveLaunchWindowSeconds),
       // evaluated per-wallet in autoBuyer.service.ts's fan-out loop. Filtering
       // by a single value here would mean one wallet's setting decides
       // whether ANY wallet even gets a chance to see/buy a token.
       const filtered = tokens.filter((t) => {
         if (!t.mint || !t.symbol) return false;
         if (EXCLUDED_TOKENS.has(t.mint)) return false;
-        if (/(USDC|USDT|USD|DAI|BUSD|TUSD|USDH|USDS)/i.test(t.symbol)) return false;
+        if (/(USDC|USDT|USD|DAI|BUSD|TUSD|USDH|USDS)/i.test(t.symbol))
+          return false;
         return true;
       });
 
@@ -167,7 +173,6 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
         .map((t) => {
           const score = calculateTokenScore(t);
           const riskLevel = assessRugPullRisk(t);
-          const age = getTokenAgeHours(t.firstPoolCreatedAt);
           return {
             symbol: t.symbol,
             mint: t.mint,
@@ -175,9 +180,17 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
             priceSol: t.usdPrice > 0 ? t.usdPrice / solPriceUsd : null,
             liquidity: t.liquidity,
             marketCapSol: t.mcap ? t.mcap / solPriceUsd : null,
+            marketCapUSD: t.mcap || null,
+            launchMarketCapUSD: t.mcap || undefined,
+            launchMarketCapSOL:
+              t.mcap && solPriceUsd > 0 ? t.mcap / solPriceUsd : undefined,
+            launchLiquidityUSD: t.liquidity || undefined,
+            launchLiquiditySOL:
+              t.liquidity && solPriceUsd > 0
+                ? t.liquidity / solPriceUsd
+                : undefined,
             score,
             riskLevel,
-            age,
             pairCreatedAt: t.firstPoolCreatedAt || undefined,
             holderCount: t.holderCount,
             organicScore: t.organicScore,
@@ -186,69 +199,85 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
         .sort((a, b) => (b.score || 0) - (a.score || 0));
 
       const scoredCandidates = candidates.filter(
-        (t) => (t.score || 0) >= runtimeConfig.minTokenScore
+        (t) => (t.score || 0) >= runtimeConfig.minTokenScore,
       );
 
       const avgScore =
         scoredCandidates.length > 0
           ? Math.round(
               scoredCandidates.reduce((sum, t) => sum + (t.score || 0), 0) /
-                scoredCandidates.length
+                scoredCandidates.length,
             )
           : 0;
 
       log.info(
-        `Filtered to ${scoredCandidates.length}/${tokens.length} tokens (avg score: ${avgScore})`
+        `Filtered to ${scoredCandidates.length}/${tokens.length} tokens (avg score: ${avgScore})`,
       );
 
       // === TRADABILITY VALIDATION (Jupiter route + liquidity) ===
-      log.info(`Running tradability validation on ${scoredCandidates.length} tokens...`);
+      log.info(
+        `Running tradability validation on ${scoredCandidates.length} tokens...`,
+      );
       const tokenMints = scoredCandidates.map((t) => t.mint);
       const lifecycleValidation = await validateTokenBatch(tokenMints);
 
-      const validatedCandidates: CandidateToken[] = scoredCandidates.map((candidate) => {
-        try {
-          const raw = byMint.get(candidate.mint);
-          addTrackedToken(candidate.mint, candidate.symbol || "", {
-            name: raw?.name,
-            decimals: raw?.decimals,
-            price: raw?.usdPrice,
-            priceSol: candidate.priceSol,
-            marketCap: raw?.mcap,
-            liquidity: raw?.liquidity,
-            volume24h: raw?.volume24h,
-            priceChange1h: raw?.priceChange1h,
-            priceChange24h: raw?.priceChange24h,
-            circulatingSupply: raw?.circSupply,
-            totalSupply: raw?.totalSupply,
-          });
-        } catch (e) {
-          log.warn(`Failed to add token to tracked list: ${candidate.mint}`);
-        }
+      const validatedCandidates: CandidateToken[] = scoredCandidates.map(
+        (candidate) => {
+          try {
+            const raw = byMint.get(candidate.mint);
+            addTrackedToken(candidate.mint, candidate.symbol || "", {
+              name: raw?.name,
+              decimals: raw?.decimals,
+              price: raw?.usdPrice,
+              priceSol: candidate.priceSol,
+              marketCap: raw?.mcap,
+              liquidity: raw?.liquidity,
+              volume24h: raw?.volume24h,
+              priceChange1h: raw?.priceChange1h,
+              priceChange24h: raw?.priceChange24h,
+              circulatingSupply: raw?.circSupply,
+              totalSupply: raw?.totalSupply,
+            });
+          } catch (e) {
+            log.warn(`Failed to add token to tracked list: ${candidate.mint}`);
+          }
 
-        const lifecycleResult: TokenLifecycleResult | undefined = lifecycleValidation.tradable
-          .concat(lifecycleValidation.notTradable)
-          .find((lc) => lc.mint === candidate.mint);
+          const lifecycleResult: TokenLifecycleResult | undefined =
+            lifecycleValidation.tradable
+              .concat(lifecycleValidation.notTradable)
+              .find((lc) => lc.mint === candidate.mint);
 
-        if (lifecycleResult) {
-          return {
-            ...candidate,
-            lifecycleStage: lifecycleResult.stage,
-            lifecycleValidated: true,
-            isTradable: lifecycleResult.isTradable,
-            hasLiquidity: lifecycleResult.hasLiquidity,
-            liquiditySOL: lifecycleResult.liquiditySOL,
-            poolAddress: lifecycleResult.poolAddress,
-          };
-        }
-        return { ...candidate, lifecycleValidated: false };
-      });
+          if (lifecycleResult) {
+            return {
+              ...candidate,
+              lifecycleStage: lifecycleResult.stage,
+              lifecycleValidated: true,
+              isTradable: lifecycleResult.isTradable,
+              hasLiquidity: lifecycleResult.hasLiquidity,
+              liquiditySOL: lifecycleResult.liquiditySOL,
+              ...(candidate.liquidity != null && {
+                liquidityUSD: candidate.liquidity,
+              }),
+              ...(candidate.launchLiquiditySOL != null && {
+                launchLiquiditySOL:
+                  candidate.launchLiquiditySOL ?? lifecycleResult.liquiditySOL,
+              }),
+              poolAddress: lifecycleResult.poolAddress,
+            };
+          }
+          return { ...candidate, lifecycleValidated: false };
+        },
+      );
 
-      const tradableCandidates = validatedCandidates.filter((t) => t.isTradable);
-      const notTradableTokens = validatedCandidates.filter((t) => !t.isTradable);
+      const tradableCandidates = validatedCandidates.filter(
+        (t) => t.isTradable,
+      );
+      const notTradableTokens = validatedCandidates.filter(
+        (t) => !t.isTradable,
+      );
 
       log.info(
-        `✅ Tradability validation complete: ${tradableCandidates.length} tradable on Jupiter, ${notTradableTokens.length} not yet tradable`
+        `✅ Tradability validation complete: ${tradableCandidates.length} tradable on Jupiter, ${notTradableTokens.length} not yet tradable`,
       );
 
       io.emit("tokenFeed", {
@@ -263,8 +292,13 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
 
       // New mints → DB watchlist entry + auto-buy trigger if tradable
       for (const tk of validatedCandidates) {
-        if (!tk.mint || currentMints.has(tk.mint)) continue;
-        currentMints.add(tk.mint);
+        if (!tk.mint) continue;
+        const isNewTradable = tk.isTradable && !currentMints.has(tk.mint);
+        // Keep rechecking non-tradable tokens until a Jupiter route appears;
+        // only a token that has already triggered its tradable transition is
+        // suppressed on later polling cycles.
+        if (tk.isTradable && !isNewTradable) continue;
+        if (isNewTradable) currentMints.add(tk.mint);
 
         // Use Jupiter's own USD mcap directly rather than round-tripping
         // through marketCapSol (itself already derived from this same USD
@@ -276,9 +310,9 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
 
         if (tk.isTradable) {
           log.info(
-            `🚀 TRADABLE ON JUPITER: ${tk.symbol} (${tk.mint.slice(0, 8)}...) | Liquidity: $${
-              tk.liquidity?.toFixed(0)
-            } | Pool: ${tk.poolAddress?.slice(0, 8)}...`
+            `🚀 TRADABLE ON JUPITER: ${tk.symbol} (${tk.mint.slice(0, 8)}...) | Liquidity: $${tk.liquidity?.toFixed(
+              0,
+            )} | Pool: ${tk.poolAddress?.slice(0, 8)}...`,
           );
 
           await dbService.upsertTokenState({
@@ -288,9 +322,25 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
             state: "TRADABLE",
             source: "jupiter",
             marketCapUSD,
+            ...(tk.launchMarketCapUSD != null && {
+              launchMarketCapUSD: tk.launchMarketCapUSD,
+            }),
+            ...(tk.launchMarketCapSOL != null && {
+              launchMarketCapSOL: tk.launchMarketCapSOL,
+            }),
             jupiterTradable: true,
             liquiditySOL: tk.liquiditySOL || 0,
             liquidityUSD: tk.liquidity || 0,
+            ...(tk.launchLiquiditySOL != null && {
+              launchLiquiditySOL: tk.launchLiquiditySOL,
+            }),
+            ...(tk.launchLiquidityUSD != null && {
+              launchLiquidityUSD: tk.launchLiquidityUSD,
+            }),
+            ...(tk.pairCreatedAt && {
+              poolCreatedAt: new Date(tk.pairCreatedAt),
+            }),
+            launchSnapshotAt: new Date(),
             poolAddress: tk.poolAddress || "",
             ...(byMint.get(tk.mint)?.devAddress
               ? { creatorAddress: byMint.get(tk.mint)!.devAddress! }
@@ -299,14 +349,20 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
             detectedAt: new Date(),
           });
 
-          registerAutoBuyCandidate(io, tk).catch((e: any) => {
-            const emsg =
-              e && typeof e === "object" && "message" in e ? (e as any).message : String(e);
-            log.error(`registerAutoBuyCandidate failed: ${emsg}`);
-          });
+          if (!(await claimMint(tk.mint))) continue;
+          registerAutoBuyCandidate(io, tk)
+            .then(() => completeMint(tk.mint))
+            .catch(async (e: any) => {
+              await releaseMint(tk.mint);
+              const emsg =
+                e && typeof e === "object" && "message" in e
+                  ? (e as any).message
+                  : String(e);
+              log.error(`registerAutoBuyCandidate failed: ${emsg}`);
+            });
         } else {
           log.debug(
-            `📋 WATCHLIST: ${tk.symbol} (${tk.mint.slice(0, 8)}...) - discovered, not yet tradable`
+            `📋 WATCHLIST: ${tk.symbol} (${tk.mint.slice(0, 8)}...) - discovered, not yet tradable`,
           );
 
           await dbService.upsertTokenState({
@@ -316,7 +372,20 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
             state: "DISCOVERED",
             source: "jupiter",
             marketCapUSD,
+            ...(tk.launchMarketCapUSD != null && {
+              launchMarketCapUSD: tk.launchMarketCapUSD,
+            }),
+            ...(tk.launchMarketCapSOL != null && {
+              launchMarketCapSOL: tk.launchMarketCapSOL,
+            }),
             jupiterTradable: false,
+            ...(tk.launchLiquidityUSD != null && {
+              launchLiquidityUSD: tk.launchLiquidityUSD,
+            }),
+            ...(tk.pairCreatedAt && {
+              poolCreatedAt: new Date(tk.pairCreatedAt),
+            }),
+            launchSnapshotAt: new Date(),
             ...(byMint.get(tk.mint)?.devAddress
               ? { creatorAddress: byMint.get(tk.mint)!.devAddress! }
               : {}),
@@ -332,14 +401,19 @@ export function startTokenWatcher(io: Server, opts?: { intervalMs?: number }) {
       }
     } catch (err) {
       const msg =
-        err && typeof err === "object" && "message" in err ? (err as any).message : String(err);
+        err && typeof err === "object" && "message" in err
+          ? (err as any).message
+          : String(err);
       log.error(`Token watcher tick failed: ${msg}`);
     }
   };
 
   const handle = setInterval(tick, intervalMs);
   tick().catch((e: any) => {
-    const msg = e && typeof e === "object" && "message" in e ? (e as any).message : String(e);
+    const msg =
+      e && typeof e === "object" && "message" in e
+        ? (e as any).message
+        : String(e);
     log.warn(`Initial token tick failed: ${msg}`);
   });
 

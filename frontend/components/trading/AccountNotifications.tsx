@@ -105,6 +105,20 @@ export const AccountNotifications: React.FC = () => {
 
     // Trade errors — reasons a buy was skipped or force-exited for this wallet
     if (event === "tradeError") {
+      const launchMetrics = payload?.launchMetrics;
+      const limits = payload?.limits;
+      const message =
+        payload?.type === "launch_metrics_out_of_range" &&
+        launchMetrics &&
+        limits
+          ? `Launch limits rejected token: MC ${Number(
+              launchMetrics.marketCapSOL
+            ).toFixed(2)} SOL / $${Number(launchMetrics.marketCapUSD).toFixed(
+              0
+            )}, liquidity ${Number(launchMetrics.liquiditySOL).toFixed(
+              2
+            )} SOL / $${Number(launchMetrics.liquidityUSD).toFixed(0)}`
+          : payload?.reason || payload?.message || "Trade error occurred";
       setAlerts((prev) => [
         ...prev,
         {
@@ -113,7 +127,7 @@ export const AccountNotifications: React.FC = () => {
             payload.type === "test_sell_failed_emergency_exit"
               ? "emergency"
               : "error",
-          message: payload.message || "Trade error occurred",
+          message,
           timestamp: Date.now(),
         },
       ]);
@@ -168,10 +182,10 @@ export const AccountNotifications: React.FC = () => {
               alert.type === "emergency"
                 ? "bg-red-900/90 border-red-500 text-red-100"
                 : alert.type === "error"
-                ? "bg-orange-900/90 border-orange-500 text-orange-100"
-                : alert.type === "success"
-                ? "bg-green-900/90 border-green-500 text-green-100"
-                : "bg-yellow-900/90 border-yellow-500 text-yellow-100"
+                  ? "bg-orange-900/90 border-orange-500 text-orange-100"
+                  : alert.type === "success"
+                    ? "bg-green-900/90 border-green-500 text-green-100"
+                    : "bg-yellow-900/90 border-yellow-500 text-yellow-100"
             }`}
           >
             <div className="flex items-start gap-3">

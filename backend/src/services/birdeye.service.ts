@@ -47,7 +47,10 @@ class BirdeyeService {
   /**
    * Runs an axios call through a shared rate gate, retrying with backoff on 429.
    */
-  private async throttledRequest<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+  private async throttledRequest<T>(
+    fn: () => Promise<T>,
+    retries = 2,
+  ): Promise<T> {
     const wait = this.lastRequestAt + this.MIN_REQUEST_SPACING_MS - Date.now();
     if (wait > 0) {
       await new Promise((resolve) => setTimeout(resolve, wait));
@@ -73,10 +76,10 @@ class BirdeyeService {
    */
   async checkMarketHealth(
     tokenMint: string,
-    buyAmountSol: number
+    buyAmountSol: number,
   ): Promise<BirdeyeMarketHealth> {
     LOG.info(
-      `📊 Running Birdeye market health check for ${tokenMint.slice(0, 8)}...`
+      `📊 Running Birdeye market health check for ${tokenMint.slice(0, 8)}...`,
     );
 
     try {
@@ -88,7 +91,7 @@ class BirdeyeService {
             "x-chain": "solana",
           },
           timeout: 10000,
-        })
+        }),
       );
 
       const data = response.data?.data;
@@ -114,9 +117,11 @@ class BirdeyeService {
       // Calculate price impact for buy size
       const priceImpact = this.calculatePriceImpact(
         data.liquidity,
-        buyAmountSol
+        buyAmountSol,
       );
-      const maxPriceImpactPct = Number(process.env.PIPELINE_MAX_PRICE_IMPACT_PCT ?? 30);
+      const maxPriceImpactPct = Number(
+        process.env.PIPELINE_MAX_PRICE_IMPACT_PCT ?? 30,
+      );
       if (priceImpact > maxPriceImpactPct) {
         reasons.push(`Price impact too high: ${priceImpact.toFixed(2)}%`);
         isHealthy = false;
@@ -130,11 +135,13 @@ class BirdeyeService {
       // never actually read anywhere in the code.
       const fdv = data.fdv || 0;
       const liquidity = data.liquidity || 0;
-      const maxFdvToLpRatio = Number(process.env.PIPELINE_MAX_FDV_TO_LP_RATIO ?? 1_500_000);
+      const maxFdvToLpRatio = Number(
+        process.env.PIPELINE_MAX_FDV_TO_LP_RATIO ?? 1_500_000,
+      );
       const fdvToLpRatio = liquidity > 0 ? fdv / liquidity : Infinity;
       if (fdvToLpRatio > maxFdvToLpRatio) {
         reasons.push(
-          `FDV/LP ratio too high: ${fdv} / ${liquidity} SOL = ${fdvToLpRatio.toFixed(0)} > ${maxFdvToLpRatio}`
+          `FDV/LP ratio too high: ${fdv} / ${liquidity} SOL = ${fdvToLpRatio.toFixed(0)} > ${maxFdvToLpRatio}`,
         );
         isHealthy = false;
       }
@@ -144,7 +151,9 @@ class BirdeyeService {
       const volume5m = data.v5mUSD || 0;
       const minVolume5m = Number(process.env.PIPELINE_MIN_VOLUME_5M_SOL ?? 1);
       if (volume5m < minVolume5m) {
-        reasons.push(`Volume too low: $${volume5m.toFixed(2)} in last 5 minutes`);
+        reasons.push(
+          `Volume too low: $${volume5m.toFixed(2)} in last 5 minutes`,
+        );
         isHealthy = false;
       }
 
@@ -175,8 +184,8 @@ class BirdeyeService {
         LOG.warn(
           `❌ Market health check FAILED for ${tokenMint.slice(
             0,
-            8
-          )}: ${reasons.join(", ")}`
+            8,
+          )}: ${reasons.join(", ")}`,
         );
       }
 
@@ -213,7 +222,7 @@ class BirdeyeService {
    */
   async getPnLData(
     tokenMint: string,
-    entryPrice: number
+    entryPrice: number,
   ): Promise<BirdeyePnLData> {
     // No try/catch fallback here on purpose: this feeds a live, real-money
     // PnL display (LivePnL.tsx via pnlTracker.service.ts). A caught error used
@@ -237,7 +246,7 @@ class BirdeyeService {
           "X-API-KEY": this.apiKey,
         },
         timeout: 5000,
-      })
+      }),
     );
 
     const data = response.data?.data;
@@ -264,6 +273,26 @@ class BirdeyeService {
     };
   }
 
+  async getCurrentPrice(tokenMint: string): Promise<number | null> {
+    try {
+      const response = await this.throttledRequest(() =>
+        axios.get(`${this.baseUrl}/defi/price`, {
+          params: { address: tokenMint },
+          headers: { "X-API-KEY": this.apiKey },
+          timeout: 5000,
+        }),
+      );
+      const price = Number(response.data?.data?.value);
+      return Number.isFinite(price) && price > 0 ? price : null;
+    } catch (err: any) {
+      LOG.debug(
+        { tokenMint, err: err?.message },
+        "Birdeye price fallback failed",
+      );
+      return null;
+    }
+  }
+
   /**
    * Historical price series, used by strategies (momentum, breakout, mean-reversion)
    * to evaluate tokens that already have an established trading history rather than
@@ -271,7 +300,7 @@ class BirdeyeService {
    */
   async getPriceHistory(
     tokenMint: string,
-    options: { intervalMinutes?: number; lookbackMinutes?: number } = {}
+    options: { intervalMinutes?: number; lookbackMinutes?: number } = {},
   ): Promise<BirdeyePriceHistoryPoint[]> {
     const { intervalMinutes = 15, lookbackMinutes = 6 * 60 } = options;
     const typeByMinutes: Record<number, string> = {
@@ -302,7 +331,7 @@ class BirdeyeService {
             "x-chain": "solana",
           },
           timeout: 8000,
-        })
+        }),
       );
 
       const items = response.data?.data?.items;
@@ -311,12 +340,12 @@ class BirdeyeService {
       return items
         .filter(
           (it: any) =>
-            typeof it?.value === "number" && typeof it?.unixTime === "number"
+            typeof it?.value === "number" && typeof it?.unixTime === "number",
         )
         .map((it: any) => ({ timestamp: it.unixTime, price: it.value }));
     } catch (error: any) {
       LOG.debug(
-        `Price history unavailable for ${tokenMint.slice(0, 8)}: ${error.message}`
+        `Price history unavailable for ${tokenMint.slice(0, 8)}: ${error.message}`,
       );
       return [];
     }

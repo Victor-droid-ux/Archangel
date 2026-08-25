@@ -14,11 +14,12 @@ export interface TraderConfig {
     maxMarketCapSol?: number;
     minMarketCapUsd?: number;
     maxMarketCapUsd?: number;
+    minLiquiditySol?: number;
+    maxLiquiditySol?: number;
+    minLiquidityUsd?: number;
+    maxLiquidityUsd?: number;
     takeProfitPct?: number;
     stopLossPct?: number;
-    /** @deprecated use maxTokenAgeSeconds */
-    maxTokenAgeHours?: number;
-    maxTokenAgeSeconds?: number;
     minSecondsSinceLaunch?: number;
     maxSecondsSinceLaunch?: number;
     minTokenScore?: number;
@@ -32,6 +33,12 @@ export interface TraderConfig {
     [mint: string]: {
       minMarketCapSol?: number;
       maxMarketCapSol?: number;
+      minMarketCapUsd?: number;
+      maxMarketCapUsd?: number;
+      minLiquiditySol?: number;
+      maxLiquiditySol?: number;
+      minLiquidityUsd?: number;
+      maxLiquidityUsd?: number;
       takeProfitPct?: number;
       stopLossPct?: number;
       entryPriceSol?: number;

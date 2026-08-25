@@ -11,7 +11,6 @@ let runtimeConfig = {
   maxMarketCapSol: Number(process.env.MAX_MARKETCAP_SOL ?? 1000000),
   minMarketCapUsd: Number(process.env.MIN_MARKETCAP_USD ?? 1000),
   maxMarketCapUsd: Number(process.env.MAX_MARKETCAP_USD ?? 200000000),
-  maxTokenAgeHours: Number(process.env.MAX_TOKEN_AGE_HOURS ?? 24),
   minTokenScore: Number(process.env.MIN_TOKEN_SCORE ?? 30),
   takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
   // Must match monitor.service.ts's DEFAULT_SL_PCT fallback (0.3) — the 0.02
@@ -55,9 +54,6 @@ router.patch("/", (req: Request, res: Response) => {
     }
     if (typeof updates.maxMarketCapUsd === "number") {
       runtimeConfig.maxMarketCapUsd = updates.maxMarketCapUsd;
-    }
-    if (typeof updates.maxTokenAgeHours === "number") {
-      runtimeConfig.maxTokenAgeHours = updates.maxTokenAgeHours;
     }
     if (typeof updates.minTokenScore === "number") {
       runtimeConfig.minTokenScore = updates.minTokenScore;
@@ -106,10 +102,9 @@ router.post("/reset", (req: Request, res: Response) => {
       maxMarketCapSol: Number(process.env.MAX_MARKETCAP_SOL ?? 1000000),
       minMarketCapUsd: Number(process.env.MIN_MARKETCAP_USD ?? 1000),
       maxMarketCapUsd: Number(process.env.MAX_MARKETCAP_USD ?? 200000000),
-      maxTokenAgeHours: Number(process.env.MAX_TOKEN_AGE_HOURS ?? 24),
       minTokenScore: Number(process.env.MIN_TOKEN_SCORE ?? 30),
       takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
-      stopLossPct: Number(process.env.SL_PCT ?? 0.02),
+      stopLossPct: Number(process.env.SL_PCT ?? 0.3),
     };
 
     log.info("Configuration reset to environment defaults");

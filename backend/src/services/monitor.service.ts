@@ -16,6 +16,8 @@ import pnlTrackerService from "./pnlTracker.service.js";
 import userWalletService from "./userWallet.service.js";
 import { loadKeypairFromEnv } from "./solana.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
+import { getEffectiveConfig } from "./traderConfig.service.js";
+import birdeyeService from "./birdeye.service.js";
 
 const OPERATOR_WALLET =
   process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
@@ -29,7 +31,7 @@ const OPERATOR_WALLET =
  * loudly rather than silently skipped, since that needs a human to notice.
  */
 async function resolveSignerForPosition(
-  ownerWallet: string
+  ownerWallet: string,
 ): Promise<Keypair | null> {
   if (ownerWallet === OPERATOR_WALLET) {
     return loadKeypairFromEnv();
@@ -43,10 +45,8 @@ async function resolveSignerForPosition(
 // route" in advance. Rather than guessing, this backs off the retry
 // frequency (and the alert spam) after enough consecutive failures, while
 // still trying occasionally in case liquidity genuinely comes back.
-const SELL_BACKOFF_THRESHOLD = 5; // consecutive failures before slowing down
-const SELL_BACKOFF_INTERVAL_MS = 30 * 60 * 1000; // 30 min between attempts once backed off
-// Once backed off, only re-alert every Nth backed-off attempt (~6h at the
-// 30-minute interval above) instead of every single one.
+const SELL_BACKOFF_BASE_INTERVAL_MS = 5_000;
+const SELL_BACKOFF_MAX_INTERVAL_MS = 60_000;
 const SELL_NOTIFY_EVERY_N_BACKED_OFF_ATTEMPTS = 12;
 
 /** True if this position is in backoff cooldown and this tick should skip
@@ -56,11 +56,15 @@ function isSellInBackoffCooldown(pos: {
   lastSellAttemptAt?: Date | string | null;
 }): boolean {
   const failures = pos.sellFailureCount ?? 0;
-  if (failures < SELL_BACKOFF_THRESHOLD) return false;
+  if (failures <= 0) return false;
   const last = pos.lastSellAttemptAt
     ? new Date(pos.lastSellAttemptAt).getTime()
     : 0;
-  return Date.now() - last < SELL_BACKOFF_INTERVAL_MS;
+  const interval = Math.min(
+    SELL_BACKOFF_MAX_INTERVAL_MS,
+    SELL_BACKOFF_BASE_INTERVAL_MS * 2 ** Math.max(0, failures - 1),
+  );
+  return Date.now() - last < interval;
 }
 
 /** Records a failed sell attempt and returns whether this specific failure
@@ -69,7 +73,7 @@ function isSellInBackoffCooldown(pos: {
 async function recordSellFailure(
   tokenMint: string,
   wallet: string,
-  currentFailureCount: number | undefined
+  currentFailureCount: number | undefined,
 ): Promise<{ newCount: number; shouldNotify: boolean }> {
   const newCount = (currentFailureCount ?? 0) + 1;
   await dbService.updatePositionMetadata(tokenMint, wallet, {
@@ -78,17 +82,16 @@ async function recordSellFailure(
   });
   const shouldNotify =
     newCount <= 1 ||
-    (newCount >= SELL_BACKOFF_THRESHOLD &&
-      (newCount - SELL_BACKOFF_THRESHOLD) %
-        SELL_NOTIFY_EVERY_N_BACKED_OFF_ATTEMPTS ===
-        0);
+    newCount === 1 ||
+    (newCount > 1 &&
+      (newCount - 1) % SELL_NOTIFY_EVERY_N_BACKED_OFF_ATTEMPTS === 0);
   return { newCount, shouldNotify };
 }
 
 /** Clears the failure streak after any successful sell for this position. */
 async function recordSellSuccess(
   tokenMint: string,
-  wallet: string
+  wallet: string,
 ): Promise<void> {
   await dbService.updatePositionMetadata(tokenMint, wallet, {
     sellFailureCount: 0,
@@ -107,15 +110,8 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const DEFAULT_TP_PCT = Number(process.env.TP_PCT ?? 0.1);
 // 30% default — meaningfully wider than the ~2.4-2.7% round-trip price-impact
 // "noise floor" measured on these thin/fresh pools, and in line with typical
-// sniper-bot SL sizing for freshly-launched tokens (see SL_GRACE_PERIOD_MS
-// below for the other half of this fix).
+// sniper-bot SL sizing for freshly-launched tokens.
 const DEFAULT_SL_PCT = Number(process.env.SL_PCT ?? 0.3);
-
-// Don't evaluate TP/SL/emergency-exit at all until a position has been open
-// this long. A fair-value price feed still has some settling/staleness right
-// at the moment of entry, and this is a second, independent guard against
-// stopping out on noise rather than a real move.
-const SL_GRACE_PERIOD_MS = Number(process.env.SL_GRACE_PERIOD_MS ?? 20_000);
 
 // Tiered profit-taking: sell a fixed slice of the remaining position each time
 // PnL crosses one of these thresholds, locking in gains progressively rather
@@ -156,11 +152,24 @@ type MonitorPosition = Position & {
   trailingActivated?: boolean; // whether trailing is active
 };
 
-// Trailing take-profit configuration - RULE 9
+export type ExitCause = "TP" | "SL" | "TRAILING";
+
+export function resolveExitCause(
+  pnlPercent: number,
+  tpPct: number,
+  slPct: number,
+  trailingTriggered: boolean,
+): ExitCause | null {
+  if (trailingTriggered) return "TRAILING";
+  if (pnlPercent >= tpPct) return "TP";
+  if (pnlPercent <= -slPct) return "SL";
+  return null;
+}
+
 const TRAILING_ACTIVATION_PCT = Number(
-  process.env.TRAILING_ACTIVATION_PCT ?? 0.15
-); // 15% profit to activate trailing
-const TRAILING_STOP_PCT = Number(process.env.TRAILING_STOP_PCT ?? 0.05); // 5% drop from peak to exit
+  process.env.TRAILING_ACTIVATION_PCT ?? 0.15,
+);
+const TRAILING_STOP_PCT = Number(process.env.TRAILING_STOP_PCT ?? 0.05);
 
 /* ------------------------------------------------------------------
    MINT DECIMALS CACHE
@@ -168,7 +177,7 @@ const TRAILING_STOP_PCT = Number(process.env.TRAILING_STOP_PCT ?? 0.05); // 5% d
 
 const mintDecimalsCache = new Map<string, number>();
 
-async function getMintDecimals(mint: string): Promise<number> {
+async function getMintDecimals(mint: string): Promise<number | null> {
   if (mintDecimalsCache.has(mint)) {
     return mintDecimalsCache.get(mint)!;
   }
@@ -176,21 +185,21 @@ async function getMintDecimals(mint: string): Promise<number> {
   try {
     const info = await connection.getParsedAccountInfo(new PublicKey(mint));
     const parsed: any = info.value?.data;
-    const decimals =
-      parsed?.parsed?.info?.decimals ?? parsed?.info?.decimals ?? 9; // fallback
+    const decimals = parsed?.parsed?.info?.decimals ?? parsed?.info?.decimals;
+    if (decimals === undefined || decimals === null) return null;
 
     const n = Number(decimals);
-    const safeDecimals = Number.isFinite(n) ? n : 9;
+    if (!Number.isFinite(n)) return null;
+    const safeDecimals = n;
 
     mintDecimalsCache.set(mint, safeDecimals);
     return safeDecimals;
   } catch (err: any) {
     log.warn(
       { mint, err: err?.message ?? String(err) },
-      "Failed to fetch mint decimals; using 9"
+      "Failed to fetch mint decimals",
     );
-    mintDecimalsCache.set(mint, 9);
-    return 9;
+    return null;
   }
 }
 
@@ -200,7 +209,7 @@ async function getMintDecimals(mint: string): Promise<number> {
 
 export function startPositionMonitor(
   io: Server,
-  opts?: { intervalMs?: number }
+  opts?: { intervalMs?: number },
 ) {
   const intervalMs = opts?.intervalMs ?? 5000;
 
@@ -210,7 +219,7 @@ export function startPositionMonitor(
       DEFAULT_TP_PCT,
       DEFAULT_SL_PCT,
     },
-    "Starting position monitor"
+    "Starting position monitor",
   );
 
   const tick = async () => {
@@ -246,7 +255,7 @@ export function startPositionMonitor(
           // reads as "closed" and the monitor keeps attempting real (fee-costing)
           // sells on economically meaningless dust every single tick, forever.
           const DUST_THRESHOLD_SOL = Number(
-            process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
+            process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005,
           );
           if (!pos.netSol || pos.netSol < DUST_THRESHOLD_SOL) continue;
 
@@ -258,33 +267,28 @@ export function startPositionMonitor(
             continue;
           }
 
-          // Grace period: don't evaluate TP/SL/emergency-exit at all until the
-          // position has been open long enough for the price feed to settle.
-          // See SL_GRACE_PERIOD_MS above for why this exists alongside the
-          // fair-value price fix below — belt and suspenders against stopping
-          // out on noise at the moment of entry rather than a real move.
-          if (pos.firstBuyAt) {
-            const ageMs = Date.now() - new Date(pos.firstBuyAt).getTime();
-            if (ageMs < SL_GRACE_PERIOD_MS) {
-              log.debug(
-                { tokenMint, ageMs, graceMs: SL_GRACE_PERIOD_MS },
-                "Skipping TP/SL check: position still within entry grace period"
-              );
-              continue;
-            }
-          }
-
-          // Per-position overrides if you ever add them to DB
+          const walletConfig = await getEffectiveConfig(pos.wallet, tokenMint);
           const tpPct =
-            typeof pos.tpPct === "number" ? pos.tpPct : DEFAULT_TP_PCT;
+            typeof pos.tpPct === "number"
+              ? pos.tpPct
+              : walletConfig.takeProfitPct;
           const slPct =
-            typeof pos.slPct === "number" ? pos.slPct : DEFAULT_SL_PCT;
+            typeof pos.slPct === "number"
+              ? pos.slPct
+              : walletConfig.stopLossPct;
 
           // Fetch decimals (cached)
           const decimals =
             typeof pos.decimals === "number"
               ? pos.decimals
               : await getMintDecimals(tokenMint);
+          if (decimals === null) {
+            log.warn(
+              { tokenMint, wallet: pos.wallet },
+              "Skipping position: token decimals unavailable; refusing to guess sell amount",
+            );
+            continue;
+          }
           const base = 10 ** decimals;
 
           // avgBuyPrice = SOL per token, computed by db.service.ts directly from
@@ -294,24 +298,34 @@ export function startPositionMonitor(
           // price, manufacturing a fake PnL that could trigger a real sell.
           // If the real cost basis isn't available, skip this position rather
           // than act on invented data.
-          if (
-            typeof pos.avgBuyPrice !== "number" ||
-            !(pos.avgBuyPrice > 0)
-          ) {
+          let avgBuy = pos.avgBuyPrice;
+          if (typeof avgBuy !== "number" || !(avgBuy > 0)) {
+            avgBuy =
+              (await dbService.recoverPositionCostBasis(
+                tokenMint,
+                pos.wallet,
+              )) ?? undefined;
+            if (avgBuy && Number.isFinite(avgBuy)) {
+              log.warn(
+                { tokenMint, wallet: pos.wallet, avgBuyPrice: avgBuy },
+                "Recovered missing position cost basis from buy history",
+              );
+            }
+          }
+          if (typeof avgBuy !== "number" || !(avgBuy > 0)) {
             log.warn(
-              { tokenMint, avgBuyPrice: pos.avgBuyPrice },
-              "Skipping position: no real avgBuyPrice recorded for this token"
+              { tokenMint, wallet: pos.wallet },
+              "Skipping position: cost basis could not be recovered",
             );
             continue;
           }
-          const avgBuy = pos.avgBuyPrice;
 
           // Estimated token quantity = total SOL exposure / avg buy price
           const estTokenQty = pos.netSol / avgBuy;
           if (!Number.isFinite(estTokenQty) || estTokenQty <= 0) {
             log.debug(
               { tokenMint, netSol: pos.netSol, avgBuy },
-              "Skipping position: invalid estTokenQty"
+              "Skipping position: invalid estTokenQty",
             );
             continue;
           }
@@ -321,7 +335,7 @@ export function startPositionMonitor(
           if (!fullAmountBase || fullAmountBase <= 0) {
             log.debug(
               { tokenMint, estTokenQty, decimals },
-              "Skipping position: zero base amount"
+              "Skipping position: zero base amount",
             );
             continue;
           }
@@ -338,9 +352,18 @@ export function startPositionMonitor(
           // quote, so it doesn't have this bias. Real execution quotes are
           // still fetched fresh at the moment of an actual sell, below.
           const tokenInfo = await getJupiterTokenInfo(tokenMint);
-          if (!tokenInfo || !tokenInfo.usdPrice) continue;
+          const currentUsdPrice =
+            tokenInfo?.usdPrice ||
+            (await birdeyeService.getCurrentPrice(tokenMint));
+          if (!currentUsdPrice) {
+            log.warn(
+              { tokenMint, wallet: pos.wallet },
+              "No trustworthy price; deferring TP/SL evaluation",
+            );
+            continue;
+          }
           const solPriceUsd = await getSolPriceUsd();
-          const currentPrice = tokenInfo.usdPrice / solPriceUsd; // SOL per token
+          const currentPrice = currentUsdPrice / solPriceUsd; // SOL per token
 
           const pnlPercent = (currentPrice - avgBuy) / avgBuy;
 
@@ -391,7 +414,7 @@ export function startPositionMonitor(
             tokenMint,
             currentPrice,
             tokenState?.poolAddress || undefined,
-            tokenState?.creatorAddress || undefined
+            tokenState?.creatorAddress || undefined,
           );
 
           if (emergencyCheck.shouldExit) {
@@ -401,7 +424,7 @@ export function startPositionMonitor(
                 reason: emergencyCheck.criticalReason,
                 triggers: emergencyCheck.triggers,
               },
-              "🚨 EMERGENCY EXIT TRIGGERED - SELLING ALL IMMEDIATELY!"
+              "🚨 EMERGENCY EXIT TRIGGERED - SELLING ALL IMMEDIATELY!",
             );
 
             // This is the strongest signal this codebase ever produces that a
@@ -415,7 +438,7 @@ export function startPositionMonitor(
             // and only turned bad later stayed "TRADABLE" forever.
             await dbService.blacklistToken(
               tokenMint,
-              emergencyCheck.criticalReason || "Emergency exit triggered"
+              emergencyCheck.criticalReason || "Emergency exit triggered",
             );
 
             // Emergency sell ALL tokens immediately — using THIS position's
@@ -433,7 +456,7 @@ export function startPositionMonitor(
                 tokenMint,
                 SOL_MINT,
                 fullAmountBase,
-                1000
+                1000,
               );
               const emergencySwap = await executeJupiterSwap({
                 inputMint: tokenMint,
@@ -484,7 +507,7 @@ export function startPositionMonitor(
                     reason: emergencyCheck.criticalReason,
                     signature: emergencySwap.signature,
                   },
-                  "🚨 Emergency exit completed"
+                  "🚨 Emergency exit completed",
                 );
               } else {
                 log.error(
@@ -492,21 +515,21 @@ export function startPositionMonitor(
                     tokenMint,
                     error: emergencySwap.error,
                   },
-                  "Emergency exit swap failed!"
+                  "Emergency exit swap failed!",
                 );
 
                 const { newCount, shouldNotify } = await recordSellFailure(
                   tokenMint,
                   pos.wallet,
-                  pos.sellFailureCount
+                  pos.sellFailureCount,
                 );
                 if (shouldNotify) {
                   notify
                     .notifyError({
                       source: "position-monitor",
                       message: `Emergency exit failed for ${tokenMint}${
-                        newCount >= SELL_BACKOFF_THRESHOLD
-                          ? ` (${newCount} consecutive failures — backing off to a 30-minute retry interval)`
+                        newCount > 1
+                          ? ` (${newCount} consecutive failures — retrying with bounded backoff)`
                           : ""
                       }`,
                       details: {
@@ -524,20 +547,28 @@ export function startPositionMonitor(
 
           // ✨ RULE 9: TIERED PROFIT TARGETS (30% at +40%, +80%, +150%)
           const remainingPct = pos.remainingPct ?? 100; // Track remaining position %
+          if (remainingPct <= 0) {
+            log.debug(
+              { tokenMint, wallet: pos.wallet, remainingPct },
+              "Skipping position: no remaining amount to sell",
+            );
+            continue;
+          }
 
           // Check for tiered profit target triggers
           let shouldSellTiered = false;
+          let tieredSellSucceeded = false;
           let sellPercent = 0;
           let tierReason = "";
 
-          if (!pos.soldAt40 && pnlPercent >= TIER1_PROFIT_PCT && remainingPct > 0) {
+          if (
+            !pos.soldAt40 &&
+            pnlPercent >= TIER1_PROFIT_PCT &&
+            remainingPct > 0
+          ) {
             shouldSellTiered = true;
             sellPercent = TIER_SELL_PCT;
             tierReason = `Tier 1: +${(TIER1_PROFIT_PCT * 100).toFixed(0)}% profit`;
-            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
-              soldAt40: true,
-              remainingPct: remainingPct - TIER_SELL_PCT,
-            });
           } else if (
             !pos.soldAt80 &&
             pnlPercent >= TIER2_PROFIT_PCT &&
@@ -546,10 +577,6 @@ export function startPositionMonitor(
             shouldSellTiered = true;
             sellPercent = TIER_SELL_PCT;
             tierReason = `Tier 2: +${(TIER2_PROFIT_PCT * 100).toFixed(0)}% profit`;
-            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
-              soldAt80: true,
-              remainingPct: remainingPct - TIER_SELL_PCT,
-            });
           } else if (
             !pos.soldAt150 &&
             pnlPercent >= TIER3_PROFIT_PCT &&
@@ -558,16 +585,12 @@ export function startPositionMonitor(
             shouldSellTiered = true;
             sellPercent = TIER_SELL_PCT;
             tierReason = `Tier 3: +${(TIER3_PROFIT_PCT * 100).toFixed(0)}% profit`;
-            await dbService.updatePositionMetadata(tokenMint, pos.wallet, {
-              soldAt150: true,
-              remainingPct: remainingPct - TIER_SELL_PCT,
-            });
           }
 
           // Execute tiered sell if triggered
           if (shouldSellTiered) {
             const sellAmountBase = Math.floor(
-              fullAmountBase * (sellPercent / 100)
+              fullAmountBase * (sellPercent / 100),
             );
 
             log.info(
@@ -578,7 +601,7 @@ export function startPositionMonitor(
                 tierReason,
                 remainingPct: remainingPct - sellPercent,
               },
-              `🎯 Tiered profit target hit: ${tierReason}. Selling ${sellPercent}%`
+              `🎯 Tiered profit target hit: ${tierReason}. Selling ${sellPercent}%`,
             );
 
             const useRealSwap = process.env.USE_REAL_SWAP === "true";
@@ -594,14 +617,15 @@ export function startPositionMonitor(
                   tokenMint,
                   SOL_MINT,
                   sellAmountBase,
-                  Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100
+                  Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
                 );
                 const tieredSwap = await executeJupiterSwap({
                   inputMint: tokenMint,
                   outputMint: SOL_MINT,
                   amount: sellAmountBase,
                   userPublicKey: tieredSigner.publicKey.toBase58(),
-                  slippageBps: Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
+                  slippageBps:
+                    Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
                   signer: tieredSigner,
                 });
 
@@ -622,7 +646,20 @@ export function startPositionMonitor(
                   };
 
                   await dbService.addTrade(tieredTrade);
+                  await dbService.updatePositionMetadata(
+                    tokenMint,
+                    pos.wallet,
+                    {
+                      ...(tierReason.startsWith("Tier 1")
+                        ? { soldAt40: true }
+                        : tierReason.startsWith("Tier 2")
+                          ? { soldAt80: true }
+                          : { soldAt150: true }),
+                      remainingPct: remainingPct - sellPercent,
+                    },
+                  );
                   await recordSellSuccess(tokenMint, pos.wallet);
+                  tieredSellSucceeded = true;
 
                   emitToWalletOrGlobal(io, pos.wallet, "tradeFeed", {
                     ...tieredTrade,
@@ -640,29 +677,33 @@ export function startPositionMonitor(
                       sellPercent,
                       signature: tieredSwap.signature,
                     },
-                    "✅ Tiered profit sell executed"
+                    "✅ Tiered profit sell executed",
                   );
                 } else {
                   log.error(
                     { tokenMint, error: tieredSwap.error },
-                    "Tiered profit sell failed"
+                    "Tiered profit sell failed",
                   );
 
                   const { newCount, shouldNotify } = await recordSellFailure(
                     tokenMint,
                     pos.wallet,
-                    pos.sellFailureCount
+                    pos.sellFailureCount,
                   );
                   if (shouldNotify) {
                     notify
                       .notifyError({
                         source: "position-monitor",
                         message: `Tiered profit sell failed for ${tokenMint}${
-                          newCount >= SELL_BACKOFF_THRESHOLD
-                            ? ` (${newCount} consecutive failures — backing off to a 30-minute retry interval)`
+                          newCount > 1
+                            ? ` (${newCount} consecutive failures — retrying with bounded backoff)`
                             : ""
                         }`,
-                        details: { error: tieredSwap.error, tierReason, sellPercent },
+                        details: {
+                          error: tieredSwap.error,
+                          tierReason,
+                          sellPercent,
+                        },
                       })
                       .catch(() => {});
                   }
@@ -670,6 +711,8 @@ export function startPositionMonitor(
               }
             }
           }
+
+          if (tieredSellSucceeded) continue;
 
           // Check trailing stop for LAST 10% of position
           const isLastTenPercent = remainingPct <= 10;
@@ -679,15 +722,21 @@ export function startPositionMonitor(
             newHighest - pnlPercent >= TRAILING_STOP_PCT;
 
           // Check TP/SL triggers (including trailing for final 10%)
-          if (
-            pnlPercent <= -slPct || // Stop loss
-            (isLastTenPercent && trailingStopForFinal) // Trailing stop for last 10%
-          ) {
-            const exitReason = trailingStopForFinal
-              ? `Trailing stop on final 10% (peak: ${(newHighest * 100).toFixed(
-                  1
-                )}%, current: ${(pnlPercent * 100).toFixed(1)}%)`
-              : `Stop loss (${(pnlPercent * 100).toFixed(1)}%)`;
+          const exitCause = resolveExitCause(
+            pnlPercent,
+            tpPct,
+            slPct,
+            isLastTenPercent && trailingStopForFinal,
+          );
+          if (exitCause) {
+            const exitReason =
+              exitCause === "TRAILING"
+                ? `Trailing stop on final 10% (peak: ${(
+                    newHighest * 100
+                  ).toFixed(1)}%, current: ${(pnlPercent * 100).toFixed(1)}%)`
+                : exitCause === "TP"
+                  ? `Take profit (${(pnlPercent * 100).toFixed(1)}%)`
+                  : `Stop loss (${(pnlPercent * 100).toFixed(1)}%)`;
             log.info(
               {
                 tokenMint,
@@ -700,14 +749,14 @@ export function startPositionMonitor(
                 remainingPct,
                 exitReason,
               },
-              `Position exit triggered: ${exitReason}. Executing auto-sell.`
+              `Position exit triggered: ${exitReason}. Executing auto-sell.`,
             );
 
             const useRealSwap = process.env.USE_REAL_SWAP === "true";
 
             // Calculate remaining position to sell (based on remainingPct)
             const sellAmountBase = Math.floor(
-              fullAmountBase * (remainingPct / 100)
+              fullAmountBase * (remainingPct / 100),
             );
 
             let swapRes:
@@ -722,7 +771,7 @@ export function startPositionMonitor(
               if (!finalSigner) {
                 log.error(
                   { tokenMint, wallet: pos.wallet },
-                  "USE_REAL_SWAP=true but no signer could be resolved for this position's wallet"
+                  "USE_REAL_SWAP=true but no signer could be resolved for this position's wallet",
                 );
                 swapRes = {
                   success: false,
@@ -736,7 +785,7 @@ export function startPositionMonitor(
                     amount: sellAmountBase,
                     remainingPct,
                   },
-                  "Executing final auto-sell"
+                  "Executing final auto-sell",
                 );
                 // addTrade's `amount` is SOL lamports, so record the quoted SOL
                 // proceeds below, not the token amount sold (sellAmountBase).
@@ -744,7 +793,7 @@ export function startPositionMonitor(
                   tokenMint,
                   SOL_MINT,
                   sellAmountBase,
-                  Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100
+                  Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
                 );
                 finalSellSolAmount = Number(finalQuote?.outAmount ?? 0);
                 swapRes = await executeJupiterSwap({
@@ -752,7 +801,8 @@ export function startPositionMonitor(
                   outputMint: SOL_MINT,
                   amount: sellAmountBase,
                   userPublicKey: finalSigner.publicKey.toBase58(),
-                  slippageBps: Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
+                  slippageBps:
+                    Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
                   signer: finalSigner,
                 });
               }
@@ -761,7 +811,7 @@ export function startPositionMonitor(
                 tokenMint,
                 SOL_MINT,
                 sellAmountBase,
-                Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100
+                Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
               );
               finalSellSolAmount = Number(simQuote?.outAmount ?? 0);
               swapRes = {
@@ -776,21 +826,21 @@ export function startPositionMonitor(
                   tokenMint,
                   error: swapRes.error,
                 },
-                "Auto-sell swap failed"
+                "Auto-sell swap failed",
               );
 
               const { newCount, shouldNotify } = await recordSellFailure(
                 tokenMint,
                 pos.wallet,
-                pos.sellFailureCount
+                pos.sellFailureCount,
               );
               if (shouldNotify) {
                 notify
                   .notifyError({
                     source: "position-monitor",
                     message: `Auto-sell failed for ${tokenMint}${
-                      newCount >= SELL_BACKOFF_THRESHOLD
-                        ? ` (${newCount} consecutive failures — backing off to a 30-minute retry interval)`
+                      newCount > 1
+                        ? ` (${newCount} consecutive failures — retrying with bounded backoff)`
                         : ""
                     }`,
                     details: { error: swapRes.error, pnlPercent, tpPct, slPct },
@@ -846,11 +896,14 @@ export function startPositionMonitor(
               signature: saved.signature,
               timestamp: saved.timestamp,
               auto: true,
-              reason: trailingStopForFinal
-                ? "trailing_stop_final"
-                : pnlPercent <= -slPct
-                ? "stop_loss"
-                : "final_exit",
+              reason:
+                exitCause === "TRAILING"
+                  ? "trailing_stop_final"
+                  : exitCause === "TP"
+                    ? "take_profit"
+                    : exitCause === "SL"
+                      ? "stop_loss"
+                      : "final_exit",
               exitReason: exitReason,
               sellPercent: remainingPct,
               remainingPct: 0,
@@ -861,9 +914,14 @@ export function startPositionMonitor(
               {
                 tokenMint,
                 id: saved.id,
-                reason: pnlPercent >= tpPct ? "TP" : "SL",
+                reason:
+                  exitCause === "TRAILING"
+                    ? "Trailing stop"
+                    : exitCause === "TP"
+                      ? "TP"
+                      : "SL",
               },
-              "Auto-sell executed & broadcast"
+              "Auto-sell executed & broadcast",
             );
 
             // Send notification (build object with only defined properties)
@@ -894,8 +952,8 @@ export function startPositionMonitor(
               .catch((notifyErr) =>
                 log.warn(
                   { err: notifyErr },
-                  "Failed to send trade notification"
-                )
+                  "Failed to send trade notification",
+                ),
               );
           }
         } catch (innerErr: any) {
@@ -903,7 +961,7 @@ export function startPositionMonitor(
             {
               err: innerErr?.message ?? String(innerErr),
             },
-            "Monitor inner loop error"
+            "Monitor inner loop error",
           );
 
           // Send error notification for critical monitoring failures
@@ -922,7 +980,7 @@ export function startPositionMonitor(
     } catch (err: any) {
       log.error(
         { err: err?.message ?? String(err) },
-        "Position monitor tick failed"
+        "Position monitor tick failed",
       );
     }
   };
@@ -933,8 +991,8 @@ export function startPositionMonitor(
   tick().catch((e) =>
     log.warn(
       { err: (e as any)?.message ?? String(e) },
-      "Initial monitor tick error"
-    )
+      "Initial monitor tick error",
+    ),
   );
 
   // Allow caller to stop monitor

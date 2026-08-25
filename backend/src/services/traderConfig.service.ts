@@ -32,21 +32,16 @@ export interface TraderConfig {
     maxMarketCapSol?: number;
     minMarketCapUsd?: number;
     maxMarketCapUsd?: number;
+    minLiquiditySol?: number;
+    maxLiquiditySol?: number;
+    minLiquidityUsd?: number;
+    maxLiquidityUsd?: number;
     takeProfitPct?: number;
     stopLossPct?: number;
-    /** @deprecated use maxTokenAgeSeconds — kept only to read pre-existing
-     * stored configs that predate the unit selector; never written anymore. */
-    maxTokenAgeHours?: number;
-    // Normalized internal unit for "how new must a token be to qualify."
-    // The UI lets the user pick seconds/minutes/hours, but everything past
-    // the form always deals in seconds.
-    maxTokenAgeSeconds?: number;
     // "Snipe window" — only buy a token whose age in seconds falls within
-    // [minSecondsSinceLaunch, maxSecondsSinceLaunch]. Independent of
-    // maxTokenAgeSeconds (a ceiling only); this is a tighter min+max band.
+    // [minSecondsSinceLaunch, maxSecondsSinceLaunch].
     minSecondsSinceLaunch?: number;
     maxSecondsSinceLaunch?: number;
-    minTokenScore?: number;
     autoTradeEnabled?: boolean;
     maxTradeAmountSol?: number;
     // Lifetime cap on how many trades the bot may take for this wallet —
@@ -62,8 +57,15 @@ export interface TraderConfig {
     [mint: string]: {
       minMarketCapSol?: number;
       maxMarketCapSol?: number;
+      minMarketCapUsd?: number;
+      maxMarketCapUsd?: number;
+      minLiquiditySol?: number;
+      maxLiquiditySol?: number;
+      minLiquidityUsd?: number;
+      maxLiquidityUsd?: number;
       takeProfitPct?: number;
       stopLossPct?: number;
+      maxTradeAmountSol?: number;
       entryPriceSol?: number;
       triggerMarketCapSol?: number; // MC at which trade should trigger
       autoTrade?: boolean;
@@ -77,7 +79,7 @@ export interface TraderConfig {
  * Get trader configuration
  */
 export async function getTraderConfig(
-  walletAddress: string
+  walletAddress: string,
 ): Promise<TraderConfig | null> {
   try {
     const db = await getDb();
@@ -92,65 +94,28 @@ export async function getTraderConfig(
   }
 }
 
-// Default: env var (seconds) if set, else the old MAX_TOKEN_AGE_HOURS env
-// var converted to seconds, else 24h — matches the pre-existing default so
-// behavior doesn't silently change for anyone who never touched this setting.
-const DEFAULT_MAX_TOKEN_AGE_SECONDS = process.env.MAX_TOKEN_AGE_SECONDS
-  ? Number(process.env.MAX_TOKEN_AGE_SECONDS)
-  : Number(process.env.MAX_TOKEN_AGE_HOURS ?? 24) * 3600;
-
-/**
- * A specific wallet's own "how new must a token be" ceiling, in seconds —
- * each wallet (operator or any custodial user) has its own stored config, so
- * this must be looked up per-wallet rather than assuming one shared value;
- * see autoBuyer.service.ts's per-wallet fan-out loop, the caller. Falls back
- * through: this wallet's stored maxTokenAgeSeconds -> its legacy
- * maxTokenAgeHours (pre-unit-selector configs) -> env default.
- */
-export async function getEffectiveMaxTokenAgeSeconds(
-  walletAddress: string
-): Promise<number> {
-  const config = await getTraderConfig(walletAddress);
-  const g = config?.globalSettings;
-  if (g?.maxTokenAgeSeconds != null && g.maxTokenAgeSeconds > 0) {
-    return g.maxTokenAgeSeconds;
-  }
-  if (g?.maxTokenAgeHours != null && g.maxTokenAgeHours > 0) {
-    return g.maxTokenAgeHours * 3600;
-  }
-  return DEFAULT_MAX_TOKEN_AGE_SECONDS;
-}
-
-// Matches autoBuyer.service.ts's pre-existing hardcoded defaults, so nobody
-// who never touches this setting sees a behavior change.
-const DEFAULT_MIN_SECONDS_SINCE_LAUNCH = Number(
-  process.env.MIN_SECONDS_SINCE_LAUNCH ?? "10"
-);
-const DEFAULT_MAX_SECONDS_SINCE_LAUNCH = Number(
-  process.env.MAX_SECONDS_SINCE_LAUNCH ?? "60"
-);
-
 /**
  * A specific wallet's own "snipe window" — only buy a token whose age in
- * seconds falls within [min, max]. Same per-wallet lookup pattern as
- * getEffectiveMaxTokenAgeSeconds; falls back to the env-configured defaults
- * for a wallet that has never set its own value.
+ * seconds falls within [min, max]. A missing or invalid window disables
+ * auto-buy for that wallet.
  */
 export async function getEffectiveLaunchWindowSeconds(
-  walletAddress: string
-): Promise<{ min: number; max: number }> {
+  walletAddress: string,
+): Promise<{ min: number; max: number } | null> {
   const config = await getTraderConfig(walletAddress);
   const g = config?.globalSettings;
-  return {
-    min:
-      g?.minSecondsSinceLaunch != null && g.minSecondsSinceLaunch >= 0
-        ? g.minSecondsSinceLaunch
-        : DEFAULT_MIN_SECONDS_SINCE_LAUNCH,
-    max:
-      g?.maxSecondsSinceLaunch != null && g.maxSecondsSinceLaunch > 0
-        ? g.maxSecondsSinceLaunch
-        : DEFAULT_MAX_SECONDS_SINCE_LAUNCH,
-  };
+  if (
+    typeof g?.minSecondsSinceLaunch !== "number" ||
+    !Number.isFinite(g.minSecondsSinceLaunch) ||
+    g.minSecondsSinceLaunch < 0 ||
+    typeof g.maxSecondsSinceLaunch !== "number" ||
+    !Number.isFinite(g.maxSecondsSinceLaunch) ||
+    g.maxSecondsSinceLaunch <= 0 ||
+    g.minSecondsSinceLaunch > g.maxSecondsSinceLaunch
+  ) {
+    return null;
+  }
+  return { min: g.minSecondsSinceLaunch, max: g.maxSecondsSinceLaunch };
 }
 
 /**
@@ -159,7 +124,7 @@ export async function getEffectiveLaunchWindowSeconds(
 export async function updateGlobalSettings(
   walletAddress: string,
   settings: TraderConfig["globalSettings"],
-  io?: Server
+  io?: Server,
 ): Promise<TraderConfig | null> {
   try {
     const db = await getDb();
@@ -179,7 +144,7 @@ export async function updateGlobalSettings(
             createdAt: new Date(),
           },
         },
-        { upsert: true, returnDocument: "after" }
+        { upsert: true, returnDocument: "after" },
       );
 
     log.info({ walletAddress, settings }, "Updated global trader settings");
@@ -207,21 +172,26 @@ export async function updateGlobalSettings(
 export async function setAutoTradeEnabled(
   walletAddress: string,
   enabled: boolean,
-  io?: Server
+  io?: Server,
 ): Promise<void> {
   const db = await getDb();
-  const result = await db.collection<TraderConfig>("traderConfigs").findOneAndUpdate(
-    { walletAddress },
-    {
-      $set: { "globalSettings.autoTradeEnabled": enabled, updatedAt: new Date() },
-      $setOnInsert: {
-        walletAddress,
-        tokenSpecificSettings: {},
-        createdAt: new Date(),
+  const result = await db
+    .collection<TraderConfig>("traderConfigs")
+    .findOneAndUpdate(
+      { walletAddress },
+      {
+        $set: {
+          "globalSettings.autoTradeEnabled": enabled,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: {
+          walletAddress,
+          tokenSpecificSettings: {},
+          createdAt: new Date(),
+        },
       },
-    },
-    { upsert: true, returnDocument: "after" }
-  );
+      { upsert: true, returnDocument: "after" },
+    );
   log.info({ walletAddress, enabled }, "Set autoTradeEnabled");
   if (io) {
     io.to(walletAddress).emit("traderConfig:updated", result);
@@ -235,7 +205,7 @@ export async function setTokenConfig(
   walletAddress: string,
   mint: string,
   config: TraderConfig["tokenSpecificSettings"][string],
-  io?: Server
+  io?: Server,
 ): Promise<TraderConfig | null> {
   try {
     const db = await getDb();
@@ -256,12 +226,12 @@ export async function setTokenConfig(
             createdAt: new Date(),
           },
         },
-        { upsert: true, returnDocument: "after" }
+        { upsert: true, returnDocument: "after" },
       );
 
     log.info(
       { walletAddress, mint, config },
-      "Set token-specific configuration"
+      "Set token-specific configuration",
     );
 
     // Emit to frontend
@@ -282,7 +252,7 @@ export async function setTokenConfig(
 export async function removeTokenConfig(
   walletAddress: string,
   mint: string,
-  io?: Server
+  io?: Server,
 ): Promise<TraderConfig | null> {
   try {
     const db = await getDb();
@@ -299,7 +269,7 @@ export async function removeTokenConfig(
             updatedAt: new Date(),
           },
         },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
 
     log.info({ walletAddress, mint }, "Removed token-specific configuration");
@@ -322,12 +292,19 @@ export async function removeTokenConfig(
  */
 export async function getEffectiveConfig(
   walletAddress: string,
-  mint: string
+  mint: string,
 ): Promise<{
   minMarketCapSol: number;
   maxMarketCapSol: number;
+  minMarketCapUsd: number;
+  maxMarketCapUsd: number;
+  minLiquiditySol: number;
+  maxLiquiditySol: number;
+  minLiquidityUsd: number;
+  maxLiquidityUsd: number;
   takeProfitPct: number;
   stopLossPct: number;
+  maxTradeAmountSol: number;
   triggerMarketCapSol?: number;
   autoTrade: boolean;
 }> {
@@ -335,9 +312,18 @@ export async function getEffectiveConfig(
 
   // Default values from environment
   const defaults = {
-    minMarketCapSol: Number(process.env.MIN_MARKETCAP_SOL ?? 5),
+    minMarketCapSol: Number(process.env.MIN_MARKETCAP_SOL ?? 3),
     maxMarketCapSol: Number(process.env.MAX_MARKETCAP_SOL ?? 1000000),
+    minMarketCapUsd: Number(process.env.MIN_MARKETCAP_USD ?? 1000),
+    maxMarketCapUsd: Number(process.env.MAX_MARKETCAP_USD ?? 200000000),
+    minLiquiditySol: Number(process.env.MIN_LIQUIDITY_SOL ?? 0.05),
+    maxLiquiditySol: Number(process.env.MAX_LIQUIDITY_SOL ?? Number.MAX_VALUE),
+    minLiquidityUsd: Number(process.env.MIN_LIQUIDITY_USD ?? 0),
+    maxLiquidityUsd: Number(process.env.MAX_LIQUIDITY_USD ?? Number.MAX_VALUE),
     takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
+    maxTradeAmountSol: Number(
+      process.env.MAX_TRADE_AMOUNT_SOL ?? Number.MAX_VALUE,
+    ),
     // Must match monitor.service.ts's DEFAULT_SL_PCT fallback (0.3) — that
     // 2% figure was the pre-fix default that caused a self-inflicted
     // stop-loss bug (see monitor.service.ts). Both read SL_PCT so they agree
@@ -357,8 +343,15 @@ export async function getEffectiveConfig(
   const result: {
     minMarketCapSol: number;
     maxMarketCapSol: number;
+    minMarketCapUsd: number;
+    maxMarketCapUsd: number;
+    minLiquiditySol: number;
+    maxLiquiditySol: number;
+    minLiquidityUsd: number;
+    maxLiquidityUsd: number;
     takeProfitPct: number;
     stopLossPct: number;
+    maxTradeAmountSol: number;
     triggerMarketCapSol?: number;
     autoTrade: boolean;
   } = {
@@ -370,6 +363,30 @@ export async function getEffectiveConfig(
       tokenSettings.maxMarketCapSol ??
       config.globalSettings.maxMarketCapSol ??
       defaults.maxMarketCapSol,
+    minMarketCapUsd:
+      tokenSettings.minMarketCapUsd ??
+      config.globalSettings.minMarketCapUsd ??
+      defaults.minMarketCapUsd,
+    maxMarketCapUsd:
+      tokenSettings.maxMarketCapUsd ??
+      config.globalSettings.maxMarketCapUsd ??
+      defaults.maxMarketCapUsd,
+    minLiquiditySol:
+      tokenSettings.minLiquiditySol ??
+      config.globalSettings.minLiquiditySol ??
+      defaults.minLiquiditySol,
+    maxLiquiditySol:
+      tokenSettings.maxLiquiditySol ??
+      config.globalSettings.maxLiquiditySol ??
+      defaults.maxLiquiditySol,
+    minLiquidityUsd:
+      tokenSettings.minLiquidityUsd ??
+      config.globalSettings.minLiquidityUsd ??
+      defaults.minLiquidityUsd,
+    maxLiquidityUsd:
+      tokenSettings.maxLiquidityUsd ??
+      config.globalSettings.maxLiquidityUsd ??
+      defaults.maxLiquidityUsd,
     takeProfitPct:
       tokenSettings.takeProfitPct ??
       config.globalSettings.takeProfitPct ??
@@ -378,6 +395,10 @@ export async function getEffectiveConfig(
       tokenSettings.stopLossPct ??
       config.globalSettings.stopLossPct ??
       defaults.stopLossPct,
+    maxTradeAmountSol:
+      tokenSettings.maxTradeAmountSol ??
+      config.globalSettings.maxTradeAmountSol ??
+      defaults.maxTradeAmountSol,
     autoTrade:
       tokenSettings.autoTrade ??
       config.globalSettings.autoTradeEnabled ??
@@ -397,7 +418,7 @@ export async function getEffectiveConfig(
 export async function shouldTriggerTrade(
   walletAddress: string,
   mint: string,
-  currentMarketCapSol: number
+  currentMarketCapSol: number,
 ): Promise<boolean> {
   const effectiveConfig = await getEffectiveConfig(walletAddress, mint);
 
@@ -417,7 +438,7 @@ export async function shouldTriggerTrade(
  * Get all traders with token-specific configurations
  */
 export async function getTradersWithTokenConfig(
-  mint: string
+  mint: string,
 ): Promise<TraderConfig[]> {
   try {
     const db = await getDb();

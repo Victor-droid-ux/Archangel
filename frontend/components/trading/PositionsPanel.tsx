@@ -132,7 +132,9 @@ export const PositionsPanel: React.FC = () => {
                   const pnlColor =
                     pctDisplay >= 0 ? "text-green-400" : "text-red-400";
                   const positionKey = `${p.token}:${p.wallet ?? ""}:${p.custody ?? "legacy"}`;
-                  const trailing = allTrailingData.get(p.token);
+                  const trailing = allTrailingData.get(
+                    `${p.wallet ?? ""}:${p.token}`
+                  );
                   const isExpanded = expanded === positionKey;
 
                   return (

@@ -18,7 +18,8 @@ Expected response:
     "maxMarketCapSol": 1000000,
     "minMarketCapUsd": 1000,
     "maxMarketCapUsd": 200000000,
-    "maxTokenAgeHours": 24,
+    "minSecondsSinceLaunch": 10,
+    "maxSecondsSinceLaunch": 60,
     "minTokenScore": 30,
     "takeProfitPct": 0.1,
     "stopLossPct": 0.02
@@ -44,13 +45,14 @@ Check socket events in frontend console for `config:update` emission.
 
 ---
 
-### 3. Update Token Age Filter
+### 3. Update Launch Window
 
 ```bash
 curl -X PATCH http://localhost:3001/api/config \
   -H "Content-Type: application/json" \
   -d '{
-    "maxTokenAgeHours": 12
+    "minSecondsSinceLaunch": 5,
+    "maxSecondsSinceLaunch": 30
   }'
 ```
 
@@ -189,7 +191,8 @@ curl -X PATCH http://localhost:3001/api/config \
     "minMarketCapSol": 20,
     "maxMarketCapSol": 100000,
     "minTokenScore": 45,
-    "maxTokenAgeHours": 12
+    "minSecondsSinceLaunch": 10,
+    "maxSecondsSinceLaunch": 60
   }'
 ```
 
@@ -206,7 +209,8 @@ curl -X PATCH http://localhost:3001/api/config \
     "minMarketCapSol": 1,
     "maxMarketCapSol": 5000,
     "minTokenScore": 20,
-    "maxTokenAgeHours": 6
+    "minSecondsSinceLaunch": 0,
+    "maxSecondsSinceLaunch": 20
   }'
 ```
 

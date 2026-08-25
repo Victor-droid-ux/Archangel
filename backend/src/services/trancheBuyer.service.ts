@@ -1,10 +1,5 @@
 // backend/src/services/trancheBuyer.service.ts
-import {
-  getJupiterQuote,
-  executeJupiterSwap,
-  getJupiterTokenInfo,
-  getSolPriceUsd,
-} from "./jupiter.service.js";
+import { getJupiterQuote, executeJupiterSwap } from "./jupiter.service.js";
 import { Keypair } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -14,10 +9,9 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 // Previously bare literals with no override anywhere in this file, unlike
 // MAX_SLIPPAGE_PCT just below.
-const PRICE_IMPACT_ABORT_PCT = Number(process.env.TRANCHE_PRICE_IMPACT_ABORT_PCT ?? 15);
-const TEST_SELL_PCT = Number(process.env.TEST_SELL_PCT ?? 0.005);
-const TEST_SELL_SLIPPAGE_BPS = Number(process.env.TEST_SELL_SLIPPAGE_BPS ?? 200);
-const PULLBACK_THRESHOLD_PCT = Number(process.env.PULLBACK_THRESHOLD_PCT ?? 0.02);
+const PRICE_IMPACT_ABORT_PCT = Number(
+  process.env.TRANCHE_PRICE_IMPACT_ABORT_PCT ?? 15,
+);
 
 interface TrancheResult {
   success: boolean;
@@ -35,7 +29,7 @@ async function executeTranche(
   useReal: boolean,
   simLabel: string,
   logLabel: string,
-  signer?: Keypair
+  signer?: Keypair,
 ): Promise<TrancheResult> {
   try {
     const lamports = Math.floor(trancheSol * 1e9);
@@ -44,7 +38,12 @@ async function executeTranche(
 
     // Get quote to estimate token amount with slippage 8-12%
     const slippagePct = Number(process.env.MAX_SLIPPAGE_PCT || 10); // Default 10%
-    const quote = await getJupiterQuote(SOL_MINT, mint, lamports, slippagePct * 100);
+    const quote = await getJupiterQuote(
+      SOL_MINT,
+      mint,
+      lamports,
+      slippagePct * 100,
+    );
     if (!quote?.outAmount) {
       return { success: false, error: `No quote for ${logLabel}` };
     }
@@ -77,10 +76,15 @@ async function executeTranche(
 
     LOG.info(
       { mint, tokenQty, pricePerToken, signature: swap.signature },
-      `${logLabel} executed successfully`
+      `${logLabel} executed successfully`,
     );
 
-    return { success: true, tokenQty, pricePerToken, signature: swap.signature };
+    return {
+      success: true,
+      tokenQty,
+      pricePerToken,
+      signature: swap.signature,
+    };
   } catch (err: any) {
     LOG.error({ err: err.message || err }, `${logLabel} execution failed`);
     return { success: false, error: err.message || "Unknown error" };
@@ -96,7 +100,7 @@ export async function executeFirstTranche(
   wallet: string,
   useReal: boolean,
   decimals: number = 9,
-  signer?: Keypair
+  signer?: Keypair,
 ): Promise<TrancheResult> {
   return executeTranche(
     mint,
@@ -106,7 +110,7 @@ export async function executeFirstTranche(
     useReal,
     "tranche1",
     "first tranche (60%)",
-    signer
+    signer,
   );
 }
 
@@ -119,7 +123,7 @@ export async function executeSecondTranche(
   wallet: string,
   useReal: boolean,
   decimals: number = 9,
-  signer?: Keypair
+  signer?: Keypair,
 ): Promise<TrancheResult> {
   return executeTranche(
     mint,
@@ -129,133 +133,6 @@ export async function executeSecondTranche(
     useReal,
     "tranche2",
     "second tranche (40%)",
-    signer
+    signer,
   );
-}
-
-/**
- * Execute test sell (0.5% of received tokens)
- * Used to verify liquidity and trading viability
- */
-export async function executeTestSell(
-  mint: string,
-  tokenQty: number,
-  decimals: number,
-  wallet: string,
-  useReal: boolean,
-  signer?: Keypair
-): Promise<{ success: boolean; error?: string }> {
-  try {
-    const testSellQty = tokenQty * TEST_SELL_PCT;
-    const testSellBase = Math.floor(testSellQty * 10 ** decimals);
-
-    LOG.info(
-      { mint, totalTokens: tokenQty, testSellQty, testSellBase, decimals },
-      "Executing 0.5% test sell"
-    );
-
-    if (!testSellBase || testSellBase <= 0) {
-      return { success: false, error: "Test sell amount too small" };
-    }
-
-    // Get quote to verify we can sell
-    const quote = await getJupiterQuote(mint, SOL_MINT, testSellBase, 100);
-    if (!quote?.outAmount) {
-      return { success: false, error: "No quote for test sell - illiquid!" };
-    }
-
-    const receivedSol = Number(quote.outAmount) / 1e9;
-    if (receivedSol <= 0) {
-      return { success: false, error: "Test sell would receive 0 SOL" };
-    }
-
-    if (useReal) {
-      const swap = await executeJupiterSwap({
-        inputMint: mint,
-        outputMint: SOL_MINT,
-        amount: testSellBase,
-        userPublicKey: wallet,
-        slippageBps: TEST_SELL_SLIPPAGE_BPS, // Higher slippage for small test sell
-        ...(signer ? { signer } : {}),
-      });
-
-      if (!swap.success) {
-        return { success: false, error: swap.error || "Test sell swap failed" };
-      }
-
-      LOG.info({ mint, receivedSol, signature: swap.signature }, "Test sell executed successfully");
-    } else {
-      LOG.info({ mint, receivedSol }, "Test sell simulated successfully");
-    }
-
-    return { success: true };
-  } catch (err: any) {
-    LOG.error({ err: err.message || err }, "Test sell execution failed");
-    return { success: false, error: err.message || "Unknown error" };
-  }
-}
-
-/**
- * Wait for price pullback before executing second tranche
- * Monitors price for a micro-dip (configurable threshold)
- */
-export async function waitForPullback(
-  mint: string,
-  entryPrice: number,
-  timeoutMs: number = 300000 // 5 minutes default
-): Promise<{ success: boolean; currentPrice?: number }> {
-  const startTime = Date.now();
-  const pullbackThreshold = 1 - PULLBACK_THRESHOLD_PCT;
-
-  LOG.info(
-    { mint, entryPrice, targetPrice: entryPrice * pullbackThreshold, timeoutMs },
-    "Waiting for pullback to execute second tranche"
-  );
-
-  while (Date.now() - startTime < timeoutMs) {
-    try {
-      // Fair-value price, not a buy-side probe quote — a probe's own price
-      // impact isn't comparable to entryPrice (the real fill price of a much
-      // larger tranche at a different size), the same bias already fixed in
-      // monitor.service.ts's PnL calculation.
-      const [tokenInfo, solPriceUsd] = await Promise.all([
-        getJupiterTokenInfo(mint),
-        getSolPriceUsd(),
-      ]);
-
-      if (tokenInfo?.usdPrice && solPriceUsd) {
-        const currentPrice = tokenInfo.usdPrice / solPriceUsd;
-
-        LOG.debug(
-          {
-            mint,
-            currentPrice,
-            entryPrice,
-            pullbackPct: ((currentPrice - entryPrice) / entryPrice) * 100,
-          },
-          "Checking for pullback"
-        );
-
-        if (currentPrice <= entryPrice * pullbackThreshold) {
-          LOG.info(
-            {
-              mint,
-              currentPrice,
-              entryPrice,
-              pullbackPct: ((currentPrice - entryPrice) / entryPrice) * 100,
-            },
-            "Pullback detected - ready for second tranche"
-          );
-          return { success: true, currentPrice };
-        }
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-    } catch (err: any) {
-      LOG.warn({ err: err.message || err }, "Error checking price for pullback");
-    }
-  }
-
-  LOG.warn({ mint, timeoutMs }, "Pullback timeout - executing second tranche at current price");
-  return { success: true }; // Still return success to not block second tranche
 }
