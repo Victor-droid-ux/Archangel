@@ -97,17 +97,32 @@ class BirdeyeService {
       const data = response.data?.data;
 
       if (!data) {
-        LOG.warn("⚠️ No data returned from Birdeye market health check");
+        // A 200 with no `data` for this mint means Birdeye's indexer hasn't
+        // picked up this token yet — expected for anything genuinely
+        // seconds-old, not a signal about the token itself. Treated as
+        // neutral (pass) rather than failed: there's nothing here to
+        // actually evaluate, so every other check below (price impact, FDV,
+        // volume, soft-rug/wash-trading heuristics) is skipped rather than
+        // computed against zeros, which would produce false readings (e.g.
+        // calculatePriceImpact(0, buyAmountSol) reads as 100% impact).
+        // This is distinct from the catch block below (a genuine API/network
+        // failure) which still fails closed — an indexing gap and an
+        // inability to verify are different situations.
+        LOG.info(
+          `ℹ️ No Birdeye data yet for ${tokenMint.slice(0, 8)} — treating as neutral (not yet indexed, not unhealthy)`,
+        );
         return {
-          isHealthy: false,
-          priceImpact: 100,
+          isHealthy: true,
+          priceImpact: 0,
           fdv: 0,
           liquidity: 0,
           volume5m: 0,
           hasSoftRugged: false,
           hasSuspiciousSells: false,
           isBotActivity: false,
-          reasons: ["No data from Birdeye API"],
+          reasons: [
+            "No Birdeye data yet (not yet indexed) — skipped, not failed",
+          ],
         };
       }
 

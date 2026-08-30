@@ -57,6 +57,13 @@ declare global {
 
     interface Request {
       io?: SocketIOServer;
+      // Populated by app.ts's express.json({ verify }) — the exact bytes
+      // received, before JSON parsing/re-serialization. Needed anywhere an
+      // HMAC signature (e.g. QuickNode's webhook) is checked against the
+      // body: JSON.stringify(req.body) is not guaranteed to byte-match what
+      // the sender actually signed (key order, whitespace), so a signature
+      // check must use this, not a re-stringified req.body.
+      rawBody?: Buffer;
     }
   }
 

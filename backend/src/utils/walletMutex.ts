@@ -1,17 +1,18 @@
 // backend/src/utils/walletMutex.ts
 //
-// Serializes buy execution per wallet across all discovery pipelines
-// (autoBuyer.service.ts, and validationPipeline.service.ts's runPipeline via
-// jupiterDiscovery.service.ts / storedTokenChecker.service.ts). Position
-// sizing reads a wallet's live balance and spends a percentage of it — if
-// two pipelines independently discover different tokens for the same wallet
-// at nearly the same moment, both would read the same starting balance and
-// size off it, risking a real on-chain overdraw once both swaps land.
+// Serializes buy execution per wallet. Position sizing (validationPipeline.
+// service.ts's runPipeline, invoked per wallet from multiUserExecution.
+// service.ts's fan-out) reads a wallet's live balance and spends a
+// percentage of it — if two candidate mints are being processed for the
+// same wallet at nearly the same moment (two concurrent webhook deliveries,
+// each clearing Phase 3/4 for a different token), both would read the same
+// starting balance and size off it, risking a real on-chain overdraw once
+// both swaps land.
 //
-// Rather than pre-splitting capital between pipelines (arbitrary, and
-// doesn't scale if a pipeline is ever added), each buy attempt for a given
-// wallet is queued behind whichever one is already in flight for that same
-// wallet. The second attempt only starts once the first has fully finished
+// Rather than pre-splitting capital across concurrent candidates (arbitrary,
+// and doesn't scale), each buy attempt for a given wallet is queued behind
+// whichever one is already in flight for that same wallet. The second
+// attempt only starts once the first has fully finished
 // (including its balance-reducing swap), so it naturally sizes against
 // whatever capital is actually left — a real, balance-aware split instead
 // of a race.

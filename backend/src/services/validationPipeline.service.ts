@@ -1,10 +1,5 @@
 import { getLogger } from "../utils/logger.js";
-import {
-  getJupiterQuote,
-  executeJupiterSwap,
-  getJupiterTokenInfo,
-} from "./jupiter.service.js";
-import birdeyeService, { BirdeyeMarketHealth } from "./birdeye.service.js";
+import { getJupiterQuote, executeJupiterSwap } from "./jupiter.service.js";
 import {
   hasSufficientBalance,
   getConnection,
@@ -65,27 +60,7 @@ interface PipelineResult {
   executionResult?: ExecutionResult;
 }
 
-interface PoolValidation {
-  poolExists: boolean;
-  lpSufficient: boolean;
-  lpAmount: number;
-  poolStable: boolean;
-}
-
-interface RoutingTestResult {
-  buyRoutePasses: boolean;
-  sellRoutePasses: boolean;
-  slippageAcceptable: boolean;
-  bidirectionalTrading: boolean;
-}
-
 class ValidationPipelineService {
-  // Same default as jupiterDiscovery.service.ts / storedTokenChecker.service.ts —
-  // this used to default to 0.5 here vs 0.05 there, a 10x gap for what should be
-  // one agreed-upon "is this pool real" threshold across every caller.
-  private readonly MIN_LP_SOL = parseFloat(
-    process.env.MIN_JUPITER_LIQUIDITY_SOL || "0.05",
-  );
   // Was a bare literal with no override, unlike every sibling threshold in
   // this class. Default kept the same (49%) to avoid silently changing
   // trading behavior — this just makes it tunable.
@@ -107,7 +82,21 @@ class ValidationPipelineService {
   }
 
   /**
-   * Run the complete 8-stage validation pipeline
+   * Per-wallet execution leg of the single linear discovery→validate→buy
+   * pipeline (see candidatePipeline.service.ts for the full sequence).
+   *
+   * Token-intrinsic checks — is it tradeable on Jupiter (Phase 3), and does
+   * it pass ArchAngel's filters: tax, mint/freeze authority, LP lock, holder
+   * concentration, liquidity/volume/price health (Phase 4) — already ran
+   * exactly ONCE for this mint, globally, before any wallet gets here. This
+   * function no longer re-derives any of that; re-checking it per wallet was
+   * the exact duplicated work called out in the pre-refactor pipeline audit.
+   *
+   * What genuinely differs per wallet is handled here: position sizing
+   * against that wallet's live balance and risk limits (Stage 0), a final
+   * quote sized to that wallet's own buy amount (Stage 1 — Phase 5, done
+   * per-wallet because the buy amount is per-wallet), and the actual buy
+   * (Stage 2 — Phase 6).
    */
   async runPipeline(
     tokenMint: string,
@@ -116,7 +105,7 @@ class ValidationPipelineService {
   ): Promise<PipelineResult> {
     LOG.info(
       { wallet: walletContext.ownerWallet },
-      `🚀 Starting 8-stage validation pipeline for ${tokenMint.slice(0, 8)}...`,
+      `🚀 Starting per-wallet execution for ${tokenMint.slice(0, 8)}...`,
     );
 
     const results: ValidationResult[] = [];
@@ -124,13 +113,12 @@ class ValidationPipelineService {
 
     // Stage 0: POSITION SIZING + RISK MANAGEMENT CHECK
     // Size the trade as a percentage of live wallet balance (AUTO_TRADE_PERCENT_OF_BALANCE,
-    // 2% default) rather than a fixed SOL amount — mirrors autoBuyer.service.ts's identical
-    // fix for the same reason: a fixed amount either sits below the risk cap's true
-    // minimum-balance requirement (rejected forever on a modest wallet) or, on a larger
-    // wallet, wastes the chance to size up. Both auto-buy paths (jupiterDiscovery.service.ts
-    // and storedTokenChecker.service.ts) funnel through runPipeline, so this is the single
-    // place that guarantees sizing + MAX_OPEN_POSITIONS/MAX_DAILY_LOSS_PCT apply to every
-    // real buy this pipeline executes.
+    // 2% default) rather than a fixed SOL amount — a fixed amount either sits below the
+    // risk cap's true minimum-balance requirement (rejected forever on a modest wallet) or,
+    // on a larger wallet, wastes the chance to size up. Every eligible wallet's buy for a
+    // candidate mint funnels through this one runPipeline(), so this is the single place
+    // that guarantees sizing + MAX_OPEN_POSITIONS/MAX_DAILY_LOSS_PCT apply to every real
+    // buy the pipeline executes.
     const walletBalance = await getBalanceInSol(wallet);
     const riskPct = ENV.AUTO_TRADE_PERCENT_OF_BALANCE;
     const config = await getEffectiveConfig(
@@ -182,387 +170,74 @@ class ValidationPipelineService {
       );
     }
 
-    // Stage 1: JUPITER DISCOVERY
-    const stage1 = await this.stage1_jupiterDiscovery(tokenMint, lpSol);
+    // Stage 1 (Phase 5 — Jupiter quote): fresh, per-wallet-sized quote +
+    // affordability check right before committing capital.
+    const stage1 = await this.stage1_preExecutionCheck(
+      tokenMint,
+      buySol,
+      wallet,
+    );
     results.push(stage1);
     if (!stage1.passed) {
       await this.logFailure(
         tokenMint,
         1,
-        "Jupiter Discovery",
+        "Jupiter Pre-Execution",
         stage1.reason || "Unknown",
       );
       return this.buildFailureResult(
         1,
-        "Jupiter Discovery",
+        "Jupiter Pre-Execution",
         stage1.reason,
         results,
       );
     }
 
-    // Stage 2: JUPITER ROUTING TEST
-    const stage2 = await this.stage2_jupiterRoutingTest(tokenMint);
+    // Stage 2 (Phase 6 — Trading): execute the swap.
+    const stage2 = await this.stage2_buyExecution(
+      tokenMint,
+      buySol,
+      walletContext,
+    );
     results.push(stage2);
     if (!stage2.passed) {
       await this.logFailure(
         tokenMint,
         2,
-        "Jupiter Routing Test",
+        "Jupiter Buy Execution",
         stage2.reason || "Unknown",
       );
       return this.buildFailureResult(
         2,
-        "Jupiter Routing Test",
+        "Jupiter Buy Execution",
         stage2.reason,
         results,
       );
     }
 
-    // Stage 3: BIRDEYE HONEYPOT CHECK
-    const stage3 = await this.stage3_authorityCheck(tokenMint);
-    results.push(stage3);
-    if (!stage3.passed) {
-      await this.logFailure(
-        tokenMint,
-        3,
-        "Authority Check",
-        stage3.reason || "Unknown",
-      );
-      return this.buildFailureResult(
-        3,
-        "Authority Check",
-        stage3.reason,
-        results,
-      );
-    }
-
-    // Stage 4: BIRDEYE MARKET HEALTH CHECK
-    const stage4 = await this.stage4_birdeyeMarketHealth(tokenMint, buySol);
-    results.push(stage4);
-    if (!stage4.passed) {
-      await this.logFailure(
-        tokenMint,
-        4,
-        "Birdeye Market Health",
-        stage4.reason || "Unknown",
-      );
-      return this.buildFailureResult(
-        4,
-        "Birdeye Market Health",
-        stage4.reason,
-        results,
-      );
-    }
-
-    // Stage 5: JUPITER PRE-EXECUTION CHECK
-    const stage5 = await this.stage5_jupiterPreExecution(
-      tokenMint,
-      buySol,
-      wallet,
-    );
-    results.push(stage5);
-    if (!stage5.passed) {
-      await this.logFailure(
-        tokenMint,
-        5,
-        "Jupiter Pre-Execution",
-        stage5.reason || "Unknown",
-      );
-      return this.buildFailureResult(
-        5,
-        "Jupiter Pre-Execution",
-        stage5.reason,
-        results,
-      );
-    }
-
-    // Stage 6: JUPITER EXECUTION (BUY)
-    const stage6 = await this.stage6_jupiterBuy(
-      tokenMint,
-      buySol,
-      walletContext,
-    );
-    results.push(stage6);
-    if (!stage6.passed) {
-      await this.logFailure(
-        tokenMint,
-        6,
-        "Jupiter Buy Execution",
-        stage6.reason || "Unknown",
-      );
-      return this.buildFailureResult(
-        6,
-        "Jupiter Buy Execution",
-        stage6.reason,
-        results,
-      );
-    }
-
-    LOG.info(`✅ All 6 execution stages PASSED for ${tokenMint.slice(0, 8)}`);
+    LOG.info(`✅ Execution PASSED for ${tokenMint.slice(0, 8)}`);
 
     return {
       success: true,
       results,
-      executionResult: stage6.details?.executionResult,
+      executionResult: stage2.details?.executionResult,
     };
   }
 
   /**
-   * STAGE 1: JUPITER DISCOVERY
-   * Only detect tokens that truly exist AND have actual LP
+   * STAGE 1 (Phase 5 — Jupiter quote): get a fresh quote sized to this
+   * wallet's own buy amount and confirm it can actually afford the trade
+   * right before committing capital. Kept per-wallet rather than folded into
+   * the one-time global Phase 3/4 checks because the buy amount — and so the
+   * quote itself — is different for every wallet.
    */
-  private async stage1_jupiterDiscovery(
-    tokenMint: string,
-    lpSol: number,
-  ): Promise<ValidationResult> {
-    LOG.info(`[Stage 1] 🔍 Jupiter Discovery for ${tokenMint.slice(0, 8)}...`);
-
-    try {
-      // Pool existence is already confirmed by pool listener
-      // Just validate LP amount here
-
-      // Check LP amount
-      if (lpSol < this.MIN_LP_SOL) {
-        return {
-          passed: false,
-          stage: 1,
-          stageName: "Jupiter Discovery",
-          reason: `Insufficient LP: ${lpSol} SOL < ${this.MIN_LP_SOL} SOL`,
-        };
-      }
-
-      // Check if it's a fake placeholder pool (LP = 0)
-      if (lpSol === 0) {
-        return {
-          passed: false,
-          stage: 1,
-          stageName: "Jupiter Discovery",
-          reason: "Pool LP is exactly 0 (fake pool)",
-        };
-      }
-
-      LOG.info(`[Stage 1] ✅ Jupiter Discovery PASSED (LP: ${lpSol} SOL)`);
-      return {
-        passed: true,
-        stage: 1,
-        stageName: "Jupiter Discovery",
-        details: { lpSol },
-      };
-    } catch (error: any) {
-      LOG.error(`[Stage 1] ❌ Error: ${error.message}`);
-      return {
-        passed: false,
-        stage: 1,
-        stageName: "Jupiter Discovery",
-        reason: `Error: ${error.message}`,
-      };
-    }
-  }
-
-  /**
-   * STAGE 2: JUPITER ROUTING TEST
-   * Make sure Jupiter can actually perform swaps
-   */
-  private async stage2_jupiterRoutingTest(
-    tokenMint: string,
-  ): Promise<ValidationResult> {
-    LOG.info(
-      `[Stage 2] 🔍 Jupiter Routing Test for ${tokenMint.slice(0, 8)}...`,
-    );
-
-    try {
-      const testAmount = 10000000; // 0.01 SOL for testing
-
-      // Test BUY route
-      const buyQuote = await getJupiterQuote(
-        SOL_MINT,
-        tokenMint,
-        testAmount,
-        this.AUTO_BUY_SLIPPAGE_BPS,
-      );
-
-      if (!buyQuote || !buyQuote.outAmount) {
-        return {
-          passed: false,
-          stage: 2,
-          stageName: "Jupiter Routing Test",
-          reason: "Buy route not available",
-        };
-      }
-
-      // Test SELL route (simulate selling the tokens we would buy)
-      const sellQuote = await getJupiterQuote(
-        tokenMint,
-        SOL_MINT,
-        Number(buyQuote.outAmount),
-        this.AUTO_BUY_SLIPPAGE_BPS,
-      );
-
-      if (!sellQuote || !sellQuote.outAmount) {
-        return {
-          passed: false,
-          stage: 2,
-          stageName: "Jupiter Routing Test",
-          reason: "Sell route not available (potential honeypot)",
-        };
-      }
-
-      // Check if price impact is acceptable — use Jupiter's own priceImpactPct,
-      // which is computed correctly against real reserves/decimals. (The previous
-      // version diffed raw SOL lamports against raw token base units directly,
-      // two incommensurable quantities, which produced meaningless multi-million
-      // percent "slippage" values and made this stage fail almost every time.)
-      const buySlippage = buyQuote.priceImpactPct ?? 0;
-      const sellSlippage = sellQuote.priceImpactPct ?? 0;
-
-      if (buySlippage > this.MAX_SLIPPAGE || sellSlippage > this.MAX_SLIPPAGE) {
-        return {
-          passed: false,
-          stage: 2,
-          stageName: "Jupiter Routing Test",
-          reason: `Slippage too high (buy: ${buySlippage}%, sell: ${sellSlippage}%)`,
-        };
-      }
-
-      LOG.info(
-        `[Stage 2] ✅ Jupiter Routing Test PASSED (bidirectional trading works)`,
-      );
-      return {
-        passed: true,
-        stage: 2,
-        stageName: "Jupiter Routing Test",
-        details: { buyQuote, sellQuote, buySlippage, sellSlippage },
-      };
-    } catch (error: any) {
-      LOG.error(`[Stage 2] ❌ Error: ${error.message}`);
-      return {
-        passed: false,
-        stage: 2,
-        stageName: "Jupiter Routing Test",
-        reason: `Error: ${error.message}`,
-      };
-    }
-  }
-
-  /**
-   * STAGE 3: AUTHORITY / HONEYPOT CHECK
-   * Uses Jupiter's /tokens/v2 audit data (already fetched for free at discovery
-   * time) rather than Birdeye's token_security endpoint — that endpoint returns
-   * "API key lacks sufficient permissions" on the current plan, and the actual
-   * ability to sell is already exercised structurally by Stage 2's bidirectional
-   * routing test (a real honeypot can't produce a sell quote at all).
-   */
-  private async stage3_authorityCheck(
-    tokenMint: string,
-  ): Promise<ValidationResult> {
-    LOG.info(`[Stage 3] 🔍 Authority Check for ${tokenMint.slice(0, 8)}...`);
-
-    try {
-      const info = await getJupiterTokenInfo(tokenMint);
-
-      if (!info) {
-        return {
-          passed: false,
-          stage: 3,
-          stageName: "Authority Check",
-          reason: "Token metadata unavailable from Jupiter",
-        };
-      }
-
-      const reasons: string[] = [];
-      if (!info.mintAuthorityDisabled) {
-        reasons.push("Mint authority still active");
-      }
-      if (!info.freezeAuthorityDisabled) {
-        reasons.push("Freeze authority still active");
-      }
-
-      if (reasons.length > 0) {
-        return {
-          passed: false,
-          stage: 3,
-          stageName: "Authority Check",
-          reason: reasons.join(", "),
-          details: info,
-        };
-      }
-
-      LOG.info(`[Stage 3] ✅ Authority Check PASSED`);
-      return {
-        passed: true,
-        stage: 3,
-        stageName: "Authority Check",
-        details: info,
-      };
-    } catch (error: any) {
-      LOG.error(`[Stage 3] ❌ Error: ${error.message}`);
-      return {
-        passed: false,
-        stage: 3,
-        stageName: "Authority Check",
-        reason: `Error: ${error.message}`,
-      };
-    }
-  }
-
-  /**
-   * STAGE 4: BIRDEYE MARKET HEALTH CHECK
-   * Ensure token is tradeable and worth entering
-   */
-  private async stage4_birdeyeMarketHealth(
-    tokenMint: string,
-    buySol: number,
-  ): Promise<ValidationResult> {
-    LOG.info(
-      `[Stage 4] 🔍 Birdeye Market Health for ${tokenMint.slice(0, 8)}...`,
-    );
-
-    try {
-      const healthResult = await birdeyeService.checkMarketHealth(
-        tokenMint,
-        buySol,
-      );
-
-      if (!healthResult.isHealthy) {
-        return {
-          passed: false,
-          stage: 4,
-          stageName: "Birdeye Market Health",
-          reason: healthResult.reasons.join(", "),
-          details: healthResult,
-        };
-      }
-
-      LOG.info(`[Stage 4] ✅ Birdeye Market Health PASSED`);
-      return {
-        passed: true,
-        stage: 4,
-        stageName: "Birdeye Market Health",
-        details: healthResult,
-      };
-    } catch (error: any) {
-      LOG.error(`[Stage 4] ❌ Error: ${error.message}`);
-      return {
-        passed: false,
-        stage: 4,
-        stageName: "Birdeye Market Health",
-        reason: `Error: ${error.message}`,
-      };
-    }
-  }
-
-  /**
-   * STAGE 5: JUPITER PRE-EXECUTION CHECK
-   * Get a fresh quote and confirm the wallet can actually afford the trade
-   * right before committing capital.
-   */
-  private async stage5_jupiterPreExecution(
+  private async stage1_preExecutionCheck(
     tokenMint: string,
     buySol: number,
     wallet: string,
   ): Promise<ValidationResult> {
     LOG.info(
-      `[Stage 5] 🔍 Jupiter Pre-Execution Check for ${tokenMint.slice(0, 8)}...`,
+      `[Stage 1] 🔍 Jupiter Pre-Execution Check for ${tokenMint.slice(0, 8)}...`,
     );
 
     try {
@@ -578,7 +253,7 @@ class ValidationPipelineService {
       if (!quote || !quote.outAmount) {
         return {
           passed: false,
-          stage: 5,
+          stage: 1,
           stageName: "Jupiter Pre-Execution",
           reason: "No Jupiter route/output available for buy amount",
         };
@@ -587,7 +262,7 @@ class ValidationPipelineService {
       if (quote.priceImpactPct && quote.priceImpactPct > this.MAX_SLIPPAGE) {
         return {
           passed: false,
-          stage: 5,
+          stage: 1,
           stageName: "Jupiter Pre-Execution",
           reason: `Price impact too high: ${quote.priceImpactPct.toFixed(2)}%`,
           details: quote,
@@ -599,25 +274,25 @@ class ValidationPipelineService {
         if (!hasBalance) {
           return {
             passed: false,
-            stage: 5,
+            stage: 1,
             stageName: "Jupiter Pre-Execution",
             reason: "Insufficient wallet balance for buy amount",
           };
         }
       }
 
-      LOG.info(`[Stage 5] ✅ Jupiter Pre-Execution Check PASSED`);
+      LOG.info(`[Stage 1] ✅ Jupiter Pre-Execution Check PASSED`);
       return {
         passed: true,
-        stage: 5,
+        stage: 1,
         stageName: "Jupiter Pre-Execution",
         details: quote,
       };
     } catch (error: any) {
-      LOG.error(`[Stage 5] ❌ Error: ${error.message}`);
+      LOG.error(`[Stage 1] ❌ Error: ${error.message}`);
       return {
         passed: false,
-        stage: 5,
+        stage: 1,
         stageName: "Jupiter Pre-Execution",
         reason: `Error: ${error.message}`,
       };
@@ -627,14 +302,14 @@ class ValidationPipelineService {
   /**
    * STAGE 6: JUPITER EXECUTION (BUY)
    */
-  private async stage6_jupiterBuy(
+  private async stage2_buyExecution(
     tokenMint: string,
     buySol: number,
     walletContext: WalletContext,
   ): Promise<ValidationResult> {
     const wallet = walletContext.publicKey;
     LOG.info(
-      `[Stage 6] 🚀 Jupiter Buy Execution for ${tokenMint.slice(0, 8)}...`,
+      `[Stage 2] 🚀 Jupiter Buy Execution for ${tokenMint.slice(0, 8)}...`,
     );
 
     try {
@@ -650,7 +325,7 @@ class ValidationPipelineService {
       if (!quote || !quote.outAmount) {
         return {
           passed: false,
-          stage: 6,
+          stage: 2,
           stageName: "Jupiter Buy Execution",
           reason: "No Jupiter route/output available at execution time",
         };
@@ -675,7 +350,7 @@ class ValidationPipelineService {
       if (!swapResult.success) {
         return {
           passed: false,
-          stage: 6,
+          stage: 2,
           stageName: "Jupiter Buy Execution",
           reason: (swapResult as any).error || "Execution failed",
           details: swapResult,
@@ -683,31 +358,24 @@ class ValidationPipelineService {
       }
 
       // outAmount is in the output token's base units — fetch its real decimals
-      // rather than assuming 9 (many SPL tokens, e.g. BONK, use fewer)
+      // rather than assuming 9 (many SPL tokens, e.g. BONK, use fewer).
       // Decimals feed directly into tokensReceived/actualPrice, which become
       // this position's recorded cost basis — a silent wrong guess here
       // corrupts every downstream PnL/TP/SL decision by the same factor.
-      // Prefer Jupiter's own token info (already fetched during discovery,
-      // no extra RPC round trip, same source already trusted pre-buy) before
-      // falling back to an on-chain lookup, and log loudly rather than
-      // silently trusting a last-resort guess if both fail.
+      // Sourced on-chain, straight from the mint account — Jupiter's role in
+      // this pipeline is strictly trading (routing checks, quotes, and this
+      // very swap execution), not fetching token metadata, so this
+      // deliberately never calls Jupiter's catalog lookup. Log loudly rather
+      // than silently trusting a last-resort guess if the RPC lookup fails.
       let decimals: number | null = null;
-      const jupInfo = await getJupiterTokenInfo(tokenMint);
-      if (
-        typeof jupInfo?.decimals === "number" &&
-        Number.isFinite(jupInfo.decimals)
-      ) {
-        decimals = jupInfo.decimals;
-      } else {
-        try {
-          const info = await getConnection().getParsedAccountInfo(
-            new PublicKey(tokenMint),
-          );
-          const d = (info.value?.data as any)?.parsed?.info?.decimals;
-          if (typeof d === "number" && Number.isFinite(d)) decimals = d;
-        } catch {
-          // handled below
-        }
+      try {
+        const info = await getConnection().getParsedAccountInfo(
+          new PublicKey(tokenMint),
+        );
+        const d = (info.value?.data as any)?.parsed?.info?.decimals;
+        if (typeof d === "number" && Number.isFinite(d)) decimals = d;
+      } catch {
+        // handled below
       }
       if (decimals === null) {
         LOG.error(
@@ -747,19 +415,19 @@ class ValidationPipelineService {
       });
 
       LOG.info(
-        `[Stage 6] ✅ Jupiter Buy Execution PASSED (${swapResult.signature})`,
+        `[Stage 2] ✅ Jupiter Buy Execution PASSED (${swapResult.signature})`,
       );
       return {
         passed: true,
-        stage: 6,
+        stage: 2,
         stageName: "Jupiter Buy Execution",
         details: { executionResult },
       };
     } catch (error: any) {
-      LOG.error(`[Stage 6] ❌ Error: ${error.message}`);
+      LOG.error(`[Stage 2] ❌ Error: ${error.message}`);
       return {
         passed: false,
-        stage: 6,
+        stage: 2,
         stageName: "Jupiter Buy Execution",
         reason: `Error: ${error.message}`,
       };

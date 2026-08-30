@@ -2,7 +2,6 @@
 import {
   getJupiterQuote,
   executeJupiterSwap,
-  getJupiterTokenInfo,
   getSolPriceUsd,
 } from "./jupiter.service.js";
 import dbService, { Position } from "./db.service.js";
@@ -248,6 +247,24 @@ export function startPositionMonitor(
           // them genuinely bot-executed) was missing this field, meaning
           // every custodial position's SL/TP has been silently unenforced.
           if (pos.custody === "self") continue;
+
+          // ✨ RULE 9 (moved up): a position with nothing left to sell needs
+          // no price, no decimals, no cost basis, no emergency-exit check —
+          // none of it changes the outcome. Checking this first, before any
+          // of that work (in particular before the Jupiter/Birdeye price
+          // fetch below), matters in practice: a position can reach
+          // remainingPct <= 0 while its netSol dust-threshold check above
+          // still doesn't trip (rounding residue across multiple partial
+          // fills), which otherwise leaves it "open" forever and refetches
+          // a live price for it on every single tick indefinitely.
+          const remainingPct = pos.remainingPct ?? 100;
+          if (remainingPct <= 0) {
+            log.debug(
+              { tokenMint, wallet: pos.wallet, remainingPct },
+              "Skipping position: no remaining amount to sell",
+            );
+            continue;
+          }
           // netSol is derived from cumulative buy-minus-sell lamports; after a
           // position is fully exited this rarely lands on exactly 0 due to
           // floating-point/rounding residue across multiple fills, leaving a
@@ -347,14 +364,17 @@ export function startPositionMonitor(
           // actually worth — comparing that against avgBuy (which is itself
           // inflated by buy-side price impact) manufactures an apparent loss
           // from the round-trip spread alone, the instant a position opens,
-          // regardless of what the token's price actually does. Jupiter's
-          // aggregated usdPrice is a fair-value estimate, not an executable
-          // quote, so it doesn't have this bias. Real execution quotes are
-          // still fetched fresh at the moment of an actual sell, below.
-          const tokenInfo = await getJupiterTokenInfo(tokenMint);
+          // regardless of what the token's price actually does. Birdeye's
+          // price feed is a fair-value estimate, not an executable quote, so
+          // it doesn't have this bias. Real execution quotes are still
+          // fetched fresh at the moment of an actual sell, below.
+          //
+          // Jupiter is intentionally not used here (or anywhere in this
+          // pipeline outside Phase 3/5/6) — its role is strictly trading:
+          // checking a route exists, quoting, and executing. Fetching a
+          // token's price/metadata is not a trading function.
           const currentUsdPrice =
-            tokenInfo?.usdPrice ||
-            (await birdeyeService.getCurrentPrice(tokenMint));
+            await birdeyeService.getCurrentPrice(tokenMint);
           if (!currentUsdPrice) {
             log.warn(
               { tokenMint, wallet: pos.wallet },
@@ -546,14 +566,7 @@ export function startPositionMonitor(
           }
 
           // ✨ RULE 9: TIERED PROFIT TARGETS (30% at +40%, +80%, +150%)
-          const remainingPct = pos.remainingPct ?? 100; // Track remaining position %
-          if (remainingPct <= 0) {
-            log.debug(
-              { tokenMint, wallet: pos.wallet, remainingPct },
-              "Skipping position: no remaining amount to sell",
-            );
-            continue;
-          }
+          // (remainingPct <= 0 already handled above, before the price fetch)
 
           // Check for tiered profit target triggers
           let shouldSellTiered = false;

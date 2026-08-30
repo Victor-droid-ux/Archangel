@@ -126,8 +126,8 @@ router.post("/force-sell", async (req, res) => {
       type: "sell",
       token: sellRecord.token,
       // tradeFeed's "amount" field is lamports everywhere else it's emitted
-      // (jupiterDiscovery.service.ts, storedTokenChecker.service.ts) — the
-      // frontend (live-feed.tsx) divides by 1e9 to get SOL. Sending raw SOL
+      // (candidatePipeline.service.ts) — the frontend (live-feed.tsx)
+      // divides by 1e9 to get SOL. Sending raw SOL
       // here made every force-sell show up ~1e9x too small on the dashboard.
       amount: Math.round(sellRecord.amountSol * 1e9),
       price: sellRecord.price,

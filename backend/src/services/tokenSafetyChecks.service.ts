@@ -1,12 +1,13 @@
 // backend/src/services/tokenSafetyChecks.service.ts
-// Shared safety checks used by BOTH auto-buy paths (autoBuyer.service.ts's
-// tradeValidation.service.ts, and jupiterDiscovery/storedTokenChecker's
-// jupiterTokenValidator.service.ts). Before this file existed, each path had
-// its own independent copy of "is this token safe" — one checked holder
-// concentration but never tax/honeypot, the other checked tax/honeypot but
-// never holder concentration, so which protections a token got depended on
-// which discovery mechanism found it first. Extracting these here means both
-// paths run the identical checks against the identical data.
+// Shared safety checks used by the single candidate pipeline's Phase 4
+// filtering (tokenFiltering.service.ts's applyArchAngelFilters). Before the
+// pipeline consolidation, multiple independent auto-buy paths each had their
+// own copy of "is this token safe" — one checked holder concentration but
+// never tax/honeypot, another checked tax/honeypot but never holder
+// concentration, so which protections a token got depended on which
+// discovery mechanism found it first. Extracting these here (and running
+// Phase 4 exactly once per mint) means every candidate gets the identical
+// checks against the identical data.
 import { getConnection } from "./solana.service.js";
 import { getLogger } from "../utils/logger.js";
 import { PublicKey } from "@solana/web3.js";
@@ -208,5 +209,105 @@ export async function checkPoolStillLive(
       `Failed to check pool liveness for ${tokenMint.slice(0, 8)}...: ${err}`,
     );
     return false;
+  }
+}
+
+export interface MintAuthorityStatus {
+  mintAuthorityDisabled: boolean;
+  freezeAuthorityDisabled: boolean;
+  available: boolean;
+}
+
+/**
+ * On-chain mint/freeze authority check, straight from the mint account —
+ * authoritative and available the instant the mint exists on-chain, unlike
+ * Jupiter's /tokens/v2/search catalog data (tokenInfo.mintAuthorityDisabled /
+ * .freezeAuthorityDisabled), which can lag for a token that's only seconds
+ * old. Callers that already have fresh tokenInfo should prefer it (cheaper,
+ * no extra RPC round trip) and only fall back to this when tokenInfo is
+ * unavailable — same pattern as resolveLiquidityUsd falling back from the
+ * catalog to a live quote.
+ *
+ * `available: false` on an RPC error or an account that isn't a parsed SPL
+ * mint — callers must fail closed on that, not treat it as "authorities
+ * disabled."
+ */
+export async function getOnChainMintAuthorityStatus(
+  tokenMint: string,
+): Promise<MintAuthorityStatus> {
+  try {
+    const connection = getConnection();
+    const info = await connection.getParsedAccountInfo(
+      new PublicKey(tokenMint),
+    );
+    const parsed = (info.value?.data as any)?.parsed?.info;
+    if (
+      !parsed ||
+      !("mintAuthority" in parsed) ||
+      !("freezeAuthority" in parsed)
+    ) {
+      return {
+        mintAuthorityDisabled: false,
+        freezeAuthorityDisabled: false,
+        available: false,
+      };
+    }
+    return {
+      mintAuthorityDisabled: parsed.mintAuthority === null,
+      freezeAuthorityDisabled: parsed.freezeAuthority === null,
+      available: true,
+    };
+  } catch (err) {
+    LOG.warn(
+      `Failed to fetch on-chain mint authority for ${tokenMint.slice(0, 8)}...: ${err}`,
+    );
+    return {
+      mintAuthorityDisabled: false,
+      freezeAuthorityDisabled: false,
+      available: false,
+    };
+  }
+}
+
+export interface MintSupplyInfo {
+  decimals: number;
+  supply: number; // human-readable units, already divided by 10^decimals
+  available: boolean;
+}
+
+/**
+ * Decimals + circulating supply straight from the mint account on-chain —
+ * one cheap `getParsedAccountInfo` call, not the full `getProgramAccounts`
+ * token-account scan `getHolderDistribution` above does (that's answering a
+ * different question — per-holder concentration — and needs every account;
+ * this only needs the mint's own summary fields). Used wherever a market cap
+ * needs computing (price × supply) without a Jupiter catalog lookup.
+ *
+ * `available: false` on an RPC error or an account that isn't a parsed SPL
+ * mint — callers must fail closed (e.g. treat mcap as unknown, not zero).
+ */
+export async function getOnChainMintSupply(
+  tokenMint: string,
+): Promise<MintSupplyInfo> {
+  try {
+    const connection = getConnection();
+    const info = await connection.getParsedAccountInfo(
+      new PublicKey(tokenMint),
+    );
+    const parsed = (info.value?.data as any)?.parsed?.info;
+    if (!parsed || typeof parsed.decimals !== "number" || !parsed.supply) {
+      return { decimals: 0, supply: 0, available: false };
+    }
+    const decimals = parsed.decimals;
+    const supply = Number(parsed.supply) / 10 ** decimals;
+    if (!Number.isFinite(supply)) {
+      return { decimals, supply: 0, available: false };
+    }
+    return { decimals, supply, available: true };
+  } catch (err) {
+    LOG.warn(
+      `Failed to fetch on-chain mint supply for ${tokenMint.slice(0, 8)}...: ${err}`,
+    );
+    return { decimals: 0, supply: 0, available: false };
   }
 }

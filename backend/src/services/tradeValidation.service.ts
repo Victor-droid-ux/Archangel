@@ -21,6 +21,7 @@ import {
   getHolderDistribution,
   checkPoolStillLive,
   fetchRugCheckReport,
+  getOnChainMintAuthorityStatus,
 } from "./tokenSafetyChecks.service.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -34,6 +35,7 @@ export interface JupiterLiquidityMetrics {
   liquiditySOL: number;
   liquidityUSD: number;
   mcapUSD: number;
+  mcapSOL?: number;
   holderCount: number;
   poolAddress?: string;
   meetsMinimumLiquidity: boolean;
@@ -85,9 +87,8 @@ async function checkJupiterTradable(
 ): Promise<{ metrics: JupiterLiquidityMetrics; passed: boolean }> {
   try {
     const smallAmountLamports = 1_000_000; // 0.001 SOL test
-    const [quote, tokenInfo, solPriceUsd] = await Promise.all([
+    const [quote, solPriceUsd] = await Promise.all([
       jupiterService.getQuote(SOL_MINT, tokenMint, smallAmountLamports, 100),
-      jupiterService.getTokenInfo(tokenMint),
       getSolPriceUsd(),
     ]);
 
@@ -109,28 +110,30 @@ async function checkJupiterTradable(
     const tradingMode = process.env.TRADING_MODE || "aggressive";
     const minLiquidityUSD = tradingMode === "safe" ? 5000 : 1500;
 
-    // tokenInfo?.liquidity comes from a *separate* Jupiter lookup
-    // (/tokens/v2/search) than the quote above (/swap/v1/quote) — a catalog
-    // miss there must not read as "$0 liquidity" when the quote we just got
-    // proves a real route exists. Falls back to a price-impact estimate
-    // instead of trusting a zero. See resolveLiquidityUsd's own doc comment.
+    // Liquidity derived purely from a price-impact estimate off the quote
+    // above — a trading function, not a Jupiter catalog/metadata fetch. See
+    // resolveLiquidityUsd's own doc comment.
     const { liquidityUSD, source: liquiditySource } = await resolveLiquidityUsd(
       tokenMint,
       minLiquidityUSD,
-      tokenInfo,
       solPriceUsd,
     );
     const liquiditySOL = solPriceUsd > 0 ? liquidityUSD / solPriceUsd : 0;
     const meetsMinimum = liquidityUSD >= minLiquidityUSD;
 
+    // mcapUSD/holderCount used to come from Jupiter's catalog data — that's
+    // no longer fetched anywhere in this pipeline, so these are informational
+    // zeros rather than real figures. Neither field gates the trade decision
+    // (only `exists`/`meetsMinimumLiquidity` do); poolAddress is similarly
+    // unavailable without a catalog lookup, so performSafetyChecks below
+    // falls back to its own "largest non-pool holder" heuristic.
     const metrics: JupiterLiquidityMetrics = {
       exists: true,
       liquiditySOL,
       liquidityUSD,
-      mcapUSD: tokenInfo?.mcap ?? 0,
-      holderCount: tokenInfo?.holderCount ?? 0,
+      mcapUSD: 0,
+      holderCount: 0,
       meetsMinimumLiquidity: meetsMinimum,
-      ...(tokenInfo?.firstPoolId ? { poolAddress: tokenInfo.firstPoolId } : {}),
     };
 
     const passed = metrics.exists && metrics.meetsMinimumLiquidity;
@@ -198,20 +201,22 @@ async function performSafetyChecks(
   poolAddress?: string,
 ): Promise<{ checks: SafetyChecks; passed: boolean }> {
   try {
-    // Prefer Jupiter's own audit data (already fetched during discovery, cheap here too)
-    // over a separate on-chain getParsedAccountInfo call.
-    const tokenInfo = await jupiterService.getTokenInfo(tokenMint);
-
-    const mintAuthorityNull = tokenInfo?.mintAuthorityDisabled ?? false;
-    const freezeAuthorityNull = tokenInfo?.freezeAuthorityDisabled ?? false;
+    // Mint/freeze authority — straight from the mint account on-chain, not
+    // Jupiter's catalog. Jupiter's role in this pipeline is strictly trading
+    // (the route/quote checks above and in checkJupiterTradable), never a
+    // token metadata fetch.
+    const authorityStatus = await getOnChainMintAuthorityStatus(tokenMint);
+    const mintAuthorityNull =
+      authorityStatus.available && authorityStatus.mintAuthorityDisabled;
+    const freezeAuthorityNull =
+      authorityStatus.available && authorityStatus.freezeAuthorityDisabled;
 
     const {
       creatorHoldings,
       top3Combined,
       available: holderDataAvailable,
     } = await getHolderDistribution(tokenMint, {
-      creatorAddress: tokenInfo?.devAddress,
-      excludeOwners: [poolAddress, tokenInfo?.firstPoolId],
+      excludeOwners: [poolAddress],
     });
 
     let canSell = false;
@@ -256,11 +261,11 @@ async function performSafetyChecks(
     const lpNotRemoved = await checkPoolStillLive(tokenMint, poolAddress);
     const firstThreeCandlesValid = await checkNoEarlyDump(tokenMint);
 
-    // Tax/honeypot via RugCheck — the other auto-buy path (jupiterTokenValidator.service.ts)
-    // already checks this; this path previously didn't, so a token could
-    // bypass tax/honeypot screening entirely depending on which discovery
-    // mechanism found it first. Fails closed on an unavailable report, same
-    // reasoning as jupiterTokenValidator.service.ts.
+    // Tax/honeypot via RugCheck — mirrors the same check the auto-buy
+    // candidate pipeline runs in tokenFiltering.service.ts's Phase 4
+    // filtering, so a manual buy through this validator gets the same
+    // protection an auto-bought token does. Fails closed on an unavailable
+    // report, same reasoning as tokenFiltering.service.ts.
     const rugCheck = await fetchRugCheckReport(tokenMint);
     const maxBuyTax = Number(process.env.MAX_BUY_TAX_PCT ?? 5);
     const maxSellTax = Number(process.env.MAX_SELL_TAX_PCT ?? 5);
@@ -395,108 +400,6 @@ export async function validateTradeOpportunity(
   );
 
   return result;
-}
-
-export async function validateFastLaunchOpportunity(
-  tokenMint: string,
-): Promise<TradeValidationResult> {
-  const timestamp = Date.now();
-  try {
-    const [tokenInfo, solPriceUsd, buyQuote] = await Promise.all([
-      jupiterService.getTokenInfo(tokenMint),
-      getSolPriceUsd(),
-      jupiterService.getQuote(SOL_MINT, tokenMint, 1_000_000, 1000),
-    ]);
-    const sellQuote = buyQuote?.outAmount
-      ? await jupiterService.getQuote(
-          tokenMint,
-          SOL_MINT,
-          buyQuote.outAmount,
-          1000,
-        )
-      : null;
-    const liquidityUSD = Number(tokenInfo?.liquidity ?? 0);
-    const liquiditySOL = solPriceUsd > 0 ? liquidityUSD / solPriceUsd : 0;
-    const mintDisabled = tokenInfo?.mintAuthorityDisabled === true;
-    const freezeDisabled = tokenInfo?.freezeAuthorityDisabled === true;
-    const approved = Boolean(
-      tokenInfo &&
-      buyQuote?.outAmount &&
-      sellQuote?.outAmount &&
-      mintDisabled &&
-      freezeDisabled &&
-      Number.isFinite(liquiditySOL) &&
-      liquiditySOL > 0 &&
-      (buyQuote.priceImpactPct ?? 0) <=
-        Number(process.env.MAX_PIPELINE_PRICE_IMPACT_PCT ?? 30),
-    );
-    const safetyChecks: SafetyChecks = {
-      canSell: Boolean(sellQuote?.outAmount),
-      mintAuthority: mintDisabled ? null : "unknown",
-      freezeAuthority: freezeDisabled ? null : "unknown",
-      firstThreeCandlesValid: true,
-      lpRemovable: false,
-      buyTax: 0,
-      sellTax: 0,
-      isHoneypot: false,
-      allChecksPassed: approved,
-    };
-    const jupiterMetrics: JupiterLiquidityMetrics = {
-      exists: Boolean(buyQuote?.outAmount),
-      buyRouteAvailable: Boolean(buyQuote?.outAmount),
-      sellRouteAvailable: Boolean(sellQuote?.outAmount),
-      buyPriceImpactPct: Number(buyQuote?.priceImpactPct ?? 0),
-      liquiditySOL,
-      liquidityUSD,
-      mcapUSD: Number(tokenInfo?.mcap ?? 0),
-      holderCount: Number(tokenInfo?.holderCount ?? 0),
-      meetsMinimumLiquidity: liquiditySOL > 0,
-      ...(tokenInfo?.firstPoolId ? { poolAddress: tokenInfo.firstPoolId } : {}),
-    };
-    return {
-      mint: tokenMint,
-      approved,
-      jupiterMetrics,
-      condition1Passed: Boolean(buyQuote?.outAmount && sellQuote?.outAmount),
-      safetyChecks,
-      condition2Passed: approved,
-      recommendation: approved ? "BUY" : "IGNORE",
-      reason: approved
-        ? "Fast launch checks passed"
-        : "Fast launch checks failed",
-      timestamp,
-    };
-  } catch (err: any) {
-    log.warn({ tokenMint, err: err?.message }, "Fast launch validation failed");
-    return {
-      mint: tokenMint,
-      approved: false,
-      jupiterMetrics: {
-        exists: false,
-        liquiditySOL: 0,
-        liquidityUSD: 0,
-        mcapUSD: 0,
-        holderCount: 0,
-        meetsMinimumLiquidity: false,
-      },
-      condition1Passed: false,
-      safetyChecks: {
-        canSell: false,
-        mintAuthority: "unknown",
-        freezeAuthority: "unknown",
-        firstThreeCandlesValid: false,
-        lpRemovable: false,
-        buyTax: 0,
-        sellTax: 0,
-        isHoneypot: true,
-        allChecksPassed: false,
-      },
-      condition2Passed: false,
-      recommendation: "IGNORE",
-      reason: "Fast launch validation unavailable",
-      timestamp,
-    };
-  }
 }
 
 /**

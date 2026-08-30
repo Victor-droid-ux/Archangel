@@ -16,7 +16,6 @@ jest.mock("../services/jupiter.service.js", () => ({
   __esModule: true,
   getJupiterQuote: jest.fn(),
   executeJupiterSwap: jest.fn(),
-  getJupiterTokenInfo: jest.fn(),
   getSolPriceUsd: jest.fn(),
 }));
 

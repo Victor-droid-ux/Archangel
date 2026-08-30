@@ -8,10 +8,16 @@ const log = getLogger("config.route");
 // In-memory config that can be updated without restart
 let runtimeConfig = {
   minMarketCapSol: Number(process.env.MIN_MARKETCAP_SOL ?? 5),
-  maxMarketCapSol: Number(process.env.MAX_MARKETCAP_SOL ?? 1000000),
-  minMarketCapUsd: Number(process.env.MIN_MARKETCAP_USD ?? 1000),
-  maxMarketCapUsd: Number(process.env.MAX_MARKETCAP_USD ?? 200000000),
-  minTokenScore: Number(process.env.MIN_TOKEN_SCORE ?? 30),
+  // Was 30 by default. The score components (holder count, 5-min buy count,
+  // Jupiter's organic score) are structurally close to zero for a token
+  // that's only seconds old — there's no history yet to score. Against the
+  // client's stated goal (trade as many newly launched tokens as possible,
+  // gated only by minMarketCapSol), a nonzero default here was filtering out
+  // fresh tokens for being fresh, before they even reached the Jupiter
+  // route/liquidity check. Kept as a real, configurable filter — set
+  // MIN_TOKEN_SCORE in .env if a quality bar above "has a route and clears
+  // the mcap floor" is wanted.
+  minTokenScore: Number(process.env.MIN_TOKEN_SCORE ?? 0),
   takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
   // Must match monitor.service.ts's DEFAULT_SL_PCT fallback (0.3) — the 0.02
   // figure was the pre-fix default that caused a self-inflicted stop-loss
@@ -35,7 +41,7 @@ router.get("/", (req: Request, res: Response) => {
 /**
  * PATCH /api/config
  * Update configuration dynamically
- * Body: { minMarketCapSol?, maxMarketCapSol?, minMarketCapUsd?, ... }
+ * Body: { minMarketCapSol?, minTokenScore?, takeProfitPct?, stopLossPct? }
  */
 router.patch("/", (req: Request, res: Response) => {
   try {
@@ -45,15 +51,6 @@ router.patch("/", (req: Request, res: Response) => {
     // Update allowed fields
     if (typeof updates.minMarketCapSol === "number") {
       runtimeConfig.minMarketCapSol = updates.minMarketCapSol;
-    }
-    if (typeof updates.maxMarketCapSol === "number") {
-      runtimeConfig.maxMarketCapSol = updates.maxMarketCapSol;
-    }
-    if (typeof updates.minMarketCapUsd === "number") {
-      runtimeConfig.minMarketCapUsd = updates.minMarketCapUsd;
-    }
-    if (typeof updates.maxMarketCapUsd === "number") {
-      runtimeConfig.maxMarketCapUsd = updates.maxMarketCapUsd;
     }
     if (typeof updates.minTokenScore === "number") {
       runtimeConfig.minTokenScore = updates.minTokenScore;
@@ -99,9 +96,6 @@ router.post("/reset", (req: Request, res: Response) => {
   try {
     runtimeConfig = {
       minMarketCapSol: Number(process.env.MIN_MARKETCAP_SOL ?? 5),
-      maxMarketCapSol: Number(process.env.MAX_MARKETCAP_SOL ?? 1000000),
-      minMarketCapUsd: Number(process.env.MIN_MARKETCAP_USD ?? 1000),
-      maxMarketCapUsd: Number(process.env.MAX_MARKETCAP_USD ?? 200000000),
       minTokenScore: Number(process.env.MIN_TOKEN_SCORE ?? 30),
       takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
       stopLossPct: Number(process.env.SL_PCT ?? 0.3),

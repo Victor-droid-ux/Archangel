@@ -8,12 +8,13 @@ import { getLogger } from "../utils/logger.js";
 import {
   getJupiterQuote,
   buildJupiterSwapPayload,
-  getJupiterTokenInfo,
   getSolPriceUsd,
 } from "../services/jupiter.service.js";
 import { Connection, VersionedTransaction } from "@solana/web3.js";
 import { validateTradeOpportunity } from "../services/tradeValidation.service.js";
 import { getTokenBalance } from "../services/solana.service.js";
+import birdeyeService from "../services/birdeye.service.js";
+import { getOnChainMintSupply } from "../services/tokenSafetyChecks.service.js";
 
 const logger = getLogger("trade.route");
 const router = express.Router();
@@ -22,9 +23,10 @@ const router = express.Router();
  * GET /api/trade/manual-buy-candidates?limit=40
  * Tokens a user can pick from on the manual Buy page — the same tradable/
  * validated set the auto-trade discovery pipeline already computes (see
- * tokenDiscovery.service.ts's startTokenWatcher, which writes state:
- * "TRADABLE" here once a token clears liquidity/routing/authority checks),
- * not a separately-invented condition set.
+ * candidatePipeline.service.ts's processCandidateMint, which writes state:
+ * "TRADABLE" here once a token clears Phase 3 Jupiter validation, then
+ * refines it further via Phase 4 filtering), not a separately-invented
+ * condition set.
  */
 // A "TRADABLE" tokenState doc is never re-verified once written — nothing
 // re-checks liquidity/safety on old entries, so without a cutoff a token
@@ -210,7 +212,7 @@ router.post("/prepare", async (req, res) => {
     // Check trader config to see if trade should trigger
     const config = await getEffectiveConfig(wallet, tokenMint);
 
-    // Enforce the configured trigger market cap server-side. Previously this
+    // Enforce the configured minimum/trigger market cap server-side. Previously this
     // only ever ran client-side (token-config-modal.tsx), which a direct API
     // call bypasses entirely — this endpoint would prepare (and /confirm
     // would happily execute) a buy regardless of whether the user's own
@@ -218,11 +220,17 @@ router.post("/prepare", async (req, res) => {
     if (type === "buy") {
       let currentMarketCapSol = 0;
       try {
-        const [tokenInfo, solPriceUsd] = await Promise.all([
-          getJupiterTokenInfo(tokenMint),
+        // Market cap computed from Birdeye's fair-value price × on-chain
+        // circulating supply — neither is a Jupiter call. Jupiter's role in
+        // this codebase is strictly trading (quotes/execution), never
+        // pricing or metadata lookups.
+        const [priceUsd, supplyInfo, solPriceUsd] = await Promise.all([
+          birdeyeService.getCurrentPrice(tokenMint),
+          getOnChainMintSupply(tokenMint),
           getSolPriceUsd(),
         ]);
-        const mcapUsd = (tokenInfo as any)?.mcap ?? 0;
+        const mcapUsd =
+          priceUsd && supplyInfo.available ? priceUsd * supplyInfo.supply : 0;
         currentMarketCapSol = solPriceUsd > 0 ? mcapUsd / solPriceUsd : 0;
       } catch (err: any) {
         logger.warn(
@@ -236,7 +244,6 @@ router.post("/prepare", async (req, res) => {
       const shouldTrigger =
         Number.isFinite(currentMarketCapSol) &&
         currentMarketCapSol >= config.minMarketCapSol &&
-        currentMarketCapSol <= config.maxMarketCapSol &&
         (!config.triggerMarketCapSol ||
           currentMarketCapSol >= config.triggerMarketCapSol);
       if (!shouldTrigger) {
@@ -415,27 +422,27 @@ router.post("/confirm", async (req, res) => {
     // be Math.random(), which fabricated the recorded price/PnL for every trade
     // regardless of whether it succeeded. This is still a post-trade estimate
     // (a fresh quote, not a parse of this exact transaction's balance deltas —
-    // and it assumes 9 token decimals, matching the approximation already used
-    // elsewhere in this codebase, e.g. trancheBuyer.service.ts), but it's
-    // grounded in real market data instead of being invented outright.
+    // and it assumes 9 token decimals, matching the fallback approximation
+    // used elsewhere in this codebase when real decimals can't be resolved),
+    // but it's grounded in real market data instead of being invented outright.
     price = 0;
     try {
       const quoteInputMint =
         type === "buy" ? "So11111111111111111111111111111111111111112" : token;
       const quoteOutputMint =
         type === "buy" ? token : "So11111111111111111111111111111111111111112";
-      const [priceQuote, tokenInfo] = await Promise.all([
+      const [priceQuote, supplyInfo] = await Promise.all([
         getJupiterQuote(
           quoteInputMint,
           quoteOutputMint,
           amountLamports,
           slippageBps || 500,
         ),
-        getJupiterTokenInfo(token),
+        getOnChainMintSupply(token),
       ]);
       if (priceQuote?.outAmount) {
         const solAmount = amountLamports / 1e9;
-        const tokenDecimals = Number(tokenInfo?.decimals ?? 9);
+        const tokenDecimals = supplyInfo.available ? supplyInfo.decimals : 9;
         const tokenAmount = Number(priceQuote.outAmount) / 10 ** tokenDecimals;
         price =
           type === "buy" ? solAmount / tokenAmount : tokenAmount / solAmount;

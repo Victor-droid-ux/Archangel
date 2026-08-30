@@ -1,7 +1,7 @@
 // backend/src/services/emergencyExit.service.ts
 import { Connection, PublicKey, Commitment } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
-import { getJupiterTokenInfo, getSolPriceUsd } from "./jupiter.service.js";
+import { getSolPriceUsd, resolveLiquidityUsd } from "./jupiter.service.js";
 
 const LOG = getLogger("emergency-exit");
 
@@ -36,7 +36,7 @@ interface EmergencyTrigger {
  */
 export async function checkLPRemoval(
   tokenMint: string,
-  poolAddress?: string
+  poolAddress?: string,
 ): Promise<EmergencyTrigger> {
   try {
     if (!poolAddress) {
@@ -52,7 +52,7 @@ export async function checkLPRemoval(
     if (!accountInfo) {
       LOG.error(
         { tokenMint, poolAddress },
-        "EMERGENCY: Liquidity pool account not found - LP REMOVED!"
+        "EMERGENCY: Liquidity pool account not found - LP REMOVED!",
       );
       return {
         triggered: true,
@@ -65,7 +65,7 @@ export async function checkLPRemoval(
     if (accountInfo.lamports === 0) {
       LOG.error(
         { tokenMint, poolAddress },
-        "EMERGENCY: Liquidity pool closed - LP REMOVED!"
+        "EMERGENCY: Liquidity pool closed - LP REMOVED!",
       );
       return {
         triggered: true,
@@ -78,7 +78,7 @@ export async function checkLPRemoval(
   } catch (err: any) {
     LOG.error(
       { err: err.message || err, tokenMint },
-      "Error checking LP removal"
+      "Error checking LP removal",
     );
     return { triggered: false, severity: "medium" };
   }
@@ -91,7 +91,7 @@ export async function checkLPRemoval(
  */
 export async function detectLargeSell(
   tokenMint: string,
-  poolAddress?: string
+  poolAddress?: string,
 ): Promise<EmergencyTrigger> {
   try {
     if (!poolAddress) {
@@ -125,15 +125,18 @@ export async function detectLargeSell(
 
     // Real per-token liquidity, not a fixed SOL amount — a thin pool can be
     // drained by well under 10 SOL, and a deep one shouldn't flag on 10 SOL
-    // moving at all.
-    const [tokenInfo, solPriceUsd] = await Promise.all([
-      getJupiterTokenInfo(tokenMint),
-      getSolPriceUsd(),
-    ]);
-    if (!tokenInfo?.liquidity || !solPriceUsd) {
+    // moving at all. Derived from a price-impact estimate off a real quote —
+    // a trading function, not a Jupiter catalog/metadata fetch.
+    const solPriceUsd = await getSolPriceUsd();
+    if (!solPriceUsd) {
       return { triggered: false, severity: "high" };
     }
-    const poolLiquiditySol = tokenInfo.liquidity / solPriceUsd;
+    const { liquidityUSD } = await resolveLiquidityUsd(
+      tokenMint,
+      0,
+      solPriceUsd,
+    );
+    const poolLiquiditySol = liquidityUSD / solPriceUsd;
     if (!(poolLiquiditySol > 0)) {
       return { triggered: false, severity: "high" };
     }
@@ -159,7 +162,7 @@ export async function detectLargeSell(
             lpPct: (lpPct * 100).toFixed(1),
             signature: latestSig.signature,
           },
-          "Large transaction detected relative to pool size - potential dump"
+          "Large transaction detected relative to pool size - potential dump",
         );
         return {
           triggered: true,
@@ -175,7 +178,7 @@ export async function detectLargeSell(
   } catch (err: any) {
     LOG.error(
       { err: err.message || err, tokenMint },
-      "Error detecting large sell"
+      "Error detecting large sell",
     );
     return { triggered: false, severity: "high" };
   }
@@ -194,7 +197,7 @@ const priceHistory = new Map<string, PricePoint[]>();
  */
 export async function detectRedCandle(
   tokenMint: string,
-  currentPrice: number
+  currentPrice: number,
 ): Promise<EmergencyTrigger> {
   try {
     const now = Date.now();
@@ -210,7 +213,7 @@ export async function detectRedCandle(
     // Check for 60% drop in last 10 seconds
     const tenSecondsAgo = now - 10000;
     const recentPrices = recentHistory.filter(
-      (p) => p.timestamp >= tenSecondsAgo
+      (p) => p.timestamp >= tenSecondsAgo,
     );
 
     if (recentPrices.length < 2) {
@@ -230,12 +233,12 @@ export async function detectRedCandle(
           lowestRecent,
           dropPct: (dropPct * 100).toFixed(1),
         },
-        "EMERGENCY: 60% red candle detected!"
+        "EMERGENCY: 60% red candle detected!",
       );
       return {
         triggered: true,
         reason: `60% price crash in 10 seconds (${(dropPct * 100).toFixed(
-          1
+          1,
         )}% drop)`,
         severity: "critical",
       };
@@ -245,7 +248,7 @@ export async function detectRedCandle(
   } catch (err: any) {
     LOG.error(
       { err: err.message || err, tokenMint },
-      "Error detecting red candle"
+      "Error detecting red candle",
     );
     return { triggered: false, severity: "high" };
   }
@@ -259,13 +262,13 @@ export async function detectRedCandle(
  */
 export async function detectCreatorSell(
   tokenMint: string,
-  creatorAddress?: string
+  creatorAddress?: string,
 ): Promise<EmergencyTrigger> {
   try {
     if (!creatorAddress) {
       LOG.debug(
         { tokenMint },
-        "No creator address provided for creator sell check"
+        "No creator address provided for creator sell check",
       );
       return { triggered: false, severity: "high" };
     }
@@ -283,7 +286,7 @@ export async function detectCreatorSell(
     // Only worth parsing transactions from the last 30s — anything older
     // isn't a "just happened" signal worth an emergency reaction.
     const recentSigs = signatures.filter(
-      (s) => s.blockTime && now - s.blockTime < 30
+      (s) => s.blockTime && now - s.blockTime < 30,
     );
     if (recentSigs.length === 0) {
       return { triggered: false, severity: "high" };
@@ -307,7 +310,7 @@ export async function detectCreatorSell(
           (p) =>
             p.mint === tokenMint &&
             p.owner === creatorAddress &&
-            p.accountIndex === postBal.accountIndex
+            p.accountIndex === postBal.accountIndex,
         );
         const preAmount = Number(preBal?.uiTokenAmount.uiAmount ?? 0);
         const postAmount = Number(postBal.uiTokenAmount.uiAmount ?? 0);
@@ -321,7 +324,7 @@ export async function detectCreatorSell(
               postAmount,
               signature: sigInfo.signature,
             },
-            "Creator wallet reduced its holding of this token"
+            "Creator wallet reduced its holding of this token",
           );
           return {
             triggered: true,
@@ -336,7 +339,7 @@ export async function detectCreatorSell(
   } catch (err: any) {
     LOG.error(
       { err: err.message || err, tokenMint },
-      "Error detecting creator sell"
+      "Error detecting creator sell",
     );
     return { triggered: false, severity: "high" };
   }
@@ -350,7 +353,7 @@ export async function checkAllEmergencyTriggers(
   tokenMint: string,
   currentPrice: number,
   poolAddress?: string,
-  creatorAddress?: string
+  creatorAddress?: string,
 ): Promise<{
   shouldExit: boolean;
   triggers: EmergencyTrigger[];
@@ -366,7 +369,7 @@ export async function checkAllEmergencyTriggers(
 
     // Check for any critical triggers
     const criticalTrigger = triggers.find(
-      (t) => t.triggered && t.severity === "critical"
+      (t) => t.triggered && t.severity === "critical",
     );
 
     if (criticalTrigger) {
@@ -379,7 +382,7 @@ export async function checkAllEmergencyTriggers(
 
     // Check for multiple high-severity triggers
     const highTriggers = triggers.filter(
-      (t) => t.triggered && t.severity === "high"
+      (t) => t.triggered && t.severity === "high",
     );
 
     if (highTriggers.length >= 2) {
@@ -399,7 +402,7 @@ export async function checkAllEmergencyTriggers(
   } catch (err: any) {
     LOG.error(
       { err: err.message || err, tokenMint },
-      "Error checking emergency triggers"
+      "Error checking emergency triggers",
     );
     return {
       shouldExit: false,

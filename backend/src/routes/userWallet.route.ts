@@ -7,8 +7,8 @@ import { verifyWalletAuth } from "../utils/walletAuth.js";
 const router = Router();
 const log = getLogger("userWallet.route");
 
-// Below this, AUTO_TRADE_PERCENT_OF_BALANCE sizing (autoBuyer.service.ts)
-// can never produce a trade that clears MIN_AUTO_TRADE_SOL, regardless of
+// Below this, AUTO_TRADE_PERCENT_OF_BALANCE sizing (validationPipeline.service.ts's
+// runPipeline, Stage 0) can never produce a trade that clears MIN_AUTO_TRADE_SOL, regardless of
 // auto-trade being enabled — e.g. 0.02 * balance >= 0.01 needs >= 0.5 SOL.
 // Exposed here so the frontend can tell a user this concretely, instead of
 // auto-trade silently never firing for an underfunded wallet.

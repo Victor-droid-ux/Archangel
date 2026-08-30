@@ -1,7 +1,7 @@
 // backend/src/__tests__/routes.test.ts
 // Integration tests for key HTTP routes via supertest against a real
 // createApp() instance and a real in-memory MongoDB. Routes that depend on
-// live external APIs (Jupiter price data) are mocked so the suite stays
+// live external APIs (price data) are mocked so the suite stays
 // fast and doesn't require network access to pass.
 import request from "supertest";
 import nacl from "tweetnacl";
@@ -12,11 +12,19 @@ import { startTestDb, stopTestDb } from "./testDb.js";
 jest.mock("../services/jupiter.service.js", () => ({
   __esModule: true,
   getSolPriceUsd: jest.fn().mockResolvedValue(200),
-  getJupiterTokenInfo: jest.fn().mockResolvedValue({ usdPrice: 0.4 }),
   SOL_MINT: "So11111111111111111111111111111111111111112",
   default: {
     getSolPriceUsd: jest.fn().mockResolvedValue(200),
-    getTokenInfo: jest.fn().mockResolvedValue({ usdPrice: 0.4 }),
+  },
+}));
+
+// positions.route.ts prices open positions via Birdeye (Jupiter's role in
+// this codebase is strictly trading — quotes/execution — never fetching a
+// token's price for display), so that's what needs mocking here now.
+jest.mock("../services/birdeye.service.js", () => ({
+  __esModule: true,
+  default: {
+    getCurrentPrice: jest.fn().mockResolvedValue(0.4),
   },
 }));
 
@@ -66,7 +74,7 @@ describe("GET /api/positions", () => {
     const res = await request(app).get(`/api/positions?wallet=${wallet}`);
     expect(res.statusCode).toBe(200);
     const pos = res.body.positions.find(
-      (p: any) => p.token === "MINT_ROUTE_POSITION"
+      (p: any) => p.token === "MINT_ROUTE_POSITION",
     );
     expect(pos).toBeDefined();
 
@@ -125,7 +133,7 @@ describe("POST/GET /api/user/settings — real persistence round-trip", () => {
     const message = `ArchAngel auth\nwallet: ${wallet}\ntimestamp: ${timestamp}`;
     const signature = nacl.sign.detached(
       new TextEncoder().encode(message),
-      testWalletKeypair.secretKey
+      testWalletKeypair.secretKey,
     );
     return {
       walletAuthTimestamp: timestamp,
@@ -157,7 +165,7 @@ describe("POST/GET /api/user/settings — real persistence round-trip", () => {
     expect(saveRes.body.success).toBe(true);
 
     const loadRes = await request(app).get(
-      `/api/user/settings?wallet=${wallet}`
+      `/api/user/settings?wallet=${wallet}`,
     );
     expect(loadRes.statusCode).toBe(200);
     expect(loadRes.body.data.amount).toBe(0.3);
@@ -196,7 +204,7 @@ describe("Watchlist routes", () => {
 
   it("404s deleting a mint that was never watched", async () => {
     const res = await request(app).delete(
-      "/api/watchlist/NeverWatchedMint555555555555555555555555"
+      "/api/watchlist/NeverWatchedMint555555555555555555555555",
     );
     expect(res.statusCode).toBe(404);
   });

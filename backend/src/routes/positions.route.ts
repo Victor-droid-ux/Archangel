@@ -1,6 +1,7 @@
 import { Router } from "express";
 import dbService from "../services/db.service.js";
-import { getJupiterTokenInfo, getSolPriceUsd } from "../services/jupiter.service.js";
+import { getSolPriceUsd } from "../services/jupiter.service.js";
+import birdeyeService from "../services/birdeye.service.js";
 import { getLogger } from "../utils/logger.js";
 
 const router = Router();
@@ -31,14 +32,19 @@ router.get("/", async (req, res) => {
       positions.map(async (p) => {
         let currentPrice = 0; // SOL-denominated, same unit as avgBuyPrice
         try {
-          const info = await getJupiterTokenInfo(p.token);
-          if (info && solPriceUsd > 0) {
-            currentPrice = info.usdPrice / solPriceUsd;
+          // Fair-value price from Birdeye, not a Jupiter quote/catalog fetch
+          // — Jupiter's role in this codebase is strictly trading, never
+          // pricing a position for display (same reasoning as
+          // monitor.service.ts's mark-to-market and
+          // portfolioValuation.service.ts).
+          const priceUsd = await birdeyeService.getCurrentPrice(p.token);
+          if (priceUsd && solPriceUsd > 0) {
+            currentPrice = priceUsd / solPriceUsd;
           }
         } catch (err: any) {
           log.warn(
             { token: p.token.slice(0, 8), err: err?.message },
-            "Failed to fetch live price for position"
+            "Failed to fetch live price for position",
           );
         }
 
@@ -59,7 +65,7 @@ router.get("/", async (req, res) => {
           unrealizedPnlSol,
           unrealizedPnlPct,
         };
-      })
+      }),
     );
 
     res.json({

@@ -2,7 +2,6 @@ import jupiterService, {
   SOL_MINT,
   getSolPriceUsd,
   resolveLiquidityUsd,
-  type JupiterRecentToken,
 } from "./jupiter.service.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -29,7 +28,6 @@ export interface TokenLifecycleResult {
   stage: TokenLifecycleStage;
   hasLiquidity: boolean;
   liquiditySOL?: number;
-  poolAddress?: string;
   isTradable: boolean;
   errorMessage?: string;
   timestamp: number;
@@ -37,16 +35,16 @@ export interface TokenLifecycleResult {
 
 /**
  * Validate a token's tradability via Jupiter: a real quote + real liquidity.
- *
- * `prefetchedTokenInfo` lets a batch caller (validateTokenBatch) pass in a
- * tokenInfo it already fetched for the whole batch in one request, instead
- * of this function doing its own per-mint /tokens/v2/search call. Pass
- * `undefined` (the default) to have it fetched here for a standalone call;
- * pass `null` explicitly if the batch lookup ran but didn't find this mint.
+ * Deliberately quote-only — Jupiter's role here is strictly trading (does a
+ * route exist, and how deep is the liquidity behind it, both derived from
+ * actual quotes), never a token metadata/catalog fetch. That means no pool
+ * address is available here (that used to come from Jupiter's catalog data,
+ * which isn't fetched anywhere in this pipeline anymore); callers that need
+ * a pool address have it from elsewhere (the QuickNode webhook event that
+ * found the token in the first place — see candidatePipeline.service.ts).
  */
 export async function validateTokenLifecycle(
   tokenMint: string,
-  prefetchedTokenInfo?: JupiterRecentToken | null
 ): Promise<TokenLifecycleResult> {
   const result: TokenLifecycleResult = {
     mint: tokenMint,
@@ -60,19 +58,10 @@ export async function validateTokenLifecycle(
     log.info(`Validating lifecycle for token ${tokenMint.slice(0, 8)}...`);
 
     const smallAmountLamports = 1_000_000; // 0.001 SOL
-    const needsTokenInfoFetch = prefetchedTokenInfo === undefined;
-    const [quote, fetchedTokenInfo, solPriceUsd] = await Promise.all([
+    const [quote, solPriceUsd] = await Promise.all([
       jupiterService.getQuote(SOL_MINT, tokenMint, smallAmountLamports, 500),
-      needsTokenInfoFetch
-        ? jupiterService.getTokenInfo(tokenMint)
-        : Promise.resolve(prefetchedTokenInfo ?? null),
       getSolPriceUsd(),
     ]);
-    const tokenInfo = fetchedTokenInfo;
-
-    if (tokenInfo?.firstPoolId) {
-      result.poolAddress = tokenInfo.firstPoolId;
-    }
 
     if (!quote) {
       result.stage = TokenLifecycleStage.NOT_TRADABLE;
@@ -82,23 +71,16 @@ export async function validateTokenLifecycle(
       return result;
     }
 
-    // tokenInfo?.liquidity comes from a separate Jupiter lookup
-    // (/tokens/v2/search) than the quote above (/swap/v1/quote) — a catalog
-    // miss/lag there must not read as "$0 liquidity" when the quote just
-    // proved a real route exists. resolveLiquidityUsd() falls back to a
-    // price-impact estimate from an actual quote instead of trusting a zero.
-    //
-    // (This also carries forward a fix from before this batching change: the
-    // liquidity figure is USD and must be divided by the SOL price to become
-    // "SOL" — it was previously written straight into liquiditySOL with no
-    // conversion, which made the ~0.05 SOL threshold this gates against
-    // downstream pass for essentially any token regardless of real liquidity.)
+    // Liquidity derived purely from a price-impact estimate off the quote
+    // above — no separate Jupiter catalog lookup involved, so a token that
+    // just got a route can never read as "$0 liquidity" from a stale/missing
+    // catalog entry. (The liquidity figure is USD and must be divided by the
+    // SOL price to become "SOL".)
     const minLiquidityUsdHint = 0.05 * solPriceUsd; // rough USD equivalent of the downstream 0.05 SOL floor
     const { liquidityUSD } = await resolveLiquidityUsd(
       tokenMint,
       minLiquidityUsdHint,
-      tokenInfo,
-      solPriceUsd
+      solPriceUsd,
     );
     const liquiditySOL = solPriceUsd > 0 ? liquidityUSD / solPriceUsd : 0;
     result.liquiditySOL = liquiditySOL;
@@ -109,21 +91,23 @@ export async function validateTokenLifecycle(
       result.isTradable = true;
       log.info(
         `Token ${tokenMint.slice(0, 8)}... is tradable via Jupiter with ${liquiditySOL.toFixed(
-          4
-        )} SOL liquidity`
+          4,
+        )} SOL liquidity`,
       );
     } else {
       result.stage = TokenLifecycleStage.ZERO_LIQUIDITY;
       result.isTradable = false;
       result.errorMessage = "Jupiter route exists but liquidity is zero";
-      log.warn(`Token ${tokenMint.slice(0, 8)}... has a route but zero liquidity`);
+      log.warn(
+        `Token ${tokenMint.slice(0, 8)}... has a route but zero liquidity`,
+      );
     }
 
     return result;
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     log.error(
-      `Lifecycle validation failed for ${tokenMint.slice(0, 8)}...: ${errorMsg}`
+      `Lifecycle validation failed for ${tokenMint.slice(0, 8)}...: ${errorMsg}`,
     );
 
     result.stage = TokenLifecycleStage.UNKNOWN;
@@ -134,7 +118,10 @@ export async function validateTokenLifecycle(
 }
 
 /**
- * Batch validate multiple tokens and classify them
+ * Batch validate multiple tokens and classify them. No longer prefetches a
+ * batch catalog lookup (there's nothing to prefetch — each validation below
+ * is just a quote + a price-impact estimate, both per-mint trading calls
+ * that don't benefit from batching the way a catalog search did).
  */
 export async function validateTokenBatch(tokenMints: string[]): Promise<{
   tradable: TokenLifecycleResult[];
@@ -148,17 +135,8 @@ export async function validateTokenBatch(tokenMints: string[]): Promise<{
 }> {
   log.info(`Batch validating ${tokenMints.length} tokens...`);
 
-  // One batched /tokens/v2/search call for the whole set instead of each
-  // validateTokenLifecycle() call doing its own — this is what was turning
-  // a routine 4-30 token discovery cycle into 4-30 separate rate-limited
-  // requests, stacking on top of whatever autoBuyer/storedTokenChecker were
-  // firing at the same time.
-  const tokenInfoByMint = await jupiterService.getTokenInfoBatch(tokenMints);
-
   const results = await Promise.all(
-    tokenMints.map((mint) =>
-      validateTokenLifecycle(mint, tokenInfoByMint.get(mint) ?? null)
-    )
+    tokenMints.map((mint) => validateTokenLifecycle(mint)),
   );
 
   const tradable = results.filter((r) => r.isTradable);
@@ -168,14 +146,15 @@ export async function validateTokenBatch(tokenMints: string[]): Promise<{
     total: results.length,
     tradableCount: tradable.length,
     zeroLiquidity: results.filter(
-      (r) => r.stage === TokenLifecycleStage.ZERO_LIQUIDITY
+      (r) => r.stage === TokenLifecycleStage.ZERO_LIQUIDITY,
     ).length,
-    unknown: results.filter((r) => r.stage === TokenLifecycleStage.UNKNOWN).length,
+    unknown: results.filter((r) => r.stage === TokenLifecycleStage.UNKNOWN)
+      .length,
   };
 
   log.info(
     `Batch validation complete: ${summary.tradableCount}/${summary.total} tradable ` +
-      `(${summary.zeroLiquidity} zero liquidity, ${summary.unknown} unknown)`
+      `(${summary.zeroLiquidity} zero liquidity, ${summary.unknown} unknown)`,
   );
 
   return { tradable, notTradable, summary };
@@ -184,7 +163,9 @@ export async function validateTokenBatch(tokenMints: string[]): Promise<{
 /**
  * Get human-readable status message for lifecycle result
  */
-export function getLifecycleStatusMessage(result: TokenLifecycleResult): string {
+export function getLifecycleStatusMessage(
+  result: TokenLifecycleResult,
+): string {
   switch (result.stage) {
     case TokenLifecycleStage.TRADABLE:
       return `✅ Tradable via Jupiter with ${

@@ -161,7 +161,11 @@ export type TokenState = {
   symbol?: string;
   name?: string;
   state: TokenLifecycleState;
-  source: "jupiter" | "other";
+  // "quicknode" = discovered via the QuickNode pool-creation webhook (the
+  // current single discovery path). "jupiter" is kept for rows written by
+  // the old Jupiter-polling discovery loops prior to this pipeline
+  // consolidation; "other" remains a catch-all.
+  source: "quicknode" | "jupiter" | "other";
 
   marketCapUSD?: number;
   launchMarketCapUSD?: number;
@@ -526,9 +530,10 @@ export async function releaseDiscoveryMint(
 
 /**
  * How many trades this wallet has ever taken — counts distinct tokens
- * bought, not raw buy-fill rows: a 2-tranche buy (see autoBuyer.service.ts)
- * records two separate "buy" TradeRecords for what a trader perceives as one
- * trade/position, so counting raw fills would silently double it. Used by
+ * bought, not raw buy-fill rows: a multi-fill buy (e.g. historical 2-tranche
+ * buys from before the pipeline consolidation) can record more than one
+ * "buy" TradeRecord for what a trader perceives as one trade/position, so
+ * counting raw fills would silently double-count it. Used by
  * multiUserExecution.service.ts to enforce each wallet's own Max Total
  * Trades setting — computed live from real trade history rather than a
  * separate incrementing counter, so it can never drift (same reasoning as

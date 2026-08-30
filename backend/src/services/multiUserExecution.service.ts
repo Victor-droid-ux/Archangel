@@ -1,15 +1,16 @@
 // backend/src/services/multiUserExecution.service.ts
 //
-// Phase 4 of per-user custodial trading: once a token has been discovered
-// and looks like a real candidate, this fans the buy decision out across
+// Implements Phases 5–6 (Jupiter quote + trading) of the candidate pipeline
+// (see candidatePipeline.service.ts) on a per-user custodial basis: once a
+// token has cleared Phase 3 (Jupiter tradeability) and Phase 4 (ArchAngel
+// filtering) exactly once, globally, this fans the buy decision out across
 // every eligible funded, auto-trade-enabled user — each one independently
 // risk-checked and executed with their OWN hot wallet (see userWallet.service.ts)
 // — instead of a single admin wallet deciding once for everyone. The token-
-// intrinsic validation stages (liquidity, routing, authority, market health)
-// still only need to be correct once; what genuinely differs per user is
-// balance, existing positions, and settings, all of which
-// validationPipeline.service.ts's runPipeline() already re-checks per
-// WalletContext passed to it.
+// intrinsic checks (liquidity, routing, authority, market health) never get
+// re-run here; what genuinely differs per user is balance, existing
+// positions, and settings, all of which validationPipeline.service.ts's
+// runPipeline() re-checks per WalletContext passed to it.
 import { getLogger } from "../utils/logger.js";
 import validationPipelineService, {
   WalletContext,
@@ -37,10 +38,7 @@ const OPERATOR_WALLET =
   process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
 
 export interface LaunchMetrics {
-  marketCapUSD: number;
   marketCapSOL: number;
-  liquidityUSD: number;
-  liquiditySOL: number;
 }
 
 export function launchMetricsWithinLimits(
@@ -48,15 +46,8 @@ export function launchMetricsWithinLimits(
   config: Awaited<ReturnType<typeof getEffectiveConfig>>,
 ): boolean {
   return (
-    Object.values(metrics).every((value) => Number.isFinite(value)) &&
-    metrics.marketCapUSD >= config.minMarketCapUsd &&
-    metrics.marketCapUSD <= config.maxMarketCapUsd &&
-    metrics.marketCapSOL >= config.minMarketCapSol &&
-    metrics.marketCapSOL <= config.maxMarketCapSol &&
-    metrics.liquidityUSD >= config.minLiquidityUsd &&
-    metrics.liquidityUSD <= config.maxLiquidityUsd &&
-    metrics.liquiditySOL >= config.minLiquiditySol &&
-    metrics.liquiditySOL <= config.maxLiquiditySol
+    Number.isFinite(metrics.marketCapSOL) &&
+    metrics.marketCapSOL >= config.minMarketCapSol
   );
 }
 
@@ -65,23 +56,20 @@ export function launchMetricsFromTokenState(
 ): LaunchMetrics | null {
   if (!state) return null;
   return {
-    marketCapUSD: Number(state.launchMarketCapUSD),
     marketCapSOL: Number(state.launchMarketCapSOL),
-    liquidityUSD: Number(state.launchLiquidityUSD),
-    liquiditySOL: Number(state.launchLiquiditySOL),
   };
 }
 
 export function launchAgeWithinWindow(
   poolCreatedAt: Date | string | undefined,
   now: number,
-  window: { min: number; max: number },
+  minSecondsSinceLaunch: number,
 ): boolean {
   if (!poolCreatedAt) return false;
   const createdAt = new Date(poolCreatedAt).getTime();
   if (!Number.isFinite(createdAt)) return false;
   const ageSeconds = (now - createdAt) / 1000;
-  return ageSeconds >= window.min && ageSeconds <= window.max;
+  return ageSeconds >= minSecondsSinceLaunch;
 }
 
 function operatorWalletContext(): WalletContext {
@@ -112,7 +100,7 @@ async function isUnderTradeCap(wallet: string): Promise<boolean> {
  * this second check, "Stop Auto Trade" disabling the flag mid-fan-out
  * wouldn't stop a buy for a wallet that was already in this run's eligible
  * list before the flag flipped — see the per-wallet re-check in
- * autoBuyer.service.ts and runPipelineForAllEligibleWallets below.
+ * runPipelineForAllEligibleWallets below.
  *
  * The operator defaults to enabled (unchanged from before this flag existed,
  * so nobody who's never touched Global Trade Settings sees a behavior
@@ -256,7 +244,7 @@ export async function runPipelineForAllEligibleWallets(
       if (!launchMetrics || !launchMetricsWithinLimits(launchMetrics, config)) {
         LOG.info(
           { ownerWallet: walletContext.ownerWallet, tokenMint, launchMetrics },
-          "Skipping wallet: launch market cap/liquidity is outside its configured limits",
+          "Skipping wallet: launch market cap is below its configured minimum",
         );
         continue;
       }
@@ -265,7 +253,6 @@ export async function runPipelineForAllEligibleWallets(
         walletContext.ownerWallet,
       );
       if (
-        !launchWindow ||
         !launchAgeWithinWindow(
           (await dbService.getTokenState(tokenMint))?.poolCreatedAt,
           Date.now(),
@@ -279,12 +266,11 @@ export async function runPipelineForAllEligibleWallets(
         continue;
       }
 
-      // Serialized per wallet (see walletMutex.ts) — this pipeline and
-      // autoBuyer.service.ts's both size trades as a percentage of live
-      // balance, so a wallet with a buy already in flight (from either
-      // pipeline, for a different token) must not have a second one read
-      // the same stale balance concurrently. This one waits its turn and
-      // sizes against whatever's actually left afterward.
+      // Serialized per wallet (see walletMutex.ts) — this pipeline sizes
+      // trades as a percentage of live balance, so a wallet with a buy
+      // already in flight (for a different candidate mint) must not have a
+      // second one read the same stale balance concurrently. This one waits
+      // its turn and sizes against whatever's actually left afterward.
       const result = await withWalletLock(walletContext.ownerWallet, () =>
         validationPipelineService.runPipeline(tokenMint, lpSol, walletContext),
       );

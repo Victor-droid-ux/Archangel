@@ -8,28 +8,28 @@ import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
 import { getConnection, loadKeypairFromEnv } from "./solana.service.js";
 import { ENV } from "../utils/env.js";
-import { quoteCache, tokenDiscoveryCache } from "./cache.service.js";
+import { quoteCache, liquidityCache } from "./cache.service.js";
 
 const LOG = getLogger("jupiter.service");
 
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-// Several independent pipelines (tokenDiscovery, jupiterDiscovery, autoBuyer,
-// tradeValidation, storedTokenChecker) all funnel through this one file and
-// can each fire Jupiter calls for multiple tokens in the same instant. The
-// previous approach here just checked "has enough time passed since the last
-// request" — but that check-then-set isn't atomic across independent async
-// call chains: several chains can all read the same stale `lastRequestAt`,
-// each conclude they're clear to fire, and burst anyway. This queue instead
-// gives every outgoing Jupiter request a single, real dispatch point: one
-// FIFO queue, a hard concurrency cap, and a minimum spacing between dispatch
-// times, enforced centrally rather than hoped for.
+// The candidate pipeline can be processing several mints concurrently
+// (concurrent webhook deliveries) and each stage — tradeability, filtering,
+// per-wallet quoting — fires its own Jupiter calls, all funneling through
+// this one file. A naive "has enough time passed since the last request"
+// check isn't atomic across independent async call chains: several chains
+// can all read the same stale `lastRequestAt`, each conclude they're clear
+// to fire, and burst anyway. This queue instead gives every outgoing
+// Jupiter request a single, real dispatch point: one FIFO queue, a hard
+// concurrency cap, and a minimum spacing between dispatch times, enforced
+// centrally rather than hoped for.
 const MAX_CONCURRENT_REQUESTS = Number(
-  process.env.JUPITER_MAX_CONCURRENT_REQUESTS ?? 4
+  process.env.JUPITER_MAX_CONCURRENT_REQUESTS ?? 4,
 );
 const MIN_REQUEST_SPACING_MS = Number(
-  process.env.JUPITER_MIN_REQUEST_SPACING_MS ?? 150
+  process.env.JUPITER_MIN_REQUEST_SPACING_MS ?? 150,
 );
 
 interface QueuedRequest {
@@ -71,7 +71,7 @@ function pumpQueue(): void {
       activeRequests--;
       item.reject(err);
       pumpQueue();
-    }
+    },
   );
 
   // Concurrency slot may still be free (or spacing may already be clear for
@@ -93,14 +93,14 @@ function scheduleJupiterRequest<T>(fn: () => Promise<T>): Promise<T> {
 
 const DEFAULT_RETRIES = Number(process.env.JUPITER_MAX_RETRIES ?? 4);
 const RETRY_BACKOFF_BASE_MS = Number(
-  process.env.JUPITER_RETRY_BACKOFF_BASE_MS ?? 1000
+  process.env.JUPITER_RETRY_BACKOFF_BASE_MS ?? 1000,
 );
 
 async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
   attempt = 0,
-  retries = DEFAULT_RETRIES
+  retries = DEFAULT_RETRIES,
 ): Promise<T> {
   try {
     return await scheduleJupiterRequest(fn);
@@ -114,7 +114,7 @@ async function withRetry<T>(
       LOG.warn(
         `Jupiter ${label} 429 — retrying in ${backoffMs}ms (attempt ${
           attempt + 1
-        }/${retries})`
+        }/${retries})`,
       );
       await new Promise((resolve) => setTimeout(resolve, backoffMs));
       return withRetry(fn, label, attempt + 1, retries);
@@ -140,11 +140,16 @@ export async function getSolPriceUsd(): Promise<number> {
         axios.get(
           `${process.env.JUPITER_API_URL || "https://lite-api.jup.ag"}/swap/v1/quote`,
           {
-            params: { inputMint: SOL_MINT, outputMint: USDC_MINT, amount: 1e9, slippageBps: 100 },
+            params: {
+              inputMint: SOL_MINT,
+              outputMint: USDC_MINT,
+              amount: 1e9,
+              slippageBps: 100,
+            },
             timeout: 8000,
-          }
+          },
         ),
-      "getSolPriceUsd"
+      "getSolPriceUsd",
     );
     if (data?.outAmount) {
       const price = Number(data.outAmount) / 1e6; // USDC has 6 decimals
@@ -154,7 +159,7 @@ export async function getSolPriceUsd(): Promise<number> {
   } catch (err: any) {
     LOG.warn(
       { err: err?.message ?? String(err) },
-      "Failed to fetch live SOL price, using fallback"
+      "Failed to fetch live SOL price, using fallback",
     );
   }
   return cachedSolPriceUsd?.price ?? 150; // conservative fallback
@@ -178,72 +183,6 @@ export interface JupiterSwapResult {
   error?: string;
 }
 
-export interface JupiterRecentToken {
-  mint: string;
-  name: string;
-  symbol: string;
-  decimals: number;
-  liquidity: number;
-  mcap: number;
-  usdPrice: number;
-  circSupply: number;
-  totalSupply: number;
-  priceChange1h: number | null;
-  priceChange24h: number | null;
-  volume24h: number; // buyVolume + sellVolume from stats24h
-  holderCount: number;
-  organicScore: number;
-  organicScoreLabel: string;
-  buyVolume5m: number;
-  numBuys5m: number;
-  isVerified: boolean;
-  tags: string[];
-  launchpad: string | null; // e.g. "pump.fun" — informational only, not a discovery filter
-  firstPoolId: string | null;
-  firstPoolCreatedAt: number; // ms epoch
-  mintAuthorityDisabled: boolean;
-  freezeAuthorityDisabled: boolean;
-  devAddress: string | null; // token creator/dev wallet, per Jupiter's `dev` field
-}
-
-// Maps a raw /tokens/v2 API record to our shape. Field names verified against live
-// responses on 2026-08-12 — see audit.mintAuthorityDisabled/freezeAuthorityDisabled
-// (booleans, not addresses), stats24h.priceChange/buyVolume/sellVolume (present on
-// established tokens, often absent on genuinely brand-new ones with no trade history yet).
-function mapRecentToken(t: any): JupiterRecentToken {
-  const stats24h = t.stats24h ?? {};
-  const stats1h = t.stats1h ?? {};
-  return {
-    mint: t.id,
-    name: t.name ?? "Unknown",
-    symbol: t.symbol ?? "UNKNOWN",
-    decimals: Number(t.decimals ?? 9),
-    liquidity: Number(t.liquidity ?? 0),
-    mcap: Number(t.mcap ?? t.fdv ?? 0),
-    usdPrice: Number(t.usdPrice ?? 0),
-    circSupply: Number(t.circSupply ?? 0),
-    totalSupply: Number(t.totalSupply ?? 0),
-    priceChange1h: stats1h.priceChange != null ? Number(stats1h.priceChange) : null,
-    priceChange24h: stats24h.priceChange != null ? Number(stats24h.priceChange) : null,
-    volume24h: Number(stats24h.buyVolume ?? 0) + Number(stats24h.sellVolume ?? 0),
-    holderCount: Number(t.holderCount ?? 0),
-    organicScore: Number(t.organicScore ?? 0),
-    organicScoreLabel: t.organicScoreLabel ?? "unknown",
-    buyVolume5m: Number(t.stats5m?.buyVolume ?? 0),
-    numBuys5m: Number(t.stats5m?.numBuys ?? 0),
-    isVerified: Boolean(t.isVerified),
-    tags: Array.isArray(t.tags) ? t.tags : [],
-    launchpad: t.launchpad ?? null,
-    firstPoolId: t.firstPool?.id ?? null,
-    firstPoolCreatedAt: t.firstPool?.createdAt
-      ? new Date(t.firstPool.createdAt).getTime()
-      : 0,
-    mintAuthorityDisabled: Boolean(t.audit?.mintAuthorityDisabled),
-    freezeAuthorityDisabled: Boolean(t.audit?.freezeAuthorityDisabled),
-    devAddress: typeof t.dev === "string" ? t.dev : null,
-  };
-}
-
 class JupiterService {
   private baseUrl: string;
   private apiKey: string;
@@ -264,7 +203,7 @@ class JupiterService {
     inputMint: string,
     outputMint: string,
     amountLamports: number | string | bigint,
-    slippageBps = 500
+    slippageBps = 500,
   ): Promise<JupiterQuote | null> {
     try {
       const amountStr = String(amountLamports);
@@ -285,13 +224,13 @@ class JupiterService {
             headers: this.headers(),
             timeout: 8000,
           }),
-        "getQuote"
+        "getQuote",
       );
 
       if (!data || !data.outAmount) {
         LOG.warn(
           { inputMint, outputMint },
-          "Jupiter quote returned no route/outAmount"
+          "Jupiter quote returned no route/outAmount",
         );
         return null;
       }
@@ -301,7 +240,9 @@ class JupiterService {
         outputMint: data.outputMint,
         inAmount: Number(data.inAmount),
         outAmount: Number(data.outAmount),
-        otherAmountThreshold: Number(data.otherAmountThreshold ?? data.outAmount),
+        otherAmountThreshold: Number(
+          data.otherAmountThreshold ?? data.outAmount,
+        ),
         priceImpactPct: Number(data.priceImpactPct ?? 0),
         slippageBps: Number(data.slippageBps ?? slippageBps),
         raw: data,
@@ -312,7 +253,7 @@ class JupiterService {
     } catch (err: any) {
       LOG.warn(
         { inputMint, outputMint, err: err?.message ?? String(err) },
-        "Jupiter quote request failed"
+        "Jupiter quote request failed",
       );
       return null;
     }
@@ -324,12 +265,14 @@ class JupiterService {
    */
   async buildSwapTransaction(
     quote: JupiterQuote,
-    userPublicKey: string
+    userPublicKey: string,
   ): Promise<{ swapTransaction: string; lastValidBlockHeight: number } | null> {
     try {
       const priorityFeeLamports = Math.max(
-        Math.round(ENV.JUPITER_PRIORITY_FEE > 0 ? ENV.JUPITER_PRIORITY_FEE * 1e9 : 0),
-        1
+        Math.round(
+          ENV.JUPITER_PRIORITY_FEE > 0 ? ENV.JUPITER_PRIORITY_FEE * 1e9 : 0,
+        ),
+        1,
       );
 
       const { data } = await withRetry(
@@ -343,9 +286,9 @@ class JupiterService {
               dynamicComputeUnitLimit: true,
               prioritizationFeeLamports: priorityFeeLamports || "auto",
             },
-            { headers: this.headers(), timeout: 15000 }
+            { headers: this.headers(), timeout: 15000 },
           ),
-        "buildSwapTransaction"
+        "buildSwapTransaction",
       );
 
       if (!data?.swapTransaction) {
@@ -360,7 +303,7 @@ class JupiterService {
     } catch (err: any) {
       LOG.error(
         { err: err?.response?.data ?? err?.message ?? String(err) },
-        "Failed to build Jupiter swap transaction"
+        "Failed to build Jupiter swap transaction",
       );
       return null;
     }
@@ -368,7 +311,7 @@ class JupiterService {
 
   private async sendRaw(
     connection: Connection,
-    tx: VersionedTransaction
+    tx: VersionedTransaction,
   ): Promise<string> {
     const raw = tx.serialize();
 
@@ -378,7 +321,7 @@ class JupiterService {
         const response = await axios.post(
           ENV.JITO_MEV_RELAY_URL,
           { transaction: base64Tx },
-          { headers: { "Content-Type": "application/json" }, timeout: 10000 }
+          { headers: { "Content-Type": "application/json" }, timeout: 10000 },
         );
         const signature = response.data?.result || response.data?.signature;
         if (signature) {
@@ -389,7 +332,7 @@ class JupiterService {
       } catch (err: any) {
         LOG.warn(
           { err: err?.message ?? String(err) },
-          "Jito relay send failed, falling back to RPC"
+          "Jito relay send failed, falling back to RPC",
         );
       }
     }
@@ -426,18 +369,26 @@ class JupiterService {
     signer?: Keypair;
   }): Promise<JupiterSwapResult> {
     try {
-      const quote = await this.getQuote(inputMint, outputMint, amount, slippageBps);
+      const quote = await this.getQuote(
+        inputMint,
+        outputMint,
+        amount,
+        slippageBps,
+      );
       if (!quote) {
         return { success: false, error: "No Jupiter route/quote available" };
       }
 
       const built = await this.buildSwapTransaction(quote, userPublicKey);
       if (!built) {
-        return { success: false, error: "Failed to build Jupiter swap transaction" };
+        return {
+          success: false,
+          error: "Failed to build Jupiter swap transaction",
+        };
       }
 
       const tx = VersionedTransaction.deserialize(
-        Buffer.from(built.swapTransaction, "base64")
+        Buffer.from(built.swapTransaction, "base64"),
       );
 
       const useReal = process.env.USE_REAL_SWAP === "true";
@@ -480,7 +431,7 @@ class JupiterService {
           blockhash: tx.message.recentBlockhash,
           lastValidBlockHeight: built.lastValidBlockHeight,
         },
-        "confirmed"
+        "confirmed",
       );
 
       LOG.info({ signature }, "Jupiter swap confirmed");
@@ -490,120 +441,6 @@ class JupiterService {
       LOG.error({ err: errorMsg }, "Jupiter swap execution failed");
       return { success: false, error: errorMsg };
     }
-  }
-
-  /**
-   * GET /tokens/v2/recent — recently-tradable tokens, the sole discovery source.
-   * "Recent" is measured from the token's first pool creation time, per Jupiter's docs.
-   */
-  async getRecentTokens(limit = 100): Promise<JupiterRecentToken[]> {
-    try {
-      // Cached briefly so independent pollers (main discovery + on-chain-style
-      // watcher + stored-token re-checks) don't each hit Jupiter separately.
-      const cacheKey = `jupiter:recent:${limit}`;
-      const cached = tokenDiscoveryCache.get<JupiterRecentToken[]>(cacheKey);
-      if (cached) return cached;
-
-      const { data } = await withRetry(
-        () =>
-          axios.get(`${this.baseUrl}/tokens/v2/recent`, {
-            params: { limit },
-            headers: this.headers(),
-            timeout: 8000,
-          }),
-        "getRecentTokens"
-      );
-
-      if (!Array.isArray(data)) return [];
-
-      const tokens = data.map(mapRecentToken);
-      tokenDiscoveryCache.set(cacheKey, tokens);
-      return tokens;
-    } catch (err: any) {
-      LOG.warn(
-        { err: err?.message ?? String(err) },
-        "Failed to fetch Jupiter recent tokens"
-      );
-      return [];
-    }
-  }
-
-  /**
-   * GET /tokens/v2 lookup by mint — used to re-check a single token's metadata/audit.
-   */
-  async getTokenInfo(mint: string): Promise<JupiterRecentToken | null> {
-    try {
-      const { data } = await withRetry(
-        () =>
-          axios.get(`${this.baseUrl}/tokens/v2/search`, {
-            params: { query: mint },
-            headers: this.headers(),
-            timeout: 8000,
-          }),
-        "getTokenInfo"
-      );
-
-      const t = Array.isArray(data) ? data.find((x: any) => x.id === mint) : null;
-      if (!t) return null;
-
-      return mapRecentToken(t);
-    } catch (err: any) {
-      LOG.debug(
-        { mint, err: err?.message ?? String(err) },
-        "Jupiter token info lookup failed"
-      );
-      return null;
-    }
-  }
-
-  /**
-   * Same lookup as getTokenInfo(), but for many mints in one request.
-   * /tokens/v2/search accepts a comma-separated query and returns matches
-   * for all of them together — anything validating a whole batch of tokens
-   * at once (discovery's per-cycle batch, a stored-token sweep) should use
-   * this instead of one getTokenInfo() call per mint; that's what was
-   * turning a 4-30 token batch into 4-30 separate rate-limited requests.
-   * Chunked at 100 mints per call per Jupiter's documented query limit.
-   */
-  async getTokenInfoBatch(
-    mints: string[]
-  ): Promise<Map<string, JupiterRecentToken>> {
-    const result = new Map<string, JupiterRecentToken>();
-    const uniqueMints = [...new Set(mints)];
-    if (uniqueMints.length === 0) return result;
-
-    const CHUNK_SIZE = 100;
-    for (let i = 0; i < uniqueMints.length; i += CHUNK_SIZE) {
-      const chunk = uniqueMints.slice(i, i + CHUNK_SIZE);
-      try {
-        const { data } = await withRetry(
-          () =>
-            axios.get(`${this.baseUrl}/tokens/v2/search`, {
-              params: { query: chunk.join(",") },
-              headers: this.headers(),
-              timeout: 10000,
-            }),
-          "getTokenInfoBatch"
-        );
-
-        if (Array.isArray(data)) {
-          for (const raw of data) {
-            const mapped = mapRecentToken(raw);
-            result.set(mapped.mint, mapped);
-          }
-        }
-      } catch (err: any) {
-        LOG.warn(
-          { err: err?.message ?? String(err), count: chunk.length },
-          "Jupiter batch token info lookup failed"
-        );
-        // Leave this chunk's mints unresolved (absent from the map) rather
-        // than failing the whole batch — callers already treat a missing
-        // entry the same as getTokenInfo() returning null.
-      }
-    }
-
-    return result;
   }
 }
 
@@ -616,50 +453,72 @@ export default jupiterService;
 const MIN_REFERENCE_PROBE_USD = 25;
 
 /**
- * Liquidity for a token, resolved defensively.
+ * Liquidity for a token, resolved purely from a real quote — never from
+ * Jupiter's /tokens/v2/search catalog. Jupiter's role in this codebase is
+ * strictly trading (routing checks, quotes, execution), so this derives
+ * liquidity the same way an actual trade would "feel" it: a price-impact
+ * estimate from one real reference-sized quote, using the same routing
+ * engine the real trade will use. If that reference-sized quote can't
+ * route, that IS genuine evidence of thin liquidity, so it's reported as $0
+ * rather than "unavailable".
  *
- * getTokenInfo()'s /tokens/v2/search catalog and getQuote()'s /swap/v1/quote
- * are two independent Jupiter systems on different update cadences — a
- * brand-new token can have a real, routable pool (quote succeeds) while the
- * search catalog hasn't indexed it yet (tokenInfo is null, or its liquidity
- * field is 0). Treating that catalog gap as "$0 liquidity" rejects a token
- * Jupiter can actually fill.
- *
- * Prefers the catalog figure when it's present (cheap, no extra request).
- * When it's missing or zero, falls back to a price-impact-implied estimate
- * from one real reference-sized quote — the same routing engine the actual
- * trade will use — instead of assuming zero. If even that reference-sized
- * quote can't route, that IS genuine evidence of thin liquidity, not an API
- * miss, so it's reported as $0 rather than "unavailable".
+ * Cached for CACHE_LIQUIDITY_TTL (default 15s, see cache.service.ts) —
+ * callers like emergencyExit.service.ts's detectLargeSell run this on every
+ * monitor tick (every few seconds) for every open position, for that
+ * position's whole lifetime; that check doesn't need millisecond-fresh
+ * liquidity, and without this every tick was a guaranteed live Jupiter quote
+ * call, scaling linearly with concurrent open positions. Keyed on both the
+ * mint and the hint, since the hint changes the reference probe size — two
+ * callers using different hints for the same mint shouldn't share a result.
  */
 export async function resolveLiquidityUsd(
   tokenMint: string,
   minLiquidityUsdHint: number,
-  tokenInfo: JupiterRecentToken | null,
-  solPriceUsd: number
+  solPriceUsd: number,
 ): Promise<{
   liquidityUSD: number;
-  source: "metadata" | "impact-estimate" | "unavailable";
+  source: "impact-estimate" | "unavailable";
 }> {
-  if (tokenInfo?.liquidity) {
-    return { liquidityUSD: tokenInfo.liquidity, source: "metadata" };
-  }
+  const cacheKey = `${tokenMint}:${minLiquidityUsdHint}`;
+  const cached = liquidityCache.get<{
+    liquidityUSD: number;
+    source: "impact-estimate" | "unavailable";
+  }>(cacheKey);
+  if (cached) return cached;
+
+  const result = await resolveLiquidityUsdUncached(
+    tokenMint,
+    minLiquidityUsdHint,
+    solPriceUsd,
+  );
+  liquidityCache.set(cacheKey, result);
+  return result;
+}
+
+async function resolveLiquidityUsdUncached(
+  tokenMint: string,
+  minLiquidityUsdHint: number,
+  solPriceUsd: number,
+): Promise<{
+  liquidityUSD: number;
+  source: "impact-estimate" | "unavailable";
+}> {
   if (solPriceUsd <= 0) {
     return { liquidityUSD: 0, source: "unavailable" };
   }
 
   const referenceAmountUsd = Math.max(
     minLiquidityUsdHint * 0.05,
-    MIN_REFERENCE_PROBE_USD
+    MIN_REFERENCE_PROBE_USD,
   );
   const referenceLamports = Math.round(
-    (referenceAmountUsd / solPriceUsd) * 1e9
+    (referenceAmountUsd / solPriceUsd) * 1e9,
   );
   const referenceQuote = await jupiterService.getQuote(
     SOL_MINT,
     tokenMint,
     referenceLamports,
-    500
+    500,
   );
 
   if (!referenceQuote) {
@@ -690,8 +549,9 @@ export const getJupiterQuote = (
   inputMint: string,
   outputMint: string,
   amountLamports: number | string | bigint,
-  slippageBps?: number
-) => jupiterService.getQuote(inputMint, outputMint, amountLamports, slippageBps);
+  slippageBps?: number,
+) =>
+  jupiterService.getQuote(inputMint, outputMint, amountLamports, slippageBps);
 
 export const executeJupiterSwap = (params: {
   inputMint: string;
@@ -702,20 +562,13 @@ export const executeJupiterSwap = (params: {
   signer?: Keypair;
 }) => jupiterService.executeSwap(params);
 
-export const getRecentJupiterTokens = (limit?: number) =>
-  jupiterService.getRecentTokens(limit);
-
-export const getJupiterTokenInfo = (mint: string) => jupiterService.getTokenInfo(mint);
-export const getJupiterTokenInfoBatch = (mints: string[]) =>
-  jupiterService.getTokenInfoBatch(mints);
-
 /**
  * Build an unsigned swap transaction for client-side (frontend wallet) signing.
  * Mirrors the old raydium.service.ts buildRaydiumSwapPayload interface.
  */
 export const buildJupiterSwapPayload = async (
   quote: JupiterQuote,
-  userPublicKey: string
+  userPublicKey: string,
 ) => {
   const built = await jupiterService.buildSwapTransaction(quote, userPublicKey);
   if (!built) throw new Error("Failed to build Jupiter swap transaction");

@@ -11,17 +11,9 @@ export interface TraderConfig {
   walletAddress: string;
   globalSettings: {
     minMarketCapSol?: number;
-    maxMarketCapSol?: number;
-    minMarketCapUsd?: number;
-    maxMarketCapUsd?: number;
-    minLiquiditySol?: number;
-    maxLiquiditySol?: number;
-    minLiquidityUsd?: number;
-    maxLiquidityUsd?: number;
     takeProfitPct?: number;
     stopLossPct?: number;
     minSecondsSinceLaunch?: number;
-    maxSecondsSinceLaunch?: number;
     minTokenScore?: number;
     autoTradeEnabled?: boolean;
     maxTradeAmountSol?: number;
@@ -32,13 +24,6 @@ export interface TraderConfig {
   tokenSpecificSettings: {
     [mint: string]: {
       minMarketCapSol?: number;
-      maxMarketCapSol?: number;
-      minMarketCapUsd?: number;
-      maxMarketCapUsd?: number;
-      minLiquiditySol?: number;
-      maxLiquiditySol?: number;
-      minLiquidityUsd?: number;
-      maxLiquidityUsd?: number;
       takeProfitPct?: number;
       stopLossPct?: number;
       entryPriceSol?: number;

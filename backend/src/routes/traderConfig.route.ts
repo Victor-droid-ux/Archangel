@@ -116,73 +116,26 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
 
     if (!requireWalletAuth(req, res)) return;
 
-    // Launch window (min/max seconds since a token's pool was created).
-    for (const field of [
-      "minSecondsSinceLaunch",
-      "maxSecondsSinceLaunch",
-    ] as const) {
-      if (settings && field in settings) {
-        const v = settings[field];
-        const isValid =
-          v === null ||
-          v === undefined ||
-          (typeof v === "number" && Number.isFinite(v) && v >= 0);
-        if (!isValid) {
-          return res.status(400).json({
-            success: false,
-            error: `${field} must be a non-negative number (or omitted/null to clear it)`,
-          });
-        }
-        if (typeof v === "number" && v > 30 * 24 * 3600) {
-          return res.status(400).json({
-            success: false,
-            error: `${field} cannot exceed 30 days (2592000 seconds)`,
-          });
-        }
+    for (const field of ["minSecondsSinceLaunch", "minMarketCapSol"] as const) {
+      const value = settings?.[field];
+      if (
+        value !== undefined &&
+        (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: `${field} must be a finite non-negative number`,
+        });
       }
     }
     if (
-      settings &&
-      typeof settings.minSecondsSinceLaunch === "number" &&
-      typeof settings.maxSecondsSinceLaunch === "number" &&
-      settings.minSecondsSinceLaunch > settings.maxSecondsSinceLaunch
+      typeof settings?.minSecondsSinceLaunch === "number" &&
+      settings.minSecondsSinceLaunch > 30 * 24 * 3600
     ) {
       return res.status(400).json({
         success: false,
-        error:
-          "minSecondsSinceLaunch cannot be greater than maxSecondsSinceLaunch",
+        error: "minSecondsSinceLaunch cannot exceed 30 days (2592000 seconds)",
       });
-    }
-
-    const rangePairs = [
-      ["minMarketCapSol", "maxMarketCapSol"],
-      ["minMarketCapUsd", "maxMarketCapUsd"],
-      ["minLiquiditySol", "maxLiquiditySol"],
-      ["minLiquidityUsd", "maxLiquidityUsd"],
-    ] as const;
-    for (const [minField, maxField] of rangePairs) {
-      const min = settings?.[minField];
-      const max = settings?.[maxField];
-      for (const [field, value] of [
-        [minField, min],
-        [maxField, max],
-      ] as const) {
-        if (
-          value !== undefined &&
-          (typeof value !== "number" || !Number.isFinite(value) || value < 0)
-        ) {
-          return res.status(400).json({
-            success: false,
-            error: `${field} must be a finite non-negative number`,
-          });
-        }
-      }
-      if (typeof min === "number" && typeof max === "number" && min > max) {
-        return res.status(400).json({
-          success: false,
-          error: `${minField} cannot be greater than ${maxField}`,
-        });
-      }
     }
 
     for (const field of ["takeProfitPct", "stopLossPct"] as const) {
@@ -210,18 +163,6 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
       return res.status(400).json({
         success: false,
         error: "maxTradeAmountSol must be a finite positive number",
-      });
-    }
-    if (
-      settings?.minTokenScore !== undefined &&
-      (typeof settings.minTokenScore !== "number" ||
-        !Number.isFinite(settings.minTokenScore) ||
-        settings.minTokenScore < 0 ||
-        settings.minTokenScore > 100)
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: "minTokenScore must be between 0 and 100",
       });
     }
     if (

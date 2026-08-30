@@ -29,19 +29,10 @@ export interface TraderConfig {
   walletAddress: string;
   globalSettings: {
     minMarketCapSol?: number;
-    maxMarketCapSol?: number;
-    minMarketCapUsd?: number;
-    maxMarketCapUsd?: number;
-    minLiquiditySol?: number;
-    maxLiquiditySol?: number;
-    minLiquidityUsd?: number;
-    maxLiquidityUsd?: number;
     takeProfitPct?: number;
     stopLossPct?: number;
-    // "Snipe window" — only buy a token whose age in seconds falls within
-    // [minSecondsSinceLaunch, maxSecondsSinceLaunch].
+    // Only buy a token once its pool is at least this old in seconds.
     minSecondsSinceLaunch?: number;
-    maxSecondsSinceLaunch?: number;
     autoTradeEnabled?: boolean;
     maxTradeAmountSol?: number;
     // Lifetime cap on how many trades the bot may take for this wallet —
@@ -56,13 +47,6 @@ export interface TraderConfig {
   tokenSpecificSettings: {
     [mint: string]: {
       minMarketCapSol?: number;
-      maxMarketCapSol?: number;
-      minMarketCapUsd?: number;
-      maxMarketCapUsd?: number;
-      minLiquiditySol?: number;
-      maxLiquiditySol?: number;
-      minLiquidityUsd?: number;
-      maxLiquidityUsd?: number;
       takeProfitPct?: number;
       stopLossPct?: number;
       maxTradeAmountSol?: number;
@@ -95,27 +79,26 @@ export async function getTraderConfig(
 }
 
 /**
- * A specific wallet's own "snipe window" — only buy a token whose age in
- * seconds falls within [min, max]. A missing or invalid window disables
- * auto-buy for that wallet.
+ * A specific wallet's own minimum pool age in seconds. Unconfigured (or an
+ * invalid value) defaults to 0 — no minimum wait — rather than disabling
+ * auto-buy for the wallet entirely. The client's stated requirement is
+ * maximum coverage of newly launched tokens with only a market-cap floor as
+ * a real gate; a wallet that's never explicitly touched this setting should
+ * default to "trade immediately," not "never trade, silently, forever."
  */
 export async function getEffectiveLaunchWindowSeconds(
   walletAddress: string,
-): Promise<{ min: number; max: number } | null> {
+): Promise<number> {
   const config = await getTraderConfig(walletAddress);
   const g = config?.globalSettings;
   if (
     typeof g?.minSecondsSinceLaunch !== "number" ||
     !Number.isFinite(g.minSecondsSinceLaunch) ||
-    g.minSecondsSinceLaunch < 0 ||
-    typeof g.maxSecondsSinceLaunch !== "number" ||
-    !Number.isFinite(g.maxSecondsSinceLaunch) ||
-    g.maxSecondsSinceLaunch <= 0 ||
-    g.minSecondsSinceLaunch > g.maxSecondsSinceLaunch
+    g.minSecondsSinceLaunch < 0
   ) {
-    return null;
+    return 0;
   }
-  return { min: g.minSecondsSinceLaunch, max: g.maxSecondsSinceLaunch };
+  return g.minSecondsSinceLaunch;
 }
 
 /**
@@ -295,13 +278,6 @@ export async function getEffectiveConfig(
   mint: string,
 ): Promise<{
   minMarketCapSol: number;
-  maxMarketCapSol: number;
-  minMarketCapUsd: number;
-  maxMarketCapUsd: number;
-  minLiquiditySol: number;
-  maxLiquiditySol: number;
-  minLiquidityUsd: number;
-  maxLiquidityUsd: number;
   takeProfitPct: number;
   stopLossPct: number;
   maxTradeAmountSol: number;
@@ -313,13 +289,6 @@ export async function getEffectiveConfig(
   // Default values from environment
   const defaults = {
     minMarketCapSol: Number(process.env.MIN_MARKETCAP_SOL ?? 3),
-    maxMarketCapSol: Number(process.env.MAX_MARKETCAP_SOL ?? 1000000),
-    minMarketCapUsd: Number(process.env.MIN_MARKETCAP_USD ?? 1000),
-    maxMarketCapUsd: Number(process.env.MAX_MARKETCAP_USD ?? 200000000),
-    minLiquiditySol: Number(process.env.MIN_LIQUIDITY_SOL ?? 0.05),
-    maxLiquiditySol: Number(process.env.MAX_LIQUIDITY_SOL ?? Number.MAX_VALUE),
-    minLiquidityUsd: Number(process.env.MIN_LIQUIDITY_USD ?? 0),
-    maxLiquidityUsd: Number(process.env.MAX_LIQUIDITY_USD ?? Number.MAX_VALUE),
     takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
     maxTradeAmountSol: Number(
       process.env.MAX_TRADE_AMOUNT_SOL ?? Number.MAX_VALUE,
@@ -342,13 +311,6 @@ export async function getEffectiveConfig(
   // Merge: defaults < global < token-specific
   const result: {
     minMarketCapSol: number;
-    maxMarketCapSol: number;
-    minMarketCapUsd: number;
-    maxMarketCapUsd: number;
-    minLiquiditySol: number;
-    maxLiquiditySol: number;
-    minLiquidityUsd: number;
-    maxLiquidityUsd: number;
     takeProfitPct: number;
     stopLossPct: number;
     maxTradeAmountSol: number;
@@ -359,34 +321,6 @@ export async function getEffectiveConfig(
       tokenSettings.minMarketCapSol ??
       config.globalSettings.minMarketCapSol ??
       defaults.minMarketCapSol,
-    maxMarketCapSol:
-      tokenSettings.maxMarketCapSol ??
-      config.globalSettings.maxMarketCapSol ??
-      defaults.maxMarketCapSol,
-    minMarketCapUsd:
-      tokenSettings.minMarketCapUsd ??
-      config.globalSettings.minMarketCapUsd ??
-      defaults.minMarketCapUsd,
-    maxMarketCapUsd:
-      tokenSettings.maxMarketCapUsd ??
-      config.globalSettings.maxMarketCapUsd ??
-      defaults.maxMarketCapUsd,
-    minLiquiditySol:
-      tokenSettings.minLiquiditySol ??
-      config.globalSettings.minLiquiditySol ??
-      defaults.minLiquiditySol,
-    maxLiquiditySol:
-      tokenSettings.maxLiquiditySol ??
-      config.globalSettings.maxLiquiditySol ??
-      defaults.maxLiquiditySol,
-    minLiquidityUsd:
-      tokenSettings.minLiquidityUsd ??
-      config.globalSettings.minLiquidityUsd ??
-      defaults.minLiquidityUsd,
-    maxLiquidityUsd:
-      tokenSettings.maxLiquidityUsd ??
-      config.globalSettings.maxLiquidityUsd ??
-      defaults.maxLiquidityUsd,
     takeProfitPct:
       tokenSettings.takeProfitPct ??
       config.globalSettings.takeProfitPct ??
@@ -422,16 +356,12 @@ export async function shouldTriggerTrade(
 ): Promise<boolean> {
   const effectiveConfig = await getEffectiveConfig(walletAddress, mint);
 
-  // If trigger MC is set, check if current MC meets it
+  // If trigger MC is set, check if current MC meets it.
   if (effectiveConfig.triggerMarketCapSol) {
     return currentMarketCapSol >= effectiveConfig.triggerMarketCapSol;
   }
 
-  // Otherwise, check if within min/max range
-  return (
-    currentMarketCapSol >= effectiveConfig.minMarketCapSol &&
-    currentMarketCapSol <= effectiveConfig.maxMarketCapSol
-  );
+  return currentMarketCapSol >= effectiveConfig.minMarketCapSol;
 }
 
 /**

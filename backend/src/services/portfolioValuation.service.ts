@@ -11,7 +11,8 @@
 // with a real mark-to-market using each open position's live Jupiter price,
 // the same calculation positions.route.ts already does per-position.
 import dbService from "./db.service.js";
-import { getJupiterTokenInfoBatch, getSolPriceUsd } from "./jupiter.service.js";
+import { getSolPriceUsd } from "./jupiter.service.js";
+import birdeyeService from "./birdeye.service.js";
 import depositTrackerService from "./depositTracker.service.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -39,19 +40,34 @@ export async function getPortfolioValuation(
     getSolPriceUsd(),
   ]);
 
-  const tokenInfoByMint = await getJupiterTokenInfoBatch(
-    positions
-      .filter((pos) => pos.avgBuyPrice && pos.netSol > 0)
-      .map((pos) => pos.token),
+  // Fair-value price per open position, same source and reasoning as
+  // monitor.service.ts's mark-to-market: Birdeye's price feed, not a Jupiter
+  // quote/catalog lookup — Jupiter's role in this codebase is strictly
+  // trading (routing checks, quotes, execution), not pricing a position for
+  // display. One call per distinct mint, deduped across positions/wallets
+  // sharing the same token, run in parallel.
+  const distinctMints = Array.from(
+    new Set(
+      positions
+        .filter((pos) => pos.avgBuyPrice && pos.netSol > 0)
+        .map((pos) => pos.token),
+    ),
   );
+  const priceEntries = await Promise.all(
+    distinctMints.map(
+      async (mint) =>
+        [mint, await birdeyeService.getCurrentPrice(mint)] as const,
+    ),
+  );
+  const priceUsdByMint = new Map(priceEntries);
 
   let unrealizedPnlSol = 0;
   for (const pos of positions) {
     if (!pos.avgBuyPrice || pos.netSol <= 0) continue;
     try {
-      const info = tokenInfoByMint.get(pos.token);
-      if (info && solPriceUsd > 0) {
-        const currentPrice = info.usdPrice / solPriceUsd;
+      const priceUsd = priceUsdByMint.get(pos.token);
+      if (priceUsd && solPriceUsd > 0) {
+        const currentPrice = priceUsd / solPriceUsd;
         unrealizedPnlSol +=
           (currentPrice - pos.avgBuyPrice) * (pos.netSol / pos.avgBuyPrice);
       }

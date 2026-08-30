@@ -9,7 +9,6 @@ import { createApp } from "./app.js";
 import { registerSocketHandlers } from "./routes/socket.route.js";
 
 import dbService from "./services/db.service.js";
-import { startTokenWatcher } from "./services/tokenDiscovery.service.js";
 import { startPositionMonitor } from "./services/monitor.service.js";
 import { startPriceAlertMonitor } from "./services/priceAlert.service.js";
 import { startPnLBroadcaster } from "./services/pnlBroadcaster.service.js";
@@ -18,8 +17,7 @@ import { getLogger } from "./utils/logger.js";
 
 const log = getLogger("index");
 import { ENV } from "./utils/env.js";
-import { jupiterDiscovery } from "./services/jupiterDiscovery.service.js";
-import storedTokenChecker from "./services/storedTokenChecker.service.js";
+import candidatePipelineService from "./services/candidatePipeline.service.js";
 
 // pino-pretty runs its transport in a worker thread in dev; log.error()
 // immediately followed by process.exit() can race ahead of that flush and the
@@ -84,9 +82,6 @@ process.on("uncaughtException", (err: Error) => {
   app.locals.io = io;
   registerSocketHandlers(io);
 
-  // Start main token discovery watcher (critical for new tokens)
-  startTokenWatcher(io);
-
   // Start position monitor for tracking open trades
   startPositionMonitor(io);
   // Start price alert monitor for watchlist notifications
@@ -95,21 +90,13 @@ process.on("uncaughtException", (err: Error) => {
   startPnLBroadcaster(io, { intervalMs: 30000 }); // Broadcast every 30 seconds
   // Detect SOL deposited into each custodial wallet (see depositTracker.service.ts)
   startDepositTracker({ intervalMs: 60000 }, io);
-  // Start Jupiter token discovery (polls Jupiter's own recent-tokens feed;
-  // replaces the old Raydium on-chain pool listener + Pump.fun bonding-curve watcher)
-  if (process.env.JUPITER_DISCOVERY_ENABLED !== "false") {
-    jupiterDiscovery.setSocketIO(io);
-    jupiterDiscovery.startWatching().catch((err) => {
-      log.error(`Failed to start Jupiter discovery: ${err.message}`);
-    });
-    log.info("🎧 Jupiter token discovery enabled");
-  }
-  // Start stored token checker for periodic re-evaluation
-  if (process.env.STORED_TOKEN_CHECKER_ENABLED === "true") {
-    storedTokenChecker.setSocketIO(io);
-    storedTokenChecker.start();
-    log.info("🔍 Stored token checker enabled");
-  }
+  // Candidate discovery is now event-driven, not polled: QuickNode posts new
+  // pool-creation events to /webhooks/quicknode (see routes/quicknode.route.ts),
+  // which runs every mint through the single linear pipeline in
+  // candidatePipeline.service.ts. No background loop to start here — just
+  // give it the socket server so it can emit progress events.
+  candidatePipelineService.setSocketIO(io);
+  log.info("🎣 QuickNode candidate pipeline ready (webhook-driven)");
   server.listen(ENV.PORT, () => {
     log.info(`⚡ Backend online → http://localhost:${ENV.PORT}`);
   });

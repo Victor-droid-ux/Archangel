@@ -111,7 +111,7 @@ class CacheService {
   async getOrSet<T>(
     key: string,
     fetchFn: () => Promise<T>,
-    ttl?: number
+    ttl?: number,
   ): Promise<T> {
     const cached = this.get<T>(key);
     if (cached !== null) {
@@ -168,7 +168,7 @@ class CacheService {
 
     if (count > 0) {
       log.info(
-        `Invalidated ${count} cache entries matching pattern: ${pattern}`
+        `Invalidated ${count} cache entries matching pattern: ${pattern}`,
       );
     }
 
@@ -182,14 +182,22 @@ const METADATA_TTL = Number(process.env.CACHE_TOKEN_METADATA_TTL) || 300000; // 
 const PRICE_TTL = Number(process.env.CACHE_TOKEN_PRICE_TTL) || 10000; // Default 10 seconds
 const DISCOVERY_TTL = Number(process.env.CACHE_TOKEN_DISCOVERY_TTL) || 30000; // Default 30 seconds
 const QUOTE_TTL = Number(process.env.CACHE_QUOTE_TTL) || 5000; // Default 5 seconds
+// Used by resolveLiquidityUsd (jupiter.service.ts) — a risk-check heuristic
+// (e.g. emergencyExit.service.ts's detectLargeSell, polled every monitor
+// tick for every open position, for that position's entire lifetime) doesn't
+// need millisecond-fresh liquidity, and without this every single tick was a
+// guaranteed live Jupiter quote call, scaling linearly with concurrent open
+// positions.
+const LIQUIDITY_TTL = Number(process.env.CACHE_LIQUIDITY_TTL) || 15000; // Default 15 seconds
 
 export const tokenMetadataCache = new CacheService(METADATA_TTL);
 export const tokenPriceCache = new CacheService(PRICE_TTL);
 export const tokenDiscoveryCache = new CacheService(DISCOVERY_TTL);
 export const quoteCache = new CacheService(QUOTE_TTL);
+export const liquidityCache = new CacheService(LIQUIDITY_TTL);
 
 log.info(
-  `Cache initialized - Metadata: ${METADATA_TTL}ms, Price: ${PRICE_TTL}ms, Discovery: ${DISCOVERY_TTL}ms, Quote: ${QUOTE_TTL}ms`
+  `Cache initialized - Metadata: ${METADATA_TTL}ms, Price: ${PRICE_TTL}ms, Discovery: ${DISCOVERY_TTL}ms, Quote: ${QUOTE_TTL}ms, Liquidity: ${LIQUIDITY_TTL}ms`,
 );
 
 export default {
@@ -197,4 +205,5 @@ export default {
   tokenPriceCache,
   tokenDiscoveryCache,
   quoteCache,
+  liquidityCache,
 };

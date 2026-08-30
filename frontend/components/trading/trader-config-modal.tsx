@@ -23,17 +23,9 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
 
   const [formData, setFormData] = useState({
     minMarketCapSol: 5,
-    maxMarketCapSol: 1000000,
-    minMarketCapUsd: 1000,
-    maxMarketCapUsd: 200000000,
-    minLiquiditySol: 0.05,
-    maxLiquiditySol: 1000000,
-    minLiquidityUsd: 0,
-    maxLiquidityUsd: 200000000,
     takeProfitPct: 10,
     stopLossPct: 30,
     minSecondsSinceLaunch: "" as number | "",
-    maxSecondsSinceLaunch: "" as number | "",
     autoTradeEnabled: false,
     maxTradeAmountSol: 1,
     // "" means unlimited (cleared/never set) — distinct from 0, which would
@@ -48,17 +40,9 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
       const g = config.globalSettings;
       setFormData({
         minMarketCapSol: g.minMarketCapSol ?? 5,
-        maxMarketCapSol: g.maxMarketCapSol ?? 1000000,
-        minMarketCapUsd: g.minMarketCapUsd ?? 1000,
-        maxMarketCapUsd: g.maxMarketCapUsd ?? 200000000,
-        minLiquiditySol: g.minLiquiditySol ?? 0.05,
-        maxLiquiditySol: g.maxLiquiditySol ?? 1000000,
-        minLiquidityUsd: g.minLiquidityUsd ?? 0,
-        maxLiquidityUsd: g.maxLiquidityUsd ?? 200000000,
         takeProfitPct: (g.takeProfitPct ?? 0.1) * 100,
         stopLossPct: (g.stopLossPct ?? 0.3) * 100,
         minSecondsSinceLaunch: g.minSecondsSinceLaunch ?? "",
-        maxSecondsSinceLaunch: g.maxSecondsSinceLaunch ?? "",
         autoTradeEnabled: g.autoTradeEnabled ?? false,
         maxTradeAmountSol: g.maxTradeAmountSol ?? 1,
         maxTotalTrades: g.maxTotalTrades ?? "",
@@ -66,22 +50,14 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
     }
   }, [config]);
 
-  // Same fail-closed reasoning as Max Token Age: empty/negative/inverted
-  // values here would either reject every token or accept all of them.
+  // A minimum launch age is required before auto-trading can start.
   const launchWindowError =
     formData.minSecondsSinceLaunch === "" ||
-    formData.maxSecondsSinceLaunch === "" ||
     !Number.isFinite(Number(formData.minSecondsSinceLaunch)) ||
     Number(formData.minSecondsSinceLaunch) < 0 ||
-    !Number.isFinite(Number(formData.maxSecondsSinceLaunch)) ||
-    Number(formData.maxSecondsSinceLaunch) <= 0
-      ? "Set both launch-window values"
-      : Number(formData.minSecondsSinceLaunch) >
-          Number(formData.maxSecondsSinceLaunch)
-        ? "Min cannot exceed max"
-        : formData.maxSecondsSinceLaunch > 30 * 24 * 3600
-          ? "Must be 30 days or less"
-          : null;
+    Number(formData.minSecondsSinceLaunch) > 30 * 24 * 3600
+      ? "Set a minimum launch age between 0 and 30 days"
+      : null;
 
   // Blank ("") means unlimited and is always valid — only a filled-in value
   // needs to be a real positive whole number.
@@ -102,46 +78,26 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
       ? "Enter a finite positive trade amount"
       : null;
 
-  const metricRanges: Array<[string, number, number]> = [
-    ["market cap SOL", formData.minMarketCapSol, formData.maxMarketCapSol],
-    ["market cap USD", formData.minMarketCapUsd, formData.maxMarketCapUsd],
-    ["liquidity SOL", formData.minLiquiditySol, formData.maxLiquiditySol],
-    ["liquidity USD", formData.minLiquidityUsd, formData.maxLiquidityUsd],
-  ];
-  const metricRangeError = metricRanges.some(
-    ([, min, max]) =>
-      !Number.isFinite(min) ||
-      !Number.isFinite(max) ||
-      min < 0 ||
-      max < 0 ||
-      min > max
-  )
-    ? "Enter finite non-negative values where each minimum does not exceed its maximum"
-    : null;
+  const minMarketCapError =
+    !Number.isFinite(formData.minMarketCapSol) || formData.minMarketCapSol < 0
+      ? "Enter a finite non-negative minimum market cap"
+      : null;
 
   const handleSave = async () => {
     if (
       launchWindowError ||
       maxTotalTradesError ||
       maxTradeAmountError ||
-      metricRangeError
+      minMarketCapError
     )
       return;
     setSaving(true);
     try {
       await updateGlobalSettings({
         minMarketCapSol: formData.minMarketCapSol,
-        maxMarketCapSol: formData.maxMarketCapSol,
-        minMarketCapUsd: formData.minMarketCapUsd,
-        maxMarketCapUsd: formData.maxMarketCapUsd,
-        minLiquiditySol: formData.minLiquiditySol,
-        maxLiquiditySol: formData.maxLiquiditySol,
-        minLiquidityUsd: formData.minLiquidityUsd,
-        maxLiquidityUsd: formData.maxLiquidityUsd,
         takeProfitPct: formData.takeProfitPct / 100,
         stopLossPct: formData.stopLossPct / 100,
         minSecondsSinceLaunch: Number(formData.minSecondsSinceLaunch),
-        maxSecondsSinceLaunch: Number(formData.maxSecondsSinceLaunch),
         autoTradeEnabled: formData.autoTradeEnabled,
         maxTradeAmountSol: formData.maxTradeAmountSol,
         maxTotalTrades:
@@ -212,75 +168,7 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
                   </p>
                 )}
               </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Max Market Cap (SOL)
-                </label>
-                <input
-                  type="number"
-                  value={formData.maxMarketCapSol}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      maxMarketCapSol: Number(e.target.value),
-                    })
-                  }
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
-                  min="0"
-                  step="1000"
-                />
-                {solPriceUsd != null && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    ~$
-                    {(formData.maxMarketCapSol * solPriceUsd).toLocaleString()}
-                  </p>
-                )}
-              </div>
             </div>
-          </div>
-
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <DollarSign className="w-5 h-5 text-blue-400" />
-              <h3 className="text-lg font-semibold text-white">
-                Launch Liquidity and USD Limits
-              </h3>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              {(
-                [
-                  ["Min Market Cap (USD)", "minMarketCapUsd", 0],
-                  ["Max Market Cap (USD)", "maxMarketCapUsd", 0],
-                  ["Min Liquidity (SOL)", "minLiquiditySol", 0],
-                  ["Max Liquidity (SOL)", "maxLiquiditySol", 0],
-                  ["Min Liquidity (USD)", "minLiquidityUsd", 0],
-                  ["Max Liquidity (USD)", "maxLiquidityUsd", 0],
-                ] as const
-              ).map(([label, field, min]) => (
-                <div key={field}>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    {label}
-                  </label>
-                  <input
-                    type="number"
-                    value={formData[field]}
-                    min={min}
-                    step="any"
-                    onChange={(e) =>
-                      setFormData({
-                        ...formData,
-                        [field]: Number(e.target.value),
-                      })
-                    }
-                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
-                  />
-                </div>
-              ))}
-            </div>
-            {metricRangeError && (
-              <p className="text-sm text-red-400">{metricRangeError}</p>
-            )}
           </div>
 
           {/* TP/SL */}
@@ -351,48 +239,30 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Launch Window (seconds since launch)
+                  Minimum Launch Age (seconds)
                 </label>
-                <div className="flex gap-2 items-center">
-                  <input
-                    type="number"
-                    value={formData.minSecondsSinceLaunch}
-                    onChange={(e) =>
-                      setFormData({
-                        ...formData,
-                        minSecondsSinceLaunch: Number(e.target.value),
-                      })
-                    }
-                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
-                    min="0"
-                    step="1"
-                    placeholder="Min"
-                  />
-                  <span className="text-gray-500">to</span>
-                  <input
-                    type="number"
-                    value={formData.maxSecondsSinceLaunch}
-                    onChange={(e) =>
-                      setFormData({
-                        ...formData,
-                        maxSecondsSinceLaunch: Number(e.target.value),
-                      })
-                    }
-                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
-                    min="0"
-                    step="1"
-                    placeholder="Max"
-                  />
-                </div>
+                <input
+                  type="number"
+                  value={formData.minSecondsSinceLaunch}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      minSecondsSinceLaunch: Number(e.target.value),
+                    })
+                  }
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                  min="0"
+                  step="1"
+                  placeholder="Minimum seconds"
+                />
                 {launchWindowError ? (
                   <p className="text-xs text-red-500 mt-1">
                     {launchWindowError}
                   </p>
                 ) : (
                   <p className="text-xs text-gray-500 mt-1">
-                    Only buy tokens between {formData.minSecondsSinceLaunch}s
-                    and {formData.maxSecondsSinceLaunch}s after their pool was
-                    created
+                    Only buy tokens once their pool is at least{" "}
+                    {formData.minSecondsSinceLaunch}s old
                   </p>
                 )}
               </div>
@@ -503,7 +373,7 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
                 !!launchWindowError ||
                 !!maxTotalTradesError ||
                 !!maxTradeAmountError ||
-                !!metricRangeError
+                !!minMarketCapError
               }
               className="px-6 py-2 bg-primary hover:bg-primary-hover text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
