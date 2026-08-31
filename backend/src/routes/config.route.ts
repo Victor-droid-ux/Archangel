@@ -96,7 +96,7 @@ router.post("/reset", (req: Request, res: Response) => {
   try {
     runtimeConfig = {
       minMarketCapSol: Number(process.env.MIN_MARKETCAP_SOL ?? 5),
-      minTokenScore: Number(process.env.MIN_TOKEN_SCORE ?? 30),
+      minTokenScore: Number(process.env.MIN_TOKEN_SCORE ?? 0),
       takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
       stopLossPct: Number(process.env.SL_PCT ?? 0.3),
     };
