@@ -16,12 +16,21 @@ import { processCandidateMint } from "../services/candidatePipeline.service.js";
 const LOG = getLogger("quicknode-webhook");
 const router = Router();
 
-// QuickNode Streams signs each delivery with an HMAC in a header (configured
-// per-Stream in the QuickNode dashboard, alongside a shared secret you set
-// there) — verify the exact header name/scheme against your Stream's
-// "Security" settings and adjust `verifySignature` below to match, since
-// that's a per-account dashboard configuration, not a fixed constant.
+// QuickNode Streams' actual signing scheme (confirmed against QuickNode's own
+// "Validating Incoming Streams Webhook Messages" guide — this is not a
+// per-account setting, it's fixed): each delivery carries three headers,
+// X-QN-Nonce, X-QN-Timestamp, and X-QN-Signature. The signature is
+// HMAC-SHA256, keyed with the Stream's security token, over the
+// concatenation `nonce + timestamp + rawBody` — NOT the raw body alone.
+// Signing just the body (what this used to do) can never match, regardless
+// of how correct the secret and raw-body capture are.
 const WEBHOOK_SECRET = process.env.QUICKNODE_WEBHOOK_SECRET || "";
+
+// Reject deliveries whose timestamp is older than this, even with an
+// otherwise-valid signature — defends against a captured request being
+// replayed later. QuickNode's own guide calls this out as recommended
+// alongside the nonce.
+const MAX_TIMESTAMP_AGE_MS = 5 * 60 * 1000; // 5 minutes
 
 function verifySignature(req: Request): boolean {
   if (!WEBHOOK_SECRET) {
@@ -33,13 +42,31 @@ function verifySignature(req: Request): boolean {
     );
     return true;
   }
-  const signature =
-    req.header("x-qn-signature") || req.header("x-webhook-signature");
-  if (!signature) return false;
 
+  const nonce = req.header("x-qn-nonce");
+  const timestamp = req.header("x-qn-timestamp");
+  const signature = req.header("x-qn-signature");
+  if (!nonce || !timestamp || !signature) return false;
+
+  const timestampMs = Number(timestamp) * 1000; // QuickNode sends unix seconds
+  if (
+    !Number.isFinite(timestampMs) ||
+    Math.abs(Date.now() - timestampMs) > MAX_TIMESTAMP_AGE_MS
+  ) {
+    LOG.warn(
+      { timestamp },
+      "Rejected QuickNode webhook: timestamp outside allowed window (stale or replayed)",
+    );
+    return false;
+  }
+
+  const payload = req.rawBody
+    ? req.rawBody.toString("utf8")
+    : JSON.stringify(req.body);
+  const message = nonce + timestamp + payload;
   const expected = crypto
     .createHmac("sha256", WEBHOOK_SECRET)
-    .update(req.rawBody ?? JSON.stringify(req.body))
+    .update(message)
     .digest("hex");
 
   try {

@@ -216,7 +216,22 @@ class BirdeyeService {
         reasons,
       };
     } catch (error: any) {
-      LOG.error(`Error checking market health: ${error.message}`);
+      // error.message alone ("Request failed with status code 400") hides
+      // the actual reason Birdeye rejected the request — that detail is in
+      // the response body, and a 400 here is currently failing every single
+      // candidate at Phase 4, so it matters a lot which of these it is:
+      // invalid/expired BIRDEYE_API_KEY, wrong base URL for the current API
+      // version, a renamed/deprecated endpoint, or a genuinely malformed
+      // param. Logging the body turns "status code 400" into an actionable
+      // error on the next run instead of a dead end.
+      LOG.error(
+        {
+          tokenMint,
+          status: error?.response?.status,
+          responseBody: error?.response?.data,
+        },
+        `Error checking market health: ${error.message}`,
+      );
       return {
         isHealthy: false,
         priceImpact: 100,
