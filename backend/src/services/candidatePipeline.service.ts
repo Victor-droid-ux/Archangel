@@ -36,6 +36,9 @@ import {
 import type { CandidateMint } from "./tokenExtraction.service.js";
 
 const LOG = getLogger("candidate-pipeline");
+const MAX_CANDIDATE_DELIVERY_AGE_MS = Number(
+  process.env.MAX_CANDIDATE_DELIVERY_AGE_MS ?? 120_000,
+);
 
 interface PipelineConfig extends ArchAngelFilterConfig {
   autoBuyEnabled: boolean;
@@ -57,6 +60,18 @@ export function setSocketIO(server: SocketIOServer): void {
   io = server;
 }
 
+export function isFreshCandidate(
+  poolCreatedAt: Date,
+  now = Date.now(),
+): boolean {
+  const ageMs = now - poolCreatedAt.getTime();
+  return (
+    Number.isFinite(ageMs) &&
+    ageMs >= 0 &&
+    ageMs <= MAX_CANDIDATE_DELIVERY_AGE_MS
+  );
+}
+
 /**
  * Runs the full pipeline for a single candidate mint. Safe to call
  * concurrently for different mints; a given mint is only ever taken through
@@ -69,6 +84,18 @@ export async function processCandidateMint(
 ): Promise<void> {
   const { mint } = candidate;
   const config = loadConfig();
+
+  if (!isFreshCandidate(candidate.poolCreatedAt)) {
+    LOG.info(
+      { mint: mint.slice(0, 8), poolCreatedAt: candidate.poolCreatedAt },
+      "Skipping stale QuickNode pool-creation candidate",
+    );
+    io?.emit("candidate:stale", {
+      mint,
+      poolCreatedAt: candidate.poolCreatedAt,
+    });
+    return;
+  }
 
   // Already seen this mint before (regardless of outcome) — one pass through
   // this pipeline per mint is the whole point of the consolidation, so don't

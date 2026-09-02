@@ -14,13 +14,9 @@
 // of forwarding the raw transaction. That is the "structured" shape below,
 // and it's what this file expects by default.
 //
-// A raw-transaction fallback is also provided for a Stream configured
-// without a shaping Function (or for a plain QuickNode Webhook pointed at
-// an RPC subscription), since payload shape is a QuickNode dashboard
-// configuration choice, not something fixed in code. Adjust
-// `extractFromRawTransaction` to match whatever your actual Stream/Function
-// configuration sends — the exact field names below are a reasonable
-// starting point, not a guarantee of QuickNode's wire format.
+// Auto-trading accepts only these structured pool-creation events. Raw
+// transaction payloads are intentionally ignored because they cannot prove
+// a mint was newly launched by that transaction.
 import { PublicKey } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -37,9 +33,9 @@ const QUOTE_MINTS = new Set([
 
 export interface CandidateMint {
   mint: string;
-  poolAddress?: string;
-  dex?: string;
-  poolCreatedAt?: Date;
+  poolAddress: string;
+  dex: string;
+  poolCreatedAt: Date;
 }
 
 function isValidMint(candidate: unknown): candidate is string {
@@ -100,67 +96,27 @@ function extractFromStructuredEvent(
   ev: StructuredPoolEvent,
 ): CandidateMint | null {
   const mint = pickNewMint(ev);
-  if (!mint) return null;
-  const poolAddress = isValidMint(ev.poolAddress) ? ev.poolAddress : undefined;
+  const poolAddress = isValidMint(ev.poolAddress) ? ev.poolAddress : null;
   const poolCreatedAt = parseTimestamp(ev);
-  // Under exactOptionalPropertyTypes, an optional field must be a real value
-  // or entirely absent — assigning it `undefined` explicitly is a type
-  // error, not just a redundant value. Building the object with conditional
-  // spreads omits each missing field outright instead.
-  return {
-    mint,
-    ...(poolAddress !== undefined && { poolAddress }),
-    ...(ev.dex !== undefined && { dex: ev.dex }),
-    ...(poolCreatedAt !== undefined && { poolCreatedAt }),
-  };
-}
-
-/**
- * Fallback: pull candidate mints out of a raw Solana transaction object
- * (as delivered by an unshaped QuickNode Stream/webhook). This inspects
- * `postTokenBalances` for mints that didn't exist in `preTokenBalances` —
- * i.e. genuinely new to this transaction — which is DEX-program-agnostic
- * and survives Raydium/Orca/whoever changing their instruction layout,
- * unlike parsing specific instruction indices.
- */
-function extractFromRawTransaction(tx: any): CandidateMint[] {
-  try {
-    const meta = tx?.meta ?? tx?.transaction?.meta;
-    if (!meta) return [];
-    const pre = new Set(
-      (meta.preTokenBalances ?? []).map((b: any) => b.mint).filter(isValidMint),
+  if (!mint || !poolAddress || !ev.dex || !poolCreatedAt) {
+    LOG.warn(
+      {
+        mint,
+        poolAddress: ev.poolAddress,
+        dex: ev.dex,
+        timestamp: ev.timestamp ?? ev.blockTime,
+      },
+      "Rejected unstructured QuickNode event: strict pool-creation fields are required",
     );
-    const post: string[] = (meta.postTokenBalances ?? [])
-      .map((b: any) => b.mint)
-      .filter(isValidMint);
-
-    const newMints = Array.from(new Set(post)).filter(
-      (m) => !pre.has(m) && !QUOTE_MINTS.has(m),
-    );
-
-    const poolCreatedAt = tx?.blockTime
-      ? new Date(tx.blockTime * 1000)
-      : undefined;
-
-    return newMints.map((mint) => ({
-      mint,
-      ...(poolCreatedAt !== undefined && { poolCreatedAt }),
-    }));
-  } catch (err: any) {
-    LOG.error(
-      { err: err?.message },
-      "Failed to extract mint from raw transaction",
-    );
-    return [];
+    return null;
   }
+  return { mint, poolAddress, dex: ev.dex, poolCreatedAt };
 }
 
 /**
  * Phase 2 entry point: given the raw JSON body QuickNode POSTed, return
- * every candidate mint it represents. Handles a single event, an array of
- * events (a batch delivery, which QuickNode Streams does by default), and
- * falls back to raw-transaction parsing if the payload doesn't look like
- * the structured shape.
+ * every candidate mint it represents. Only structured pool-creation events
+ * with mint, pool, DEX, and creation time are accepted for auto-trading.
  */
 export function extractCandidateMints(payload: unknown): CandidateMint[] {
   const events = Array.isArray(payload) ? payload : [payload];
@@ -172,17 +128,10 @@ export function extractCandidateMints(payload: unknown): CandidateMint[] {
     const structured = extractFromStructuredEvent(ev as StructuredPoolEvent);
     if (structured) {
       results.push(structured);
-      continue;
-    }
-
-    // Doesn't look like our structured shape — try raw-transaction parsing.
-    const fromRaw = extractFromRawTransaction(ev);
-    if (fromRaw.length > 0) {
-      results.push(...fromRaw);
     } else {
       LOG.debug(
         { event: ev },
-        "Webhook event had no extractable mint — skipping",
+        "Webhook event is not a valid structured pool-creation event — skipping",
       );
     }
   }

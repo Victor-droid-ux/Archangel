@@ -13,6 +13,20 @@ interface BirdeyeMarketHealth {
   hasSuspiciousSells: boolean;
   isBotActivity: boolean;
   reasons: string[];
+  deferred?: boolean;
+}
+
+function isQuotaOrRateLimitError(error: any): boolean {
+  const status = Number(error?.response?.status);
+  const message = String(
+    error?.response?.data?.message ?? error?.message ?? "",
+  ).toLowerCase();
+  return (
+    status === 429 ||
+    message.includes("compute units usage limit exceeded") ||
+    message.includes("rate limit") ||
+    message.includes("too many requests")
+  );
 }
 
 interface BirdeyePnLData {
@@ -216,6 +230,30 @@ class BirdeyeService {
         reasons,
       };
     } catch (error: any) {
+      if (isQuotaOrRateLimitError(error)) {
+        LOG.warn(
+          {
+            tokenMint,
+            status: error?.response?.status,
+            responseBody: error?.response?.data,
+          },
+          "Birdeye quota/rate limit unavailable; deferring market-health checks",
+        );
+        return {
+          isHealthy: true,
+          deferred: true,
+          priceImpact: 0,
+          fdv: 0,
+          liquidity: 0,
+          volume5m: 0,
+          hasSoftRugged: false,
+          hasSuspiciousSells: false,
+          isBotActivity: false,
+          reasons: [
+            "Birdeye quota/rate limit unavailable — market health deferred",
+          ],
+        };
+      }
       // error.message alone ("Request failed with status code 400") hides
       // the actual reason Birdeye rejected the request — that detail is in
       // the response body, and a 400 here is currently failing every single
