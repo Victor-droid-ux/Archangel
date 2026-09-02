@@ -50,6 +50,7 @@ export interface FilterResult {
     top3HoldingsPct?: number;
     marketHealthy: boolean;
     marketHealthReasons: string[];
+    fdvUsd: number;
   };
 }
 
@@ -86,6 +87,7 @@ export async function applyArchAngelFilters(
     isHoneypot: false,
     marketHealthy: false,
     marketHealthReasons: [],
+    fdvUsd: 0,
   };
 
   try {
@@ -211,6 +213,13 @@ export async function applyArchAngelFilters(
     );
     details.marketHealthy = marketHealth.isHealthy;
     details.marketHealthReasons = marketHealth.reasons;
+    // Reused for launchMarketCapSOL (see candidatePipeline.service.ts) —
+    // FDV comes from this same Birdeye call, so exposing it here avoids a
+    // second, fully independent Birdeye request just to get a market cap
+    // figure. For a freshly-launched token (no vesting/locked supply, the
+    // overwhelmingly common case for what this pipeline discovers), FDV and
+    // circulating market cap are effectively the same number anyway.
+    details.fdvUsd = marketHealth.fdv;
     if (marketHealth.isHealthy) passedFilters.push("market_health");
     else failedFilters.push("market_health");
 
