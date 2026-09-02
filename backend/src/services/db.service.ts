@@ -191,6 +191,11 @@ export type TokenState = {
   top3WalletsCombined?: number;
   lpRemoved?: boolean;
 
+  // Phase 4 result. Jupiter tradability alone is not sufficient to present a
+  // candidate as eligible for automatic buying.
+  autoBuyEligible?: boolean;
+  autoBuyEligibleAt?: Date;
+
   // Timestamps
   detectedAt: Date;
   confirmedTradableAt?: Date;

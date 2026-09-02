@@ -26,7 +26,7 @@ interface TokenApiResponse {
 
 export default function TokenTable() {
   const { data, mutate, isLoading, error } = useSWR<TokenApiResponse>(
-    "/api/tokens",
+    "/api/tokens/active",
     fetcher,
     {
       refreshInterval: 10000,
@@ -38,7 +38,16 @@ export default function TokenTable() {
   /** SOCKET — realtime token refresh */
   useEffect(() => {
     if (!lastMessage?.event) return;
-    if (lastMessage.event !== "token_prices") return; // Correct event name
+    if (
+      ![
+        "token_prices",
+        "candidate:detected",
+        "candidate:tradeable",
+        "candidate:filtered_out",
+        "candidate:approved",
+      ].includes(lastMessage.event)
+    )
+      return;
 
     mutate(); // 🔄 Update SWR cache live
   }, [lastMessage, mutate]);
@@ -91,7 +100,9 @@ export default function TokenTable() {
                   <tr
                     key={t.mint}
                     className="border-b border-base-300 hover:bg-base-300/20 cursor-pointer"
-                    onClick={() => (window.location.href = `/trading/${t.mint}`)}
+                    onClick={() =>
+                      (window.location.href = `/trading/${t.mint}`)
+                    }
                   >
                     <td className="py-2 px-4 font-medium">{t.symbol}</td>
 

@@ -43,43 +43,19 @@ export const NewTokens = () => {
 
   const { lastMessage } = useSocket();
 
-  // initial load
+  // A token enters this list only after the backend records its Phase 4
+  // approval. The legacy tokenFeed can include unqualified candidates.
   useEffect(() => {
-    fetcher("/api/tokens").then((res) => setTokens(res.tokens || []));
+    fetcher("/api/tokens/approved-candidates").then((res) =>
+      setTokens(res.tokens || [])
+    );
   }, []);
 
-  // socket updates
   useEffect(() => {
-    if (!lastMessage) return;
-    if (lastMessage.event !== "tokenFeed") return;
-
-    const incoming = lastMessage.payload.tokens;
-    if (!Array.isArray(incoming)) return;
-
-    const flashMap: Record<string, "up" | "down"> = {};
-
-    for (const t of incoming) {
-      const prevTok = prev.current[t.symbol];
-      const currentPrice = t.price || t.priceSol || 0;
-      const prevPrice = prevTok ? prevTok.price || prevTok.priceSol || 0 : 0;
-
-      if (prevTok && currentPrice && prevPrice) {
-        if (currentPrice > prevPrice) flashMap[t.symbol] = "up";
-        else if (currentPrice < prevPrice) flashMap[t.symbol] = "down";
-      }
-
-      prev.current[t.symbol] = t;
-    }
-
-    setFlash(flashMap);
-    setTimeout(() => setFlash({}), 700);
-
-    setTokens(incoming);
-
-    // Store lifecycle summary if available
-    if (lastMessage.payload.lifecycleSummary) {
-      setLifecycleSummary(lastMessage.payload.lifecycleSummary);
-    }
+    if (lastMessage?.event !== "candidate:approved") return;
+    fetcher("/api/tokens/approved-candidates").then((res) =>
+      setTokens(res.tokens || [])
+    );
   }, [lastMessage]);
 
   return (

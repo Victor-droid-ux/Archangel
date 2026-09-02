@@ -27,6 +27,7 @@ import {
 } from "./tokenFiltering.service.js";
 import multiUserExecutionService from "./multiUserExecution.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
+import { addTrackedToken } from "./tokenPrice.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 import {
   claimMint,
@@ -185,6 +186,7 @@ export async function processCandidateMint(
     candidate.poolAddress,
   );
   if (!filterResult.approved) {
+    await dbService.updateTokenState(mint, { autoBuyEligible: false });
     LOG.info(
       { mint: mint.slice(0, 8), failed: filterResult.failedFilters },
       `❌ ${filterResult.reason}`,
@@ -200,6 +202,13 @@ export async function processCandidateMint(
     { mint: mint.slice(0, 8), passed: filterResult.passedFilters },
     "✅ Passed ArchAngel filters",
   );
+  await dbService.updateTokenState(mint, {
+    autoBuyEligible: true,
+    autoBuyEligibleAt: new Date(),
+  });
+  addTrackedToken(mint, "NEW", {
+    liquidity: tradeability.liquidityUsd,
+  });
   io?.emit("candidate:approved", {
     mint,
     passedFilters: filterResult.passedFilters,

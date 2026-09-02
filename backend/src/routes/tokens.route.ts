@@ -2,6 +2,7 @@
 import express from "express";
 import { getLogger } from "../utils/logger.js";
 import { getLatestTokens } from "../services/tokenPrice.service.js";
+import dbService from "../services/db.service.js";
 import { getSolPriceUsd } from "../services/jupiter.service.js";
 import {
   validateTokenLifecycle,
@@ -11,6 +12,66 @@ import {
 
 const router = express.Router();
 const logger = getLogger("tokens.route");
+
+const MAX_CANDIDATE_AGE_MS = 24 * 60 * 60 * 1000;
+
+function toCandidateToken(
+  token: Awaited<ReturnType<typeof dbService.getTokenState>>,
+) {
+  if (!token) return null;
+  return {
+    mint: token.mint,
+    symbol: token.symbol || "NEW",
+    name: token.name || "New Token",
+    price: null,
+    priceChange24h: null,
+    liquidity: token.liquidityUSD ?? null,
+    marketCap: token.marketCapUSD ?? null,
+    autoBuyEligible: token.autoBuyEligible === true,
+    detectedAt: token.detectedAt,
+  };
+}
+
+async function getRecentCandidates(autoBuyEligible?: boolean) {
+  const tokens = await dbService.getTokensByStates(["DISCOVERED", "TRADABLE"], {
+    minCreatedAt: new Date(Date.now() - MAX_CANDIDATE_AGE_MS),
+    limit: 100,
+  });
+  return tokens
+    .filter((token) =>
+      autoBuyEligible === undefined
+        ? true
+        : token.autoBuyEligible === autoBuyEligible,
+    )
+    .map((token) => toCandidateToken(token))
+    .filter((token): token is NonNullable<typeof token> => token !== null);
+}
+
+/**
+ * GET /api/tokens/active
+ * Recent webhook candidates, including those that do not meet auto-buy rules.
+ */
+router.get("/active", async (_req, res) => {
+  try {
+    return res.json({ success: true, tokens: await getRecentCandidates() });
+  } catch (err: any) {
+    logger.error("Failed to load active candidates:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * GET /api/tokens/approved-candidates
+ * Recent candidates that passed every Phase 4 auto-buy filter.
+ */
+router.get("/approved-candidates", async (_req, res) => {
+  try {
+    return res.json({ success: true, tokens: await getRecentCandidates(true) });
+  } catch (err: any) {
+    logger.error("Failed to load approved candidates:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 /**
  * GET /api/tokens
