@@ -133,6 +133,23 @@ export async function processCandidateMint(
     liquiditySol: tradeability.liquiditySol,
   });
 
+  // Launch market cap — captured here, right after Phase 3, from
+  // tradeability.launchMarketCapSol (on-chain supply × the Phase 3 buy
+  // quote's implied price). Deliberately not from Birdeye's FDV: this is
+  // the field multiUserExecution.service.ts's per-wallet minimum-market-cap
+  // gate reads, and market cap is the one filter the client specifically
+  // wants enforced — it needs a number that doesn't share Birdeye's
+  // indexing-lag failure mode (FDV reading $0 for a token this fresh just
+  // as often as its volume figure used to). Captured before Phase 4 runs
+  // rather than after, so even a token that fails Phase 4's other checks
+  // still gets a correctly-captured launch-time snapshot recorded.
+  if (tradeability.launchMarketCapSol != null) {
+    await dbService.setLaunchMarketCapIfUnset(
+      mint,
+      tradeability.launchMarketCapSol,
+    );
+  }
+
   // Phase 4 — token filtering (ArchAngel criteria).
   const filterResult = await applyArchAngelFilters(
     mint,

@@ -22,6 +22,7 @@ import jupiterService, {
   resolveLiquidityUsd,
   type JupiterQuote,
 } from "./jupiter.service.js";
+import { getOnChainMintSupply } from "./tokenSafetyChecks.service.js";
 
 const LOG = getLogger("jupiter-tradeability");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -33,6 +34,41 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const ROUTING_PROBE_LAMPORTS = 10_000_000;
 const ROUTING_PROBE_SLIPPAGE_BPS = 1000;
 
+// This pipeline queries Jupiter within milliseconds of a pool-creation
+// transaction landing on-chain (see routes/quicknode.route.ts) — faster than
+// Jupiter's own routing engine reliably indexes a brand-new pool. A quote
+// that 400s immediately after launch is very often "not routable yet," not
+// "never routable" — retry a few times, a beat apart, before concluding
+// there's genuinely no route. This is specifically about Jupiter's indexing
+// lag, not a timezone/clock issue — the quote endpoint has no time-based
+// validation at all.
+const BUY_QUOTE_RETRY_ATTEMPTS = 3;
+const BUY_QUOTE_RETRY_DELAY_MS = 1000;
+
+async function getBuyQuoteWithRetry(
+  tokenMint: string,
+): Promise<JupiterQuote | null> {
+  for (let attempt = 1; attempt <= BUY_QUOTE_RETRY_ATTEMPTS; attempt++) {
+    const quote = await jupiterService.getQuote(
+      SOL_MINT,
+      tokenMint,
+      ROUTING_PROBE_LAMPORTS,
+      ROUTING_PROBE_SLIPPAGE_BPS,
+    );
+    if (quote?.outAmount) return quote;
+
+    if (attempt < BUY_QUOTE_RETRY_ATTEMPTS) {
+      LOG.debug(
+        `No Jupiter route yet for ${tokenMint.slice(0, 8)} (attempt ${attempt}/${BUY_QUOTE_RETRY_ATTEMPTS}) — retrying in ${BUY_QUOTE_RETRY_DELAY_MS}ms`,
+      );
+      await new Promise((resolve) =>
+        setTimeout(resolve, BUY_QUOTE_RETRY_DELAY_MS),
+      );
+    }
+  }
+  return null;
+}
+
 export interface TradeabilityResult {
   tradeable: boolean;
   reason?: string;
@@ -40,6 +76,15 @@ export interface TradeabilityResult {
   liquidityUsd: number;
   buyQuote: JupiterQuote | null;
   sellQuote: JupiterQuote | null;
+  // On-chain-derived market cap in SOL — supply straight from the mint
+  // account, price implied by the buy quote above. Deliberately independent
+  // of Birdeye: its FDV reads $0 for a token this fresh just as often as its
+  // volume does, and market cap is the one filter the client specifically
+  // wants enforced, not softened — it needs a source that doesn't share
+  // Birdeye's indexing-lag failure mode. Undefined (not 0) when supply
+  // wasn't available — the per-wallet mcap gate must keep treating "unknown"
+  // and "genuinely below the minimum" as different things.
+  launchMarketCapSol?: number;
 }
 
 /**
@@ -68,19 +113,34 @@ export async function checkJupiterTradeability(
 
     const solPriceUsd = await getSolPriceUsd();
 
-    // Step 1: does Jupiter's aggregator actually route a buy?
-    const buyQuote = await jupiterService.getQuote(
-      SOL_MINT,
-      tokenMint,
-      ROUTING_PROBE_LAMPORTS,
-      ROUTING_PROBE_SLIPPAGE_BPS,
-    );
+    // Step 1: does Jupiter's aggregator actually route a buy? Retried — see
+    // getBuyQuoteWithRetry's own comment for why a single immediate attempt
+    // isn't reliable here.
+    const buyQuote = await getBuyQuoteWithRetry(tokenMint);
     if (!buyQuote || !buyQuote.outAmount) {
       return {
         tradeable: false,
         reason: "No Jupiter buy route available",
         ...empty,
       };
+    }
+
+    // Step 1b: market cap, computed on-chain — supply from the mint account,
+    // price implied by the buy quote just above. Independent of Birdeye on
+    // purpose (see TradeabilityResult's doc comment). A missing/failed
+    // supply lookup leaves this undefined rather than 0 — candidatePipeline
+    // only records a launch mcap when this succeeds, and the per-wallet gate
+    // (multiUserExecution.service.ts) already treats an unset value as
+    // failing closed, not as "$0 market cap."
+    let launchMarketCapSol: number | undefined;
+    const supplyInfo = await getOnChainMintSupply(tokenMint);
+    if (supplyInfo.available && solPriceUsd > 0) {
+      const tokensReceived =
+        Number(buyQuote.outAmount) / 10 ** supplyInfo.decimals;
+      if (tokensReceived > 0) {
+        const priceInSol = ROUTING_PROBE_LAMPORTS / 1e9 / tokensReceived;
+        launchMarketCapSol = priceInSol * supplyInfo.supply;
+      }
     }
 
     // Step 2: does it route back? A route that only works one way is either
@@ -99,6 +159,7 @@ export async function checkJupiterTradeability(
         liquidityUsd: 0,
         buyQuote,
         sellQuote: null,
+        ...(launchMarketCapSol != null ? { launchMarketCapSol } : {}),
       };
     }
 
@@ -127,6 +188,7 @@ export async function checkJupiterTradeability(
         liquidityUsd: 0,
         buyQuote,
         sellQuote,
+        ...(launchMarketCapSol != null ? { launchMarketCapSol } : {}),
       };
     }
 
@@ -139,6 +201,7 @@ export async function checkJupiterTradeability(
       liquidityUsd,
       buyQuote,
       sellQuote,
+      ...(launchMarketCapSol != null ? { launchMarketCapSol } : {}),
     };
   } catch (err: any) {
     LOG.error(

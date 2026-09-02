@@ -1170,6 +1170,30 @@ export async function upsertTokenState(
   );
 }
 
+/**
+ * Sets launchMarketCapSOL only if it isn't already recorded for this mint —
+ * deliberately separate from upsertTokenState's own handling of this field
+ * (routed through $setOnInsert there, which only ever fires on the row's
+ * very first insert). This pipeline's first insert for a mint happens at
+ * Phase 1/3 (see candidatePipeline.service.ts), before the Birdeye FDV data
+ * this value is computed from even exists — by the time it's available
+ * (Phase 4), the row already exists, so a second upsertTokenState call
+ * would silently drop it via that same $setOnInsert behavior. This targets
+ * the field directly with a conditional $set instead, while preserving the
+ * same "first successful capture wins, never overwritten later" semantics
+ * upsertTokenState's other launch-snapshot fields have.
+ */
+export async function setLaunchMarketCapIfUnset(
+  mint: string,
+  launchMarketCapSOL: number,
+): Promise<void> {
+  if (!db) await connect();
+  await tokenStateCol!.updateOne(
+    { mint, launchMarketCapSOL: { $exists: false } },
+    { $set: { launchMarketCapSOL, updatedAt: new Date() } },
+  );
+}
+
 export async function getTokenState(mint: string): Promise<TokenState | null> {
   if (!db) await connect();
   return await tokenStateCol!.findOne({ mint });
@@ -1295,6 +1319,7 @@ export default {
   getPnLHistory,
   upsertTokenState,
   getTokenState,
+  setLaunchMarketCapIfUnset,
   claimDiscoveryMint,
   completeDiscoveryMint,
   renewDiscoveryMint,
