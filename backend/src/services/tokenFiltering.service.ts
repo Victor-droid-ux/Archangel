@@ -3,24 +3,37 @@
 // Phase 4 of the linear discovery→validate→buy pipeline (see
 // candidatePipeline.service.ts): given a mint that Phase 3 already confirmed
 // is tradeable on Jupiter, apply ArchAngel's own quality/safety criteria —
-// tax, mint/freeze authority, LP lock, holder concentration, and
-// liquidity/volume/price health. These checks run exactly once per token,
-// globally, before any per-wallet execution — they don't depend on which
-// wallet is buying or how much, unlike Phase 5/6 (see
-// validationPipeline.service.ts) or the per-wallet launch-window/min-mcap
-// checks in multiUserExecution.service.ts.
+// exactly seven checks, none of which touch Jupiter or any third-party price
+// API:
 //
-// None of this touches Jupiter. Jupiter's role in this pipeline is strictly
-// trading (Phase 3's routing check, Phase 5's quote, Phase 6's execution) —
-// mint/freeze authority here comes straight from the mint account on-chain
-// (getOnChainMintAuthorityStatus), not Jupiter's /tokens/v2/search catalog.
+//   Phase 4
+//   ├── Mint authority     (on-chain, straight from the mint account)
+//   ├── Freeze authority   (on-chain, straight from the mint account)
+//   ├── Buy tax            (RugCheck)
+//   ├── Sell tax           (RugCheck)
+//   ├── Honeypot           (RugCheck)
+//   ├── Creator holdings   (on-chain token-account distribution)
+//   └── Top 3 holdings     (on-chain token-account distribution)
+//
+// These run exactly once per token, globally, before any per-wallet
+// execution — they don't depend on which wallet is buying or how much,
+// unlike Phase 5/6 (see validationPipeline.service.ts) or the per-wallet
+// launch-window/min-mcap checks in multiUserExecution.service.ts.
+//
+// There is deliberately no market-health/liquidity/volume check here
+// anymore — that used to be a Birdeye call, and Birdeye has been removed
+// from this codebase entirely (API-plan compute-unit limits made it an
+// unreliable dependency for a check that runs on every single candidate).
+// Liquidity is still gated — just by Jupiter itself, structurally, as part
+// of Phase 3 (see jupiterTradeability.service.ts) and again immediately
+// before each buy in Phase 6 (see validationPipeline.service.ts's
+// pre-execution checks).
 import { getLogger } from "../utils/logger.js";
 import {
   fetchRugCheckReport,
   getHolderDistribution,
   getOnChainMintAuthorityStatus,
 } from "./tokenSafetyChecks.service.js";
-import birdeyeService from "./birdeye.service.js";
 
 const LOG = getLogger("token-filtering");
 
@@ -48,9 +61,6 @@ export interface FilterResult {
     isHoneypot: boolean;
     creatorHoldingsPct?: number;
     top3HoldingsPct?: number;
-    marketHealthy: boolean;
-    marketHealthReasons: string[];
-    fdvUsd: number;
   };
 }
 
@@ -61,18 +71,12 @@ export interface FilterResult {
  * — see candidatePipeline.service.ts), is excluded from the holder-
  * concentration ranking so the AMM's own liquidity vault is never mistaken
  * for a whale wallet. There's no creator/deployer address available without
- * a Jupiter catalog lookup, so creator-holdings falls back to "largest
- * non-pool holder" — see getHolderDistribution's own doc comment.
- *
- * `buySolEstimate` only sizes the reference trade used for the Birdeye
- * price-impact/market-health check — it is NOT the actual buy amount (that's
- * decided per-wallet in Phase 6). A reasonable default (the global
- * auto-buy reference size) is used if the caller doesn't have one yet.
+ * a token-metadata catalog lookup, so creator-holdings falls back to
+ * "largest non-pool holder" — see getHolderDistribution's own doc comment.
  */
 export async function applyArchAngelFilters(
   tokenMint: string,
   config: ArchAngelFilterConfig,
-  buySolEstimate = 0.05,
   poolAddress?: string,
 ): Promise<FilterResult> {
   const passedFilters: string[] = [];
@@ -85,9 +89,6 @@ export async function applyArchAngelFilters(
     sellTax: 0,
     lpLocked: false,
     isHoneypot: false,
-    marketHealthy: false,
-    marketHealthReasons: [],
-    fdvUsd: 0,
   };
 
   try {
@@ -175,8 +176,8 @@ export async function applyArchAngelFilters(
     }
 
     // Holder concentration — on-chain token-account data, with the pool
-    // address (from the webhook event, not Jupiter) excluded from the
-    // ranking so liquidity isn't mistaken for a whale wallet.
+    // address (from the webhook event) excluded from the ranking so
+    // liquidity isn't mistaken for a whale wallet.
     const maxCreatorPct = config.maxCreatorHoldingsPct ?? 20;
     const maxTop3Pct = config.maxTop3HoldingsPct ?? 60;
     const holderDist = await getHolderDistribution(tokenMint, {
@@ -205,24 +206,6 @@ export async function applyArchAngelFilters(
       }
     }
 
-    // Market health: liquidity/volume/price-impact/FDV-LP ratio, plus
-    // soft-rug, suspicious-sell, and bot-activity heuristics.
-    const marketHealth = await birdeyeService.checkMarketHealth(
-      tokenMint,
-      buySolEstimate,
-    );
-    details.marketHealthy = marketHealth.isHealthy;
-    details.marketHealthReasons = marketHealth.reasons;
-    // Reused for launchMarketCapSOL (see candidatePipeline.service.ts) —
-    // FDV comes from this same Birdeye call, so exposing it here avoids a
-    // second, fully independent Birdeye request just to get a market cap
-    // figure. For a freshly-launched token (no vesting/locked supply, the
-    // overwhelmingly common case for what this pipeline discovers), FDV and
-    // circulating market cap are effectively the same number anyway.
-    details.fdvUsd = marketHealth.fdv;
-    if (marketHealth.isHealthy) passedFilters.push("market_health");
-    else failedFilters.push("market_health");
-
     const approved = failedFilters.length === 0;
     if (approved) {
       LOG.info(
@@ -231,10 +214,7 @@ export async function applyArchAngelFilters(
       );
     } else {
       LOG.warn(
-        {
-          failedChecks: failedFilters,
-          marketHealthReasons: marketHealth.reasons,
-        },
+        { failedChecks: failedFilters },
         `❌ [Phase 4] ArchAngel filters FAILED for ${tokenMint.slice(0, 8)}`,
       );
     }

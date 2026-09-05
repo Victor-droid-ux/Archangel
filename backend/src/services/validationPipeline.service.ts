@@ -1,5 +1,9 @@
 import { getLogger } from "../utils/logger.js";
-import { getJupiterQuote, executeJupiterSwap } from "./jupiter.service.js";
+import {
+  getJupiterQuote,
+  executeJupiterSwap,
+  type JupiterQuote,
+} from "./jupiter.service.js";
 import {
   hasSufficientBalance,
   getConnection,
@@ -75,6 +79,18 @@ class ValidationPipelineService {
   );
   private readonly AUTO_BUY_SLIPPAGE = parseFloat(
     process.env.AUTO_BUY_SLIPPAGE_PCT || "10",
+  );
+  // Used by the "liquidity sufficient?" Jupiter execution check — see
+  // evaluateJupiterExecutionQuote. Deliberately independent of Phase 3's own
+  // liquidity floor (jupiterTradeability.service.ts): that one ran once,
+  // possibly seconds to minutes ago; this one re-checks right before
+  // spending real capital.
+  private readonly MIN_EXECUTION_LIQUIDITY_SOL = Number(
+    process.env.MIN_EXECUTION_LIQUIDITY_SOL ?? 1,
+  );
+  // Used by the "quote still valid?" Jupiter execution check.
+  private readonly MAX_QUOTE_AGE_MS = Number(
+    process.env.MAX_QUOTE_AGE_MS ?? 8000,
   );
   // Jupiter's quote/swap APIs take slippage in basis points, not percent
   private get AUTO_BUY_SLIPPAGE_BPS(): number {
@@ -231,6 +247,120 @@ class ValidationPipelineService {
    * the one-time global Phase 3/4 checks because the buy amount — and so the
    * quote itself — is different for every wallet.
    */
+  /**
+   * The five Jupiter execution checks, run twice per buy: once in Stage 1
+   * (pre-execution, before touching balance checks or the wallet lock) and
+   * again in Stage 2 on a BRAND NEW quote fetched immediately before the
+   * swap itself. Running it twice against two different quotes is what
+   * makes "quote still valid" a real check rather than a formality — a
+   * pool can thin out or get partially drained in the seconds between
+   * Stage 1 approving a candidate and Stage 2 actually executing (wallet
+   * lock queueing, balance checks, other wallets' buys in the same
+   * fan-out), and only re-validating a fresh quote at the last possible
+   * moment catches that.
+   *
+   *   Jupiter
+   *   ├── Buy route exists?
+   *   ├── Liquidity sufficient?
+   *   ├── Price impact acceptable?
+   *   ├── Expected output acceptable?
+   *   └── Quote still valid?
+   */
+  private evaluateJupiterExecutionQuote(
+    quote: JupiterQuote | null,
+    quoteFetchedAt: number,
+  ): { passed: boolean; reason?: string; checks: Record<string, boolean> } {
+    const checks: Record<string, boolean> = {
+      buy_route_exists: false,
+      liquidity_sufficient: false,
+      price_impact_acceptable: false,
+      expected_output_acceptable: false,
+      quote_still_valid: false,
+    };
+
+    // 1. Buy route exists?
+    if (!quote || !(quote.outAmount > 0)) {
+      return {
+        passed: false,
+        reason: "No Jupiter buy route available",
+        checks,
+      };
+    }
+    checks.buy_route_exists = true;
+
+    // 2. Liquidity sufficient? — same constant-product price-impact-implied
+    // reserve estimate resolveLiquidityUsd uses (see jupiter.service.ts),
+    // inlined here in pure SOL terms so this needs no USD conversion and no
+    // third-party price feed. impact === 0 reads as "comfortably deep, no
+    // measurable impact from this trade size" rather than "unknown."
+    const impact = quote.priceImpactPct;
+    const inSol = quote.inAmount / 1e9;
+    let impliedLiquiditySol = Infinity;
+    if (Number.isFinite(impact) && impact > 0) {
+      impliedLiquiditySol = (2 * inSol) / impact;
+    } else if (!Number.isFinite(impact) || impact < 0) {
+      impliedLiquiditySol = 0; // can't read the impact at all — fail closed
+    }
+    if (impliedLiquiditySol < this.MIN_EXECUTION_LIQUIDITY_SOL) {
+      return {
+        passed: false,
+        reason: `Implied liquidity too thin: ~${impliedLiquiditySol.toFixed(2)} SOL < ${this.MIN_EXECUTION_LIQUIDITY_SOL} SOL minimum`,
+        checks,
+      };
+    }
+    checks.liquidity_sufficient = true;
+
+    // 3. Price impact acceptable?
+    if (!Number.isFinite(impact) || impact > this.MAX_SLIPPAGE) {
+      return {
+        passed: false,
+        reason: `Price impact too high: ${Number.isFinite(impact) ? impact.toFixed(2) : "unknown"}%`,
+        checks,
+      };
+    }
+    checks.price_impact_acceptable = true;
+
+    // 4. Expected output acceptable? — Jupiter's own worst-case guaranteed
+    // output (otherAmountThreshold) must exist and must not imply Jupiter
+    // is itself budgeting for far more slippage than we configured; either
+    // one is a sign something is wrong with this specific quote, not just
+    // "the market moved."
+    const guaranteedOut = quote.otherAmountThreshold;
+    if (!(guaranteedOut > 0)) {
+      return {
+        passed: false,
+        reason: "No guaranteed minimum output on quote",
+        checks,
+      };
+    }
+    const impliedWorstCaseSlippagePct =
+      ((quote.outAmount - guaranteedOut) / quote.outAmount) * 100;
+    const configuredSlippagePct = quote.slippageBps / 100;
+    if (impliedWorstCaseSlippagePct > configuredSlippagePct * 2) {
+      return {
+        passed: false,
+        reason: `Quote's guaranteed output implies ${impliedWorstCaseSlippagePct.toFixed(1)}% slippage, far above the ${configuredSlippagePct.toFixed(1)}% configured`,
+        checks,
+      };
+    }
+    checks.expected_output_acceptable = true;
+
+    // 5. Quote still valid? — freshness. Jupiter quotes are only good for a
+    // few seconds on a fast-moving pool; anything fetched further back than
+    // this is stale enough that re-quoting is safer than trusting it.
+    const ageMs = Date.now() - quoteFetchedAt;
+    if (ageMs > this.MAX_QUOTE_AGE_MS) {
+      return {
+        passed: false,
+        reason: `Quote is ${(ageMs / 1000).toFixed(1)}s old, exceeds ${this.MAX_QUOTE_AGE_MS / 1000}s freshness limit`,
+        checks,
+      };
+    }
+    checks.quote_still_valid = true;
+
+    return { passed: true, checks };
+  }
+
   private async stage1_preExecutionCheck(
     tokenMint: string,
     buySol: number,
@@ -249,23 +379,25 @@ class ValidationPipelineService {
         lamports,
         this.AUTO_BUY_SLIPPAGE_BPS,
       );
+      const quoteFetchedAt = Date.now();
 
-      if (!quote || !quote.outAmount) {
+      const evaluation = this.evaluateJupiterExecutionQuote(
+        quote,
+        quoteFetchedAt,
+      );
+      if (!evaluation.passed) {
         return {
           passed: false,
           stage: 1,
           stageName: "Jupiter Pre-Execution",
-          reason: "No Jupiter route/output available for buy amount",
-        };
-      }
-
-      if (quote.priceImpactPct && quote.priceImpactPct > this.MAX_SLIPPAGE) {
-        return {
-          passed: false,
-          stage: 1,
-          stageName: "Jupiter Pre-Execution",
-          reason: `Price impact too high: ${quote.priceImpactPct.toFixed(2)}%`,
-          details: quote,
+          details: { checks: evaluation.checks, quote },
+          // Under exactOptionalPropertyTypes, an optional field must be a
+          // real value or entirely absent — evaluation.reason is typed
+          // string | undefined, so assigning it directly is a type error
+          // even though it's only ever actually undefined when passed=true
+          // (which never reaches this branch). Conditional spread omits the
+          // key outright instead.
+          ...(evaluation.reason !== undefined && { reason: evaluation.reason }),
         };
       }
 
@@ -281,12 +413,15 @@ class ValidationPipelineService {
         }
       }
 
-      LOG.info(`[Stage 1] ✅ Jupiter Pre-Execution Check PASSED`);
+      LOG.info(
+        { checks: evaluation.checks },
+        `[Stage 1] ✅ Jupiter Pre-Execution Check PASSED`,
+      );
       return {
         passed: true,
         stage: 1,
         stageName: "Jupiter Pre-Execution",
-        details: quote,
+        details: { checks: evaluation.checks, quote },
       };
     } catch (error: any) {
       LOG.error(`[Stage 1] ❌ Error: ${error.message}`);
@@ -321,13 +456,35 @@ class ValidationPipelineService {
         lamports,
         this.AUTO_BUY_SLIPPAGE_BPS,
       );
+      const quoteFetchedAt = Date.now();
 
-      if (!quote || !quote.outAmount) {
+      // Re-run the same five checks Stage 1 did, against a BRAND NEW quote
+      // fetched right now — this is what makes "quote still valid" mean
+      // something: Stage 1 may have approved this buy seconds ago, before
+      // the wallet lock queue or a balance check added latency, or before
+      // another wallet in this same fan-out moved the pool. If the pool has
+      // thinned out or the price has moved past what's acceptable since
+      // then, this catches it immediately before capital actually moves —
+      // not "does a route exist," the same full bar Stage 1 held it to.
+      const evaluation = this.evaluateJupiterExecutionQuote(
+        quote,
+        quoteFetchedAt,
+      );
+      if (!evaluation.passed || !quote) {
+        // The `!quote` half of this condition should be unreachable in
+        // practice — evaluateJupiterExecutionQuote only reports passed=true
+        // when its own internal quote check succeeded — but TypeScript
+        // can't see that guarantee across the function boundary. Checking
+        // it explicitly here (rather than a non-null assertion) is what
+        // keeps `quote` narrowed to non-null for everything below.
+        const reason =
+          evaluation.reason ?? "Quote unexpectedly missing after evaluation";
         return {
           passed: false,
           stage: 2,
           stageName: "Jupiter Buy Execution",
-          reason: "No Jupiter route/output available at execution time",
+          reason,
+          details: { checks: evaluation.checks },
         };
       }
 

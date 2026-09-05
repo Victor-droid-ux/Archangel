@@ -6,17 +6,29 @@
 //
 // QuickNode Streams (https://www.quicknode.com/docs/streams) let you attach
 // a Filter/Function that runs QuickNode-side and reshapes each matched
-// transaction before it's POSTed to your webhook. The recommended setup for
-// this pipeline is a Solana dataset (block/transaction) filtered to new-pool
-// instructions on the DEX programs you care about (Raydium, Orca Whirlpool,
-// etc.), with a Function that emits ONE clean object per new pool — mint
-// addresses, pool address, dex name, and pool-creation timestamp — instead
-// of forwarding the raw transaction. That is the "structured" shape below,
-// and it's what this file expects by default.
+// transaction before it's POSTed to your webhook. This pipeline requires
+// that shaping Function: a Solana dataset (block/transaction) filtered to
+// new-pool instructions on the DEX programs you care about (Raydium, Orca,
+// etc.), emitting ONE clean object per new pool — mint address, pool
+// address, dex name, and pool-creation time. That is the "structured" shape
+// below, and it is now the ONLY shape this file accepts for auto-trade
+// candidates.
 //
-// Auto-trading accepts only these structured pool-creation events. Raw
-// transaction payloads are intentionally ignored because they cannot prove
-// a mint was newly launched by that transaction.
+// Strict on purpose: mint, poolAddress, dex, and a creation timestamp are
+// ALL required, or the event is rejected outright (empty result, not a
+// partial candidate). A candidate missing poolAddress can't be excluded
+// from its own holder-concentration ranking in Phase 4 (see
+// tokenFiltering.service.ts); one missing dex can't be filtered by DEX
+// later if that's ever wanted; one missing a timestamp can't be checked for
+// delivery freshness (see candidatePipeline.service.ts's isFreshCandidate).
+// A partially-shaped event is a QuickNode Stream/Function misconfiguration,
+// not something to silently trade around.
+//
+// The previous raw-transaction fallback (parsing pre/postTokenBalances
+// directly out of an unshaped transaction) has been removed entirely for
+// the same reason: it can supply a mint, but never a reliable poolAddress,
+// dex, or precise creation time — every candidate it produced was
+// necessarily missing data this pipeline now requires for auto-trading.
 import { PublicKey } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -52,8 +64,8 @@ function isValidMint(candidate: unknown): candidate is string {
 }
 
 /**
- * Structured event shape: what a QuickNode Stream Function should emit for
- * a new-pool-creation match. One event can reference multiple pools if a
+ * Structured event shape: what a QuickNode Stream Function must emit for a
+ * new-pool-creation match. One event can reference multiple pools if a
  * single block/transaction created more than one (e.g. a batched deploy).
  */
 interface StructuredPoolEvent {
@@ -92,31 +104,45 @@ function parseTimestamp(ev: StructuredPoolEvent): Date | undefined {
   return Number.isFinite(d.getTime()) ? d : undefined;
 }
 
+/**
+ * Accepts a structured event only when mint, poolAddress, dex, and a valid
+ * creation timestamp are ALL present — see this file's header comment for
+ * why each one is mandatory now. Returns null on any single missing piece,
+ * not a partial CandidateMint.
+ */
 function extractFromStructuredEvent(
   ev: StructuredPoolEvent,
 ): CandidateMint | null {
   const mint = pickNewMint(ev);
+  if (!mint) return null;
+
   const poolAddress = isValidMint(ev.poolAddress) ? ev.poolAddress : null;
-  const poolCreatedAt = parseTimestamp(ev);
-  if (!mint || !poolAddress || !ev.dex || !poolCreatedAt) {
-    LOG.warn(
+  const poolCreatedAt = parseTimestamp(ev) ?? null;
+  const dex = typeof ev.dex === "string" && ev.dex.length > 0 ? ev.dex : null;
+
+  if (!poolAddress || !dex || !poolCreatedAt) {
+    LOG.debug(
       {
-        mint,
-        poolAddress: ev.poolAddress,
-        dex: ev.dex,
-        timestamp: ev.timestamp ?? ev.blockTime,
+        mint: mint.slice(0, 8),
+        hasPoolAddress: !!poolAddress,
+        hasDex: !!dex,
+        hasTimestamp: !!poolCreatedAt,
       },
-      "Rejected unstructured QuickNode event: strict pool-creation fields are required",
+      "Rejecting incomplete pool-creation event — missing required field(s)",
     );
     return null;
   }
-  return { mint, poolAddress, dex: ev.dex, poolCreatedAt };
+
+  return { mint, poolAddress, dex, poolCreatedAt };
 }
 
 /**
  * Phase 2 entry point: given the raw JSON body QuickNode POSTed, return
- * every candidate mint it represents. Only structured pool-creation events
- * with mint, pool, DEX, and creation time are accepted for auto-trading.
+ * every candidate mint it represents. Handles a single event and an array
+ * of events (a batch delivery, which QuickNode Streams does by default).
+ * Any event that isn't a complete structured pool-creation event (see
+ * extractFromStructuredEvent) is silently dropped, not degraded into a
+ * partial candidate.
  */
 export function extractCandidateMints(payload: unknown): CandidateMint[] {
   const events = Array.isArray(payload) ? payload : [payload];
@@ -131,7 +157,7 @@ export function extractCandidateMints(payload: unknown): CandidateMint[] {
     } else {
       LOG.debug(
         { event: ev },
-        "Webhook event is not a valid structured pool-creation event — skipping",
+        "Webhook event rejected — not a complete structured pool-creation event",
       );
     }
   }

@@ -1,5 +1,4 @@
 // backend/src/services/tokenChart.service.ts
-import birdeyeService from "./birdeye.service.js";
 import { getLogger } from "../utils/logger.js";
 
 const log = getLogger("tokenChart.service");
@@ -9,35 +8,27 @@ export interface ChartPoint {
   price: number;
 }
 
-// intervalMinutes/lookbackMinutes per timeframe, matching birdeye.service.ts's
-// supported candle types (getPriceHistory maps these to Birdeye's "type" param)
-const TIMEFRAME_CONFIG: Record<
-  string,
-  { intervalMinutes: number; lookbackMinutes: number }
-> = {
-  "1h": { intervalMinutes: 1, lookbackMinutes: 60 },
-  "24h": { intervalMinutes: 15, lookbackMinutes: 24 * 60 },
-  "7d": { intervalMinutes: 60, lookbackMinutes: 7 * 24 * 60 },
-  "30d": { intervalMinutes: 240, lookbackMinutes: 30 * 24 * 60 },
-};
-
+/**
+ * Historical price chart data for a token.
+ *
+ * Returns empty (not an error) — this used to be backed by Birdeye's
+ * history_price endpoint, which has been removed from this codebase
+ * entirely (its API-plan compute-unit limits made it an unreliable
+ * dependency). Jupiter has no historical price API of its own, so there is
+ * currently NO price-history data source anywhere in this codebase. This
+ * function is left in place (returning empty) so callers — routes/tokenChart.route.ts
+ * and anything else expecting a ChartPoint[] — keep working rather than
+ * throwing, but the chart feature has no real data until a different
+ * provider (e.g. DexScreener, GeckoTerminal — several offer free Solana
+ * OHLCV endpoints) is wired in here.
+ */
 export async function getTokenChartData(
   mint: string,
-  tf: string = "24h"
+  tf: string = "24h",
 ): Promise<ChartPoint[]> {
-  const config = TIMEFRAME_CONFIG[tf] ?? TIMEFRAME_CONFIG["24h"];
-
-  const history = await birdeyeService.getPriceHistory(mint, config);
-
-  if (history.length === 0) {
-    log.debug(
-      { mint: mint.slice(0, 8), tf },
-      "No price history available for chart"
-    );
-  }
-
-  return history.map((point) => ({
-    time: new Date(point.timestamp * 1000).toISOString(),
-    price: point.price,
-  }));
+  log.debug(
+    { mint: mint.slice(0, 8), tf },
+    "Price history unavailable — no provider configured (Birdeye removed)",
+  );
+  return [];
 }

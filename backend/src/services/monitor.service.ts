@@ -2,7 +2,7 @@
 import {
   getJupiterQuote,
   executeJupiterSwap,
-  getSolPriceUsd,
+  getQuoteImpliedPriceSol,
 } from "./jupiter.service.js";
 import dbService, { Position } from "./db.service.js";
 import { getLogger } from "../utils/logger.js";
@@ -16,7 +16,6 @@ import userWalletService from "./userWallet.service.js";
 import { loadKeypairFromEnv } from "./solana.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 import { getEffectiveConfig } from "./traderConfig.service.js";
-import birdeyeService from "./birdeye.service.js";
 
 const OPERATOR_WALLET =
   process.env.ADMIN_WALLET_PUBKEY || process.env.WALLET_PUBLIC_KEY || "";
@@ -251,7 +250,7 @@ export function startPositionMonitor(
           // ✨ RULE 9 (moved up): a position with nothing left to sell needs
           // no price, no decimals, no cost basis, no emergency-exit check —
           // none of it changes the outcome. Checking this first, before any
-          // of that work (in particular before the Jupiter/Birdeye price
+          // of that work (in particular before the Jupiter-quote price
           // fetch below), matters in practice: a position can reach
           // remainingPct <= 0 while its netSol dust-threshold check above
           // still doesn't trip (rounding residue across multiple partial
@@ -358,32 +357,27 @@ export function startPositionMonitor(
           }
 
           // Fair-value price for PnL/TP/SL decisions — NOT a quote for a
-          // specific trade size. A sell-side quote (what used to be used here)
-          // bakes in that trade's own price impact on top of the pool's real
-          // bid-ask spread, so it's always biased below what the token is
-          // actually worth — comparing that against avgBuy (which is itself
-          // inflated by buy-side price impact) manufactures an apparent loss
-          // from the round-trip spread alone, the instant a position opens,
-          // regardless of what the token's price actually does. Birdeye's
-          // price feed is a fair-value estimate, not an executable quote, so
-          // it doesn't have this bias. Real execution quotes are still
-          // fetched fresh at the moment of an actual sell, below.
-          //
-          // Jupiter is intentionally not used here (or anywhere in this
-          // pipeline outside Phase 3/5/6) — its role is strictly trading:
-          // checking a route exists, quoting, and executing. Fetching a
-          // token's price/metadata is not a trading function.
-          const currentUsdPrice =
-            await birdeyeService.getCurrentPrice(tokenMint);
-          if (!currentUsdPrice) {
+          // specific trade size. This is a small, fixed-size REFERENCE quote
+          // (see getQuoteImpliedPriceSol's own doc comment for the exact
+          // tradeoff), not the eventual sell-side quote for this position's
+          // real size — that's still fetched fresh at the moment of an
+          // actual sell, below. There is no third-party price feed left in
+          // this codebase (Birdeye has been removed entirely), so this
+          // small-reference-quote estimate is the only fair-value price
+          // source available; it carries a mild price-impact bias that a
+          // true aggregated feed wouldn't, but a FIXED small size keeps that
+          // bias consistent and small rather than scaling with position size.
+          const currentPrice = await getQuoteImpliedPriceSol(
+            tokenMint,
+            decimals,
+          );
+          if (!currentPrice) {
             log.warn(
               { tokenMint, wallet: pos.wallet },
               "No trustworthy price; deferring TP/SL evaluation",
             );
             continue;
           }
-          const solPriceUsd = await getSolPriceUsd();
-          const currentPrice = currentUsdPrice / solPriceUsd; // SOL per token
 
           const pnlPercent = (currentPrice - avgBuy) / avgBuy;
 
@@ -508,7 +502,7 @@ export function startPositionMonitor(
                 await recordSellSuccess(tokenMint, pos.wallet);
 
                 // Emergency exit always sells the entire position — stop the
-                // live P&L poll loop, otherwise it keeps polling Birdeye for
+                // live P&L poll loop, otherwise it keeps quoting Jupiter for
                 // a token we no longer hold, forever (pnlTracker.service.ts's
                 // stopTracking is never called automatically).
                 pnlTrackerService.stopTracking(tokenMint, pos.wallet);

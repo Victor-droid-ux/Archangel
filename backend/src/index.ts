@@ -43,12 +43,15 @@ function scheduleExit(code: number): void {
 process.on("unhandledRejection", (reason: any) => {
   log.error(
     { err: reason?.stack ?? reason?.message ?? String(reason) },
-    "🚨 Unhandled promise rejection (process kept alive)"
+    "🚨 Unhandled promise rejection (process kept alive)",
   );
 });
 
 process.on("uncaughtException", (err: Error) => {
-  log.error({ err: err.stack ?? err.message }, "🚨 Uncaught exception — exiting");
+  log.error(
+    { err: err.stack ?? err.message },
+    "🚨 Uncaught exception — exiting",
+  );
   scheduleExit(1);
 });
 

@@ -16,7 +16,6 @@ import jupiterService, {
   getSolPriceUsd,
   resolveLiquidityUsd,
 } from "./jupiter.service.js";
-import birdeyeService from "./birdeye.service.js";
 import {
   getHolderDistribution,
   checkPoolStillLive,
@@ -51,7 +50,6 @@ export interface SafetyChecks {
   canSell: boolean; // Test sell successful
   mintAuthority: string | null;
   freezeAuthority: string | null;
-  firstThreeCandlesValid: boolean; // No 60%+ dump
   lpRemovable: boolean;
   buyTax: number;
   sellTax: number;
@@ -164,36 +162,6 @@ async function checkJupiterTradable(
 }
 
 /**
- * Look for a >60% price collapse in the token's short recent history (its
- * "first three candles" since discovery). A brand-new token — the normal
- * case, since this bot validates within seconds of launch — simply has no
- * history yet; that's not evidence of a dump, so it passes rather than being
- * fabricated as either always-true or always-false.
- */
-async function checkNoEarlyDump(tokenMint: string): Promise<boolean> {
-  try {
-    const points = await birdeyeService.getPriceHistory(tokenMint, {
-      intervalMinutes: 1,
-      lookbackMinutes: 15,
-    });
-    if (points.length < 2) return true; // no data yet — nothing detected
-
-    const prices = points.map((p) => p.price);
-    const high = Math.max(...prices);
-    const low = Math.min(...prices);
-    if (high <= 0) return true;
-
-    const dropPct = (high - low) / high;
-    return dropPct < 0.6;
-  } catch (err) {
-    log.debug(
-      `Early-dump check unavailable for ${tokenMint.slice(0, 8)}...: ${err}`,
-    );
-    return true; // no data — same honest-degradation reasoning as above
-  }
-}
-
-/**
  * CONDITION 2: Perform anti-manipulation safety checks
  */
 async function performSafetyChecks(
@@ -259,7 +227,6 @@ async function performSafetyChecks(
     const top3BelowLimit = holderDataAvailable && top3Combined <= 60;
 
     const lpNotRemoved = await checkPoolStillLive(tokenMint, poolAddress);
-    const firstThreeCandlesValid = await checkNoEarlyDump(tokenMint);
 
     // Tax/honeypot via RugCheck — mirrors the same check the auto-buy
     // candidate pipeline runs in tokenFiltering.service.ts's Phase 4
@@ -279,7 +246,6 @@ async function performSafetyChecks(
       canSell,
       mintAuthority: mintAuthorityNull ? null : "unknown",
       freezeAuthority: freezeAuthorityNull ? null : "unknown",
-      firstThreeCandlesValid,
       lpRemovable: !lpNotRemoved,
       buyTax: rugCheck.taxes.buyTax,
       sellTax: rugCheck.taxes.sellTax,
@@ -291,7 +257,6 @@ async function performSafetyChecks(
         creatorBelowLimit &&
         top3BelowLimit &&
         lpNotRemoved &&
-        firstThreeCandlesValid &&
         taxAcceptable &&
         notHoneypot,
     };
@@ -324,7 +289,6 @@ async function performSafetyChecks(
         canSell: false,
         mintAuthority: "UNKNOWN",
         freezeAuthority: "UNKNOWN",
-        firstThreeCandlesValid: false,
         lpRemovable: true,
         buyTax: 0,
         sellTax: 0,
@@ -355,7 +319,6 @@ export async function validateTradeOpportunity(
           canSell: false,
           mintAuthority: "UNKNOWN",
           freezeAuthority: "UNKNOWN",
-          firstThreeCandlesValid: false,
           lpRemovable: true,
           buyTax: 0,
           sellTax: 0,

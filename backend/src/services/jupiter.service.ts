@@ -8,7 +8,7 @@ import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
 import { getLogger } from "../utils/logger.js";
 import { getConnection, loadKeypairFromEnv } from "./solana.service.js";
 import { ENV } from "../utils/env.js";
-import { quoteCache, liquidityCache } from "./cache.service.js";
+import { quoteCache } from "./cache.service.js";
 
 const LOG = getLogger("jupiter.service");
 
@@ -461,41 +461,8 @@ const MIN_REFERENCE_PROBE_USD = 25;
  * engine the real trade will use. If that reference-sized quote can't
  * route, that IS genuine evidence of thin liquidity, so it's reported as $0
  * rather than "unavailable".
- *
- * Cached for CACHE_LIQUIDITY_TTL (default 15s, see cache.service.ts) —
- * callers like emergencyExit.service.ts's detectLargeSell run this on every
- * monitor tick (every few seconds) for every open position, for that
- * position's whole lifetime; that check doesn't need millisecond-fresh
- * liquidity, and without this every tick was a guaranteed live Jupiter quote
- * call, scaling linearly with concurrent open positions. Keyed on both the
- * mint and the hint, since the hint changes the reference probe size — two
- * callers using different hints for the same mint shouldn't share a result.
  */
 export async function resolveLiquidityUsd(
-  tokenMint: string,
-  minLiquidityUsdHint: number,
-  solPriceUsd: number,
-): Promise<{
-  liquidityUSD: number;
-  source: "impact-estimate" | "unavailable";
-}> {
-  const cacheKey = `${tokenMint}:${minLiquidityUsdHint}`;
-  const cached = liquidityCache.get<{
-    liquidityUSD: number;
-    source: "impact-estimate" | "unavailable";
-  }>(cacheKey);
-  if (cached) return cached;
-
-  const result = await resolveLiquidityUsdUncached(
-    tokenMint,
-    minLiquidityUsdHint,
-    solPriceUsd,
-  );
-  liquidityCache.set(cacheKey, result);
-  return result;
-}
-
-async function resolveLiquidityUsdUncached(
   tokenMint: string,
   minLiquidityUsdHint: number,
   solPriceUsd: number,
@@ -541,6 +508,47 @@ async function resolveLiquidityUsdUncached(
   // the implied one-sided reserve to match that convention.
   const estimated = (2 * referenceAmountUsd) / impact;
   return { liquidityUSD: estimated, source: "impact-estimate" };
+}
+
+// Small reference amount for quote-implied pricing/liquidity estimates —
+// large enough to get a meaningful quote, small enough to minimize the
+// estimate's own price-impact distortion on a thin pool.
+const PRICE_PROBE_LAMPORTS = 10_000_000; // 0.01 SOL
+
+/**
+ * Fair-value price for a token, in SOL per whole token — derived from a
+ * small reference buy quote, not fetched from any price feed. This is the
+ * only price source left anywhere in this codebase that isn't Jupiter
+ * execution itself: no token-metadata catalog, no third-party price API.
+ *
+ * Understand the tradeoff before using this for anything besides a rough
+ * estimate: a quote — even a small one — always bakes in that trade's own
+ * price impact on top of the pool's real bid-ask spread, so it's a biased
+ * (usually slightly high, for a buy-side quote) read of "true" spot price,
+ * not an aggregated fair-value feed. It's precise enough for "is this
+ * candidate's implied market cap roughly in range" or "how has this
+ * position's value moved," and it deliberately CANNOT be used to justify a
+ * PnL calculation that looks better/worse than reality by more than a
+ * couple of the pool's own percentage points of slippage.
+ *
+ * Returns null if no route exists or a decimals lookup elsewhere failed —
+ * callers must treat that as "unknown," not "zero."
+ */
+export async function getQuoteImpliedPriceSol(
+  tokenMint: string,
+  tokenDecimals: number,
+): Promise<number | null> {
+  if (!(tokenDecimals >= 0)) return null;
+  const quote = await jupiterService.getQuote(
+    SOL_MINT,
+    tokenMint,
+    PRICE_PROBE_LAMPORTS,
+    500,
+  );
+  if (!quote?.outAmount) return null;
+  const outTokens = Number(quote.outAmount) / 10 ** tokenDecimals;
+  if (!(outTokens > 0)) return null;
+  return PRICE_PROBE_LAMPORTS / 1e9 / outTokens;
 }
 
 // Named convenience exports matching the old raydium.service.ts call-site shape,

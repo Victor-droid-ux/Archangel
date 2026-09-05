@@ -20,7 +20,7 @@ const queues = new Map<string, Promise<unknown>>();
 
 export function withWalletLock<T>(
   wallet: string,
-  fn: () => Promise<T>
+  fn: () => Promise<T>,
 ): Promise<T> {
   const prior = queues.get(wallet) ?? Promise.resolve();
   // Run fn only after `prior` settles, regardless of whether it resolved or
@@ -33,7 +33,7 @@ export function withWalletLock<T>(
   // reaches whoever called withWalletLock, via the returned `run` promise.
   queues.set(
     wallet,
-    run.catch(() => undefined)
+    run.catch(() => undefined),
   );
   return run;
 }

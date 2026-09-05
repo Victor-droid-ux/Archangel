@@ -1,7 +1,7 @@
 import { Router } from "express";
 import dbService from "../services/db.service.js";
-import { getSolPriceUsd } from "../services/jupiter.service.js";
-import birdeyeService from "../services/birdeye.service.js";
+import { getQuoteImpliedPriceSol } from "../services/jupiter.service.js";
+import { getOnChainMintSupply } from "../services/tokenSafetyChecks.service.js";
 import { getLogger } from "../utils/logger.js";
 
 const router = Router();
@@ -26,20 +26,19 @@ router.get("/", async (req, res) => {
       return res.json({ success: true, positions: [] });
     }
 
-    const solPriceUsd = await getSolPriceUsd();
-
     const enriched = await Promise.all(
       positions.map(async (p) => {
         let currentPrice = 0; // SOL-denominated, same unit as avgBuyPrice
         try {
-          // Fair-value price from Birdeye, not a Jupiter quote/catalog fetch
-          // — Jupiter's role in this codebase is strictly trading, never
-          // pricing a position for display (same reasoning as
-          // monitor.service.ts's mark-to-market and
-          // portfolioValuation.service.ts).
-          const priceUsd = await birdeyeService.getCurrentPrice(p.token);
-          if (priceUsd && solPriceUsd > 0) {
-            currentPrice = priceUsd / solPriceUsd;
+          // Fair-value price from a small reference Jupiter quote — see
+          // getQuoteImpliedPriceSol's own doc comment for the tradeoff.
+          // Birdeye has been removed from this codebase entirely; this is
+          // the only price source left for display purposes.
+          const supplyInfo = await getOnChainMintSupply(p.token);
+          if (supplyInfo.available) {
+            currentPrice =
+              (await getQuoteImpliedPriceSol(p.token, supplyInfo.decimals)) ??
+              0;
           }
         } catch (err: any) {
           log.warn(

@@ -12,20 +12,23 @@ import { startTestDb, stopTestDb } from "./testDb.js";
 jest.mock("../services/jupiter.service.js", () => ({
   __esModule: true,
   getSolPriceUsd: jest.fn().mockResolvedValue(200),
+  getQuoteImpliedPriceSol: jest.fn().mockResolvedValue(0.002),
   SOL_MINT: "So11111111111111111111111111111111111111112",
   default: {
     getSolPriceUsd: jest.fn().mockResolvedValue(200),
   },
 }));
 
-// positions.route.ts prices open positions via Birdeye (Jupiter's role in
-// this codebase is strictly trading — quotes/execution — never fetching a
-// token's price for display), so that's what needs mocking here now.
-jest.mock("../services/birdeye.service.js", () => ({
+// positions.route.ts prices open positions via a small reference Jupiter
+// quote (Birdeye has been removed from this codebase entirely) — decimals
+// come from an on-chain mint-account lookup, so that needs mocking too.
+jest.mock("../services/tokenSafetyChecks.service.js", () => ({
   __esModule: true,
-  default: {
-    getCurrentPrice: jest.fn().mockResolvedValue(0.4),
-  },
+  getOnChainMintSupply: jest.fn().mockResolvedValue({
+    decimals: 9,
+    supply: 1_000_000_000,
+    available: true,
+  }),
 }));
 
 let app: import("express").Express;
@@ -78,8 +81,8 @@ describe("GET /api/positions", () => {
     );
     expect(pos).toBeDefined();
 
-    // Mocked current price: 0.4 USD / 200 USD-per-SOL = 0.002 SOL, double the
-    // 0.001 SOL avgBuyPrice, so this position should show as up ~100%.
+    // Mocked current price: 0.002 SOL (getQuoteImpliedPriceSol above), double
+    // the 0.001 SOL avgBuyPrice, so this position should show as up ~100%.
     expect(pos.currentPrice).toBeCloseTo(0.002, 9);
     expect(pos.unrealizedPnlPct).toBeCloseTo(1.0, 6);
     expect(pos.unrealizedPnlSol).toBeGreaterThan(0);

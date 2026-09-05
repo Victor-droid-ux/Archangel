@@ -1,5 +1,3 @@
-import axios from "axios";
-import { Server as SocketIOServer } from "socket.io";
 import { getLogger } from "../utils/logger.js";
 
 const log = getLogger("tokenPrice.service");
@@ -48,10 +46,10 @@ function pruneTrackedTokens() {
   if (trackedTokens.length <= MAX_TRACKED_TOKENS) return;
   // Keep SOL/USDC plus the most-recently-added tokens; drop the oldest.
   const pinned = trackedTokens.filter(
-    (t) => t.mint === SOL_MINT || t.mint === USDC_MINT
+    (t) => t.mint === SOL_MINT || t.mint === USDC_MINT,
   );
   const rest = trackedTokens.filter(
-    (t) => t.mint !== SOL_MINT && t.mint !== USDC_MINT
+    (t) => t.mint !== SOL_MINT && t.mint !== USDC_MINT,
   );
   const kept = rest.slice(-1 * (MAX_TRACKED_TOKENS - pinned.length));
   const keptMints = new Set([...pinned, ...kept].map((t) => t.mint));
@@ -62,7 +60,7 @@ function pruneTrackedTokens() {
   }
   log.info(
     { total: trackedTokens.length },
-    "Pruned tracked-token list back to the configured cap"
+    "Pruned tracked-token list back to the configured cap",
   );
 }
 
@@ -76,7 +74,7 @@ function pruneTrackedTokens() {
 export function addTrackedToken(
   mint: string,
   symbol = "",
-  data?: Partial<TokenInfo>
+  data?: Partial<TokenInfo>,
 ) {
   const existingIndex = trackedTokens.findIndex((t) => t.mint === mint);
   const discoveredAt = priceCache.get(mint)?.discoveredAt ?? Date.now();
@@ -84,7 +82,7 @@ export function addTrackedToken(
     trackedTokens.push({ mint, symbol, discoveredAt });
     log.info(
       { mint: mint.slice(0, 8), symbol, total: trackedTokens.length },
-      "✅ Token added to tracked list"
+      "✅ Token added to tracked list",
     );
     pruneTrackedTokens();
   }
@@ -108,94 +106,21 @@ export function addTrackedToken(
       data?.circulatingSupply ??
       priceCache.get(mint)?.circulatingSupply ??
       null,
-    totalSupply:
-      data?.totalSupply ?? priceCache.get(mint)?.totalSupply ?? null,
+    totalSupply: data?.totalSupply ?? priceCache.get(mint)?.totalSupply ?? null,
   };
   priceCache.set(mint, merged);
 
   log.debug(
     { total: trackedTokens.length, cacheSize: priceCache.size },
-    "Tracked token upserted"
+    "Tracked token upserted",
   );
 }
 
 export function getLatestTokens(): TokenInfo[] {
   // Newest-discovered first — see TokenInfo.discoveredAt.
   const tokens = Array.from(priceCache.values()).sort(
-    (a, b) => b.discoveredAt - a.discoveredAt
+    (a, b) => b.discoveredAt - a.discoveredAt,
   );
   log.debug({ count: tokens.length }, "Returning tracked tokens");
   return tokens;
-}
-
-async function fetchTokenDataBatch(mints: string[]) {
-  // Use Birdeye Price API as a fallback/refresh source for tokens that didn't
-  // arrive with real data already (see addTrackedToken)
-  try {
-    const mintsParam = mints.join(",");
-    const url = `https://public-api.birdeye.so/defi/multi_price?list_address=${mintsParam}`;
-    const { data } = await axios.get(url, {
-      timeout: 10000,
-      headers: {
-        "X-API-KEY": process.env.BIRDEYE_API_KEY || "",
-      },
-    });
-
-    const results: Partial<TokenInfo>[] = [];
-    for (const mint of mints) {
-      const priceData = data.data?.[mint];
-      if (priceData) {
-        results.push({
-          mint,
-          price: priceData.value ?? null,
-        });
-      }
-    }
-    return results;
-  } catch (err) {
-    log.warn({ err: String(err) }, "Failed to fetch token prices from Birdeye");
-    return [];
-  }
-}
-
-async function refresh(io?: SocketIOServer) {
-  try {
-    const chunkSize = 30;
-    const mints = trackedTokens.map((t) => t.mint);
-
-    for (let i = 0; i < mints.length; i += chunkSize) {
-      const chunk = mints.slice(i, i + chunkSize);
-      const results = await fetchTokenDataBatch(chunk);
-      // Insert-or-merge into the existing cache rather than replacing it
-      // wholesale — Birdeye frequently has no data yet for very fresh tokens,
-      // and a full replace would silently wipe out the real Jupiter-sourced
-      // data those tokens already have.
-      for (const partial of results) {
-        const existing = priceCache.get(partial.mint!);
-        const trackedMeta = trackedTokens.find((t) => t.mint === partial.mint);
-        priceCache.set(partial.mint!, {
-          mint: partial.mint!,
-          symbol: existing?.symbol ?? trackedMeta?.symbol ?? "???",
-          name: existing?.name ?? "Token",
-          decimals: existing?.decimals ?? 9,
-          discoveredAt:
-            existing?.discoveredAt ?? trackedMeta?.discoveredAt ?? Date.now(),
-          ...existing,
-          ...partial,
-        });
-      }
-    }
-
-    if (io) {
-      io.emit("token_prices", { tokens: getLatestTokens() });
-      log.info(`📡 Broadcasted ${priceCache.size} token prices`);
-    }
-  } catch (err: any) {
-    log.error({ err: err?.message || String(err) }, "Price refresh error");
-  }
-}
-
-export function startTokenPriceService(io: SocketIOServer) {
-  refresh(io).catch(console.error);
-  setInterval(() => refresh(io).catch(console.error), 10_000);
 }

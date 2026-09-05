@@ -1,5 +1,6 @@
 import { getLogger } from "../utils/logger.js";
-import birdeyeService, { BirdeyePnLData } from "./birdeye.service.js";
+import { getQuoteImpliedPriceSol } from "./jupiter.service.js";
+import { getOnChainMintSupply } from "./tokenSafetyChecks.service.js";
 import { Server as SocketIOServer } from "socket.io";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 
@@ -15,7 +16,12 @@ interface TrackedPosition {
 
 /**
  * STAGE 7: LIVE P&L TRACKING
- * Continuously track unrealized P&L via Birdeye
+ * Continuously track unrealized P&L via a small Jupiter reference quote —
+ * see getQuoteImpliedPriceSol's own doc comment for the exact tradeoff.
+ * This used to go through Birdeye, which has been removed from this
+ * codebase entirely; there's no price-impact/liquidity-movement/soft-rug
+ * enrichment left to attach here (that was Birdeye-specific data with no
+ * equivalent from a quote alone), so this reports price and PnL only.
  */
 class PnLTrackerService {
   // Keyed by "wallet:tokenMint", not tokenMint alone — different wallets
@@ -45,11 +51,11 @@ class PnLTrackerService {
   startTracking(position: TrackedPosition): void {
     LOG.info(
       { wallet: position.wallet },
-      `📊 Started tracking P&L for ${position.tokenMint.slice(0, 8)}`
+      `📊 Started tracking P&L for ${position.tokenMint.slice(0, 8)}`,
     );
     this.trackedPositions.set(
       this.key(position.wallet, position.tokenMint),
-      position
+      position,
     );
 
     // Start tracking loop if not already running
@@ -62,7 +68,10 @@ class PnLTrackerService {
    * Stop tracking a position
    */
   stopTracking(tokenMint: string, wallet: string): void {
-    LOG.info({ wallet }, `🛑 Stopped tracking P&L for ${tokenMint.slice(0, 8)}`);
+    LOG.info(
+      { wallet },
+      `🛑 Stopped tracking P&L for ${tokenMint.slice(0, 8)}`,
+    );
     this.trackedPositions.delete(this.key(wallet, tokenMint));
 
     // Stop tracking loop if no positions left
@@ -90,16 +99,29 @@ class PnLTrackerService {
       // uniqueness, not a usable mint address on its own.
       for (const position of this.trackedPositions.values()) {
         try {
-          const pnlData = await birdeyeService.getPnLData(
+          const supplyInfo = await getOnChainMintSupply(position.tokenMint);
+          if (!supplyInfo.available) {
+            LOG.debug(
+              `Decimals unavailable for ${position.tokenMint.slice(0, 8)} — skipping this tick`,
+            );
+            continue;
+          }
+          const currentPrice = await getQuoteImpliedPriceSol(
             position.tokenMint,
-            position.entryPrice
+            supplyInfo.decimals,
           );
+          if (!currentPrice) {
+            LOG.debug(
+              `No Jupiter route/price for ${position.tokenMint.slice(0, 8)} — skipping this tick`,
+            );
+            continue;
+          }
 
           // Broadcast to frontend via WebSocket
-          this.broadcastPnLUpdate(position.tokenMint, position, pnlData);
+          this.broadcastPnLUpdate(position.tokenMint, position, currentPrice);
         } catch (error: any) {
           LOG.error(
-            `Error tracking P&L for ${position.tokenMint.slice(0, 8)}: ${error.message}`
+            `Error tracking P&L for ${position.tokenMint.slice(0, 8)}: ${error.message}`,
           );
         }
       }
@@ -112,19 +134,18 @@ class PnLTrackerService {
   private broadcastPnLUpdate(
     tokenMint: string,
     position: TrackedPosition,
-    pnlData: BirdeyePnLData
+    currentPrice: number,
   ): void {
+    const percentChange =
+      ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
     const update = {
       tokenMint,
       wallet: position.wallet,
       entryPrice: position.entryPrice,
-      currentPrice: pnlData.currentPrice,
+      currentPrice,
       amount: position.amount,
-      unrealizedPnL: pnlData.unrealizedPnL * position.amount,
-      percentChange: pnlData.percentChange,
-      priceImpact: pnlData.priceImpact,
-      liquidityMovement: pnlData.liquidityMovement,
-      trendDirection: pnlData.trendDirection,
+      unrealizedPnL: (currentPrice - position.entryPrice) * position.amount,
+      percentChange,
       timestamp: Date.now(),
     };
 
@@ -133,12 +154,12 @@ class PnLTrackerService {
     emitToWalletOrGlobal(this.io, position.wallet, "pnl:update", update);
 
     // Log significant changes
-    if (Math.abs(pnlData.percentChange) > 10) {
+    if (Math.abs(percentChange) > 10) {
       LOG.info(
         `📈 Significant P&L change for ${tokenMint.slice(
           0,
-          8
-        )}: ${pnlData.percentChange.toFixed(2)}%`
+          8,
+        )}: ${percentChange.toFixed(2)}%`,
       );
     }
   }

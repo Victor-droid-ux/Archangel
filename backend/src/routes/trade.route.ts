@@ -8,12 +8,11 @@ import { getLogger } from "../utils/logger.js";
 import {
   getJupiterQuote,
   buildJupiterSwapPayload,
-  getSolPriceUsd,
+  getQuoteImpliedPriceSol,
 } from "../services/jupiter.service.js";
 import { Connection, VersionedTransaction } from "@solana/web3.js";
 import { validateTradeOpportunity } from "../services/tradeValidation.service.js";
 import { getTokenBalance } from "../services/solana.service.js";
-import birdeyeService from "../services/birdeye.service.js";
 import { getOnChainMintSupply } from "../services/tokenSafetyChecks.service.js";
 
 const logger = getLogger("trade.route");
@@ -220,18 +219,18 @@ router.post("/prepare", async (req, res) => {
     if (type === "buy") {
       let currentMarketCapSol = 0;
       try {
-        // Market cap computed from Birdeye's fair-value price × on-chain
-        // circulating supply — neither is a Jupiter call. Jupiter's role in
-        // this codebase is strictly trading (quotes/execution), never
-        // pricing or metadata lookups.
-        const [priceUsd, supplyInfo, solPriceUsd] = await Promise.all([
-          birdeyeService.getCurrentPrice(tokenMint),
-          getOnChainMintSupply(tokenMint),
-          getSolPriceUsd(),
-        ]);
-        const mcapUsd =
-          priceUsd && supplyInfo.available ? priceUsd * supplyInfo.supply : 0;
-        currentMarketCapSol = solPriceUsd > 0 ? mcapUsd / solPriceUsd : 0;
+        // Market cap computed from a small reference Jupiter quote × on-chain
+        // circulating supply — Birdeye has been removed from this codebase
+        // entirely. See getQuoteImpliedPriceSol's own doc comment for the
+        // tradeoff of using a quote as a fair-value price source.
+        const supplyInfo = await getOnChainMintSupply(tokenMint);
+        if (supplyInfo.available) {
+          const priceSol = await getQuoteImpliedPriceSol(
+            tokenMint,
+            supplyInfo.decimals,
+          );
+          currentMarketCapSol = priceSol ? priceSol * supplyInfo.supply : 0;
+        }
       } catch (err: any) {
         logger.warn(
           `Failed to fetch market cap for trigger check on ${tokenMint.slice(

@@ -175,6 +175,13 @@ export type TokenState = {
 
   // Jupiter tradability metrics
   jupiterTradable?: boolean;
+  // Set once, after this mint passes every Phase 4 ArchAngel filter (see
+  // candidatePipeline.service.ts) — exposed via GET /api/tokens/active
+  // (all recent candidates) and GET /api/tokens/approved-candidates (only
+  // this flag true) in tokens.route.ts. Left unset (falsy) for anything
+  // that never reached or never passed Phase 4 — callers compare with
+  // `=== true`, so undefined and false are equivalent here.
+  autoBuyEligible?: boolean;
   liquidityUSD?: number;
   liquiditySOL?: number;
   launchLiquidityUSD?: number;
@@ -190,11 +197,6 @@ export type TokenState = {
   creatorHoldings?: number;
   top3WalletsCombined?: number;
   lpRemoved?: boolean;
-
-  // Phase 4 result. Jupiter tradability alone is not sufficient to present a
-  // candidate as eligible for automatic buying.
-  autoBuyEligible?: boolean;
-  autoBuyEligibleAt?: Date;
 
   // Timestamps
   detectedAt: Date;

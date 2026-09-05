@@ -11,8 +11,8 @@
 // with a real mark-to-market using each open position's live Jupiter price,
 // the same calculation positions.route.ts already does per-position.
 import dbService from "./db.service.js";
-import { getSolPriceUsd } from "./jupiter.service.js";
-import birdeyeService from "./birdeye.service.js";
+import { getQuoteImpliedPriceSol } from "./jupiter.service.js";
+import { getOnChainMintSupply } from "./tokenSafetyChecks.service.js";
 import depositTrackerService from "./depositTracker.service.js";
 import { getLogger } from "../utils/logger.js";
 
@@ -33,19 +33,17 @@ export interface PortfolioValuation {
 export async function getPortfolioValuation(
   wallet: string,
 ): Promise<PortfolioValuation> {
-  const [pnl, positions, totalDepositedSol, solPriceUsd] = await Promise.all([
+  const [pnl, positions, totalDepositedSol] = await Promise.all([
     dbService.getPortfolioPnL(wallet),
     dbService.getPositions(wallet),
     depositTrackerService.getTotalDepositedSol(wallet),
-    getSolPriceUsd(),
   ]);
 
-  // Fair-value price per open position, same source and reasoning as
-  // monitor.service.ts's mark-to-market: Birdeye's price feed, not a Jupiter
-  // quote/catalog lookup — Jupiter's role in this codebase is strictly
-  // trading (routing checks, quotes, execution), not pricing a position for
-  // display. One call per distinct mint, deduped across positions/wallets
-  // sharing the same token, run in parallel.
+  // Fair-value price per open position — a small reference Jupiter quote
+  // (see getQuoteImpliedPriceSol's own doc comment for the tradeoff), the
+  // only price source left in this codebase now that Birdeye has been
+  // removed entirely. One call per distinct mint, deduped across
+  // positions/wallets sharing the same token, run in parallel.
   const distinctMints = Array.from(
     new Set(
       positions
@@ -54,20 +52,22 @@ export async function getPortfolioValuation(
     ),
   );
   const priceEntries = await Promise.all(
-    distinctMints.map(
-      async (mint) =>
-        [mint, await birdeyeService.getCurrentPrice(mint)] as const,
-    ),
+    distinctMints.map(async (mint) => {
+      const supplyInfo = await getOnChainMintSupply(mint);
+      const price = supplyInfo.available
+        ? await getQuoteImpliedPriceSol(mint, supplyInfo.decimals)
+        : null;
+      return [mint, price] as const;
+    }),
   );
-  const priceUsdByMint = new Map(priceEntries);
+  const priceSolByMint = new Map(priceEntries);
 
   let unrealizedPnlSol = 0;
   for (const pos of positions) {
     if (!pos.avgBuyPrice || pos.netSol <= 0) continue;
     try {
-      const priceUsd = priceUsdByMint.get(pos.token);
-      if (priceUsd && solPriceUsd > 0) {
-        const currentPrice = priceUsd / solPriceUsd;
+      const currentPrice = priceSolByMint.get(pos.token);
+      if (currentPrice) {
         unrealizedPnlSol +=
           (currentPrice - pos.avgBuyPrice) * (pos.netSol / pos.avgBuyPrice);
       }
