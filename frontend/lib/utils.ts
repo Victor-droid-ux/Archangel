@@ -46,8 +46,11 @@ export const fetcher = async <T = any>(
   }
 
   if (!res.ok || json?.success === false) {
+    // Backend routes aren't consistent about the error key (some use
+    // `message`, others `error`) — check both before falling back.
     throw new Error(
       json?.message ||
+        json?.error ||
         `❌ Request failure: HTTP ${res.status} — ${res.statusText}`
     );
   }
