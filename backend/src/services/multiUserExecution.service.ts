@@ -197,6 +197,15 @@ export interface FanOutResult {
   result: PipelineResult;
 }
 
+// Defaults to the existing Jupiter pipeline — see runPipelineForAllEligibleWallets's
+// new third parameter below. Kept as a named type so executionRouter.service.ts's
+// native call site has something concrete to match against.
+type PipelineRunner = (
+  tokenMint: string,
+  lpSol: number,
+  walletContext: WalletContext,
+) => Promise<PipelineResult>;
+
 /**
  * Runs the full validation+execution pipeline for a single token, once per
  * eligible wallet, sequentially. Sequential (not parallel) is deliberate: it
@@ -204,10 +213,21 @@ export interface FanOutResult {
  * bursts by however many users are active, and one wallet's slow/failed run
  * never risks stepping on another's in-flight buy. A failure or rejection
  * for one wallet never stops the rest — each is independent.
+ *
+ * `runPipelineFn` defaults to the Jupiter pipeline (validationPipelineService.runPipeline)
+ * — unchanged behavior for every existing caller. executionRouter.service.ts's
+ * native path passes a closure over validationPipelineService.runNativePipeline
+ * instead, so eligibility checks (auto-trade enabled, market-cap window,
+ * launch-age window), the per-wallet mutex, and position-metadata recording
+ * below are shared verbatim between both execution methods rather than
+ * duplicated — the only thing that actually differs per method is what
+ * happens inside runPipelineFn itself.
  */
 export async function runPipelineForAllEligibleWallets(
   tokenMint: string,
   lpSol: number,
+  runPipelineFn: PipelineRunner = (mint, sol, ctx) =>
+    validationPipelineService.runPipeline(mint, sol, ctx),
 ): Promise<FanOutResult[]> {
   const wallets = await getEligibleWallets();
   const results: FanOutResult[] = [];
@@ -272,7 +292,7 @@ export async function runPipelineForAllEligibleWallets(
       // second one read the same stale balance concurrently. This one waits
       // its turn and sizes against whatever's actually left afterward.
       const result = await withWalletLock(walletContext.ownerWallet, () =>
-        validationPipelineService.runPipeline(tokenMint, lpSol, walletContext),
+        runPipelineFn(tokenMint, lpSol, walletContext),
       );
       if (result.success && result.executionResult) {
         await dbService.updatePositionMetadata(

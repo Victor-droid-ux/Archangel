@@ -94,6 +94,26 @@ declare global {
       JUPITER_AUTO_BUY?: string;
       JUPITER_AUTO_BUY_SOL?: string;
       MIN_JUPITER_LIQUIDITY_SOL?: string;
+
+      // Execution router (services/execution/executionRouter.service.ts).
+      // Defaults to disabled — see that file's header comment. Until a
+      // native executor is registered in NATIVE_EXECUTOR_REGISTRY, setting
+      // this to "true" has no effect: every candidate still routes to
+      // Jupiter.
+      RAYDIUM_NATIVE_EXECUTION_ENABLED?: string;
+      // Per-executor readiness flags — see registerNativeExecutors.ts.
+      // Both this AND RAYDIUM_NATIVE_EXECUTION_ENABLED must be "true" for
+      // the CPMM executor to ever run for a real candidate.
+      RAYDIUM_CPMM_EXECUTOR_ENABLED?: string;
+      RAYDIUM_CPMM_SLIPPAGE_PCT?: string;
+      RAYDIUM_CPMM_COMPUTE_UNIT_LIMIT?: string;
+      RAYDIUM_CPMM_PRIORITY_FEE_MICROLAMPORTS?: string;
+      // MEV/Jito routing (docs/mev-jito-routing-spec.md) — see
+      // services/execution/transaction/jitoSender.ts. Defaults to "rpc"
+      // (today's existing send path, unchanged).
+      RAYDIUM_SEND_STRATEGY?: string;
+      RAYDIUM_JITO_TIP_LAMPORTS?: string;
+      JITO_BLOCK_ENGINE_URL?: string;
     }
   }
 }

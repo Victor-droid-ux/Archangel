@@ -29,7 +29,7 @@ import {
   applyArchAngelFilters,
   ArchAngelFilterConfig,
 } from "./tokenFiltering.service.js";
-import multiUserExecutionService from "./multiUserExecution.service.js";
+import executionRouterService from "./execution/executionRouter.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 import {
@@ -138,6 +138,7 @@ export async function processCandidateMint(
     source: "quicknode",
     poolCreatedAt: candidate.poolCreatedAt,
     poolAddress: candidate.poolAddress,
+    dex: candidate.dex,
     detectedAt: new Date(),
   });
   io?.emit("candidate:detected", {
@@ -159,6 +160,7 @@ export async function processCandidateMint(
     liquidityUSD: tradeability.liquidityUsd,
     poolCreatedAt: candidate.poolCreatedAt,
     poolAddress: candidate.poolAddress,
+    dex: candidate.dex,
     detectedAt: new Date(),
     ...(tradeability.tradeable ? { confirmedTradableAt: new Date() } : {}),
   });
@@ -259,13 +261,25 @@ export async function processCandidateMint(
     { mint: mint.slice(0, 8) },
     "🚀 Phase 5/6 — quoting and buying across eligible wallets",
   );
+  // Routed through executionRouter.service.ts rather than calling
+  // multiUserExecutionService directly — the router is what decides
+  // per-candidate whether this goes through a Raydium-native executor
+  // (feature-flagged, defaults off) or the existing Jupiter path. With no
+  // native executors registered yet, this is behaviorally identical to the
+  // direct call it replaces.
   let fanOutResults;
   try {
-    fanOutResults =
-      await multiUserExecutionService.runPipelineForAllEligibleWallets(
-        mint,
-        tradeability.liquiditySol,
+    const routed = await executionRouterService.routeExecution(
+      candidate,
+      tradeability.liquiditySol,
+    );
+    fanOutResults = routed.fanOutResults;
+    if (routed.route === "jupiter" && routed.nativeFallbackReason) {
+      LOG.info(
+        { mint: mint.slice(0, 8), reason: routed.nativeFallbackReason },
+        "Fell back to Jupiter after a native execution attempt",
       );
+    }
   } catch (err) {
     await releaseMint(mint);
     throw err;

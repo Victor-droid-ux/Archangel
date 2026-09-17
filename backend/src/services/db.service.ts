@@ -56,7 +56,7 @@ export type TradeRecord = {
   simulated?: boolean;
   signature?: string | null;
   timestamp: Date;
-  route?: "jupiter";
+  route?: "jupiter" | "raydium-cpmm" | "raydium-amm-v4" | "raydium-clmm";
   // Which wallet actually holds/signs for these tokens on-chain — "self"
   // means the connected wallet itself (a manual buy/sell, signed directly by
   // the user's own Phantom/Solflare), "custodial" means the server-managed
@@ -189,6 +189,12 @@ export type TokenState = {
   poolCreatedAt?: Date;
   launchSnapshotAt?: Date;
   poolAddress?: string;
+  // The DEX string as reported by discovery (e.g. "raydium-cpmm") — see
+  // tokenExtraction.service.ts's CandidateMint. Persisted so anything that
+  // needs it after discovery (the sell-side execution router, in
+  // particular — it has to know a position's pool type to decide native-
+  // vs-Jupiter eligibility) doesn't need to re-derive or guess it later.
+  dex?: string;
   creatorAddress?: string; // token dev/creator wallet, used by emergencyExit's creator-sell trigger
 
   // Security checks
@@ -284,7 +290,24 @@ export type DiscoveryClaim = {
   completedAt?: Date;
 };
 
+// Mirrors DiscoveryClaim's shape exactly, but keyed by (token, wallet) —
+// a position, unlike a discovery candidate, belongs to one specific wallet.
+// Exists so two overlapping monitor.service.ts ticks (or two process
+// instances) can never both decide to sell the same wallet's position at
+// once — see positionExitCoordinator.service.ts, which wraps this the same
+// way discoveryCoordinator.service.ts wraps DiscoveryClaim.
+export type PositionExitClaim = {
+  token: string;
+  wallet: string;
+  ownerId: string;
+  status: "claimed" | "completed";
+  claimedAt: Date;
+  leaseUntil: Date;
+  completedAt?: Date;
+};
+
 let discoveryClaimsCol: Collection<DiscoveryClaim> | null = null;
+let positionExitClaimsCol: Collection<PositionExitClaim> | null = null;
 let client: MongoClient | null = null;
 let db: Db | null = null;
 let tradesCol: Collection<TradeRecord> | null = null;
@@ -307,6 +330,8 @@ export async function connect() {
   tokenStateCol = db.collection<TokenState>("tokenStates");
   userSettingsCol = db.collection<UserSettings>("userSettings");
   discoveryClaimsCol = db.collection<DiscoveryClaim>("discoveryClaims");
+  positionExitClaimsCol =
+    db.collection<PositionExitClaim>("positionExitClaims");
   // New collection for old token analytics (optional, or store in tokenStates)
   // const oldTokenStateCol = db.collection<OldTokenState>("oldTokenStates");
   await tradesCol.createIndex({ timestamp: -1 });
@@ -341,6 +366,14 @@ export async function connect() {
   await userSettingsCol.createIndex({ wallet: 1 }, { unique: true });
   await discoveryClaimsCol.createIndex({ mint: 1 }, { unique: true });
   await discoveryClaimsCol.createIndex(
+    { completedAt: 1 },
+    { expireAfterSeconds: 24 * 60 * 60 },
+  );
+  await positionExitClaimsCol.createIndex(
+    { token: 1, wallet: 1 },
+    { unique: true },
+  );
+  await positionExitClaimsCol.createIndex(
     { completedAt: 1 },
     { expireAfterSeconds: 24 * 60 * 60 },
   );
@@ -529,6 +562,105 @@ export async function releaseDiscoveryMint(
   if (!db) await connect();
   const result = await discoveryClaimsCol!.deleteOne({
     mint,
+    ownerId,
+    status: "claimed",
+  });
+  return result.deletedCount === 1;
+}
+
+// The four functions below are PositionExitClaim's exact counterpart to the
+// four DiscoveryClaim functions above — same lease-based
+// findOneAndUpdate-then-insert claim, same completed-doc reclaim window,
+// same TTL cleanup. Key difference: keyed by (token, wallet) instead of
+// mint alone, since a sell decision belongs to one wallet's position, not
+// to the token globally — two different wallets holding the same mint must
+// be able to sell independently and concurrently.
+export async function claimPositionExit(
+  token: string,
+  wallet: string,
+  ownerId: string,
+  leaseMs = 2 * 60 * 1000,
+): Promise<boolean> {
+  if (!db) await connect();
+  const now = new Date();
+  const reclaimBefore = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const leaseUntil = new Date(now.getTime() + leaseMs);
+
+  const claimed = await positionExitClaimsCol!.findOneAndUpdate(
+    {
+      token,
+      wallet,
+      $or: [
+        { status: "claimed", leaseUntil: { $lte: now } },
+        { status: "completed", completedAt: { $lte: reclaimBefore } },
+      ],
+    },
+    {
+      $set: { ownerId, status: "claimed", claimedAt: now, leaseUntil },
+      $unset: { completedAt: "" },
+    },
+    { returnDocument: "after" },
+  );
+  if (claimed?.ownerId === ownerId) return true;
+
+  try {
+    const inserted = await positionExitClaimsCol!.insertOne({
+      token,
+      wallet,
+      ownerId,
+      status: "claimed",
+      claimedAt: now,
+      leaseUntil,
+    });
+    return inserted.acknowledged;
+  } catch (err: any) {
+    if (err?.code === 11000) return false;
+    throw err;
+  }
+}
+
+export async function completePositionExit(
+  token: string,
+  wallet: string,
+  ownerId: string,
+): Promise<boolean> {
+  if (!db) await connect();
+  const result = await positionExitClaimsCol!.updateOne(
+    { token, wallet, ownerId, status: "claimed" },
+    {
+      $set: {
+        status: "completed",
+        completedAt: new Date(),
+        leaseUntil: new Date(),
+      },
+    },
+  );
+  return result.modifiedCount === 1;
+}
+
+export async function renewPositionExit(
+  token: string,
+  wallet: string,
+  ownerId: string,
+  leaseMs = 2 * 60 * 1000,
+): Promise<boolean> {
+  if (!db) await connect();
+  const result = await positionExitClaimsCol!.updateOne(
+    { token, wallet, ownerId, status: "claimed" },
+    { $set: { leaseUntil: new Date(Date.now() + leaseMs) } },
+  );
+  return result.modifiedCount === 1;
+}
+
+export async function releasePositionExit(
+  token: string,
+  wallet: string,
+  ownerId: string,
+): Promise<boolean> {
+  if (!db) await connect();
+  const result = await positionExitClaimsCol!.deleteOne({
+    token,
+    wallet,
     ownerId,
     status: "claimed",
   });
@@ -1331,6 +1463,10 @@ export default {
   completeDiscoveryMint,
   renewDiscoveryMint,
   releaseDiscoveryMint,
+  claimPositionExit,
+  completePositionExit,
+  renewPositionExit,
+  releasePositionExit,
   getTokensByState,
   getTokensByStates,
   updateTokenState,

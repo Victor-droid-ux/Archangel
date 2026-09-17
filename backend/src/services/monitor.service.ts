@@ -1,9 +1,6 @@
 // backend/src/services/monitor.service.ts
-import {
-  getJupiterQuote,
-  executeJupiterSwap,
-  getQuoteImpliedPriceSol,
-} from "./jupiter.service.js";
+import { getJupiterQuote, getQuoteImpliedPriceSol } from "./jupiter.service.js";
+import sellExecutionRouterService from "./execution/sellExecutionRouter.service.js";
 import dbService, { Position } from "./db.service.js";
 import { getLogger } from "../utils/logger.js";
 import notify from "./notifications/notify.service.js";
@@ -462,33 +459,35 @@ export function startPositionMonitor(
             const emergencySigner = await resolveSignerForPosition(pos.wallet);
 
             if (useRealSwap && emergencySigner) {
-              // addTrade's `amount` field is SOL lamports, not the token amount
-              // being sold — fetch a real quote to know actual SOL proceeds
-              // rather than recording the raw token unit count (which silently
-              // corrupts tradeVolumeSol/pnlSol by orders of magnitude).
-              const emergencyQuote = await getJupiterQuote(
+              // solLamportsOut below replaces the old separate Jupiter-quote
+              // call for recording actual SOL proceeds — the router
+              // computes/passes it through regardless of which path
+              // (native or Jupiter) actually executed.
+              const emergencySwap = await sellExecutionRouterService.routeSell({
                 tokenMint,
-                SOL_MINT,
-                fullAmountBase,
-                1000,
-              );
-              const emergencySwap = await executeJupiterSwap({
-                inputMint: tokenMint,
-                outputMint: SOL_MINT,
-                amount: fullAmountBase,
-                userPublicKey: emergencySigner.publicKey.toBase58(),
+                wallet: pos.wallet,
+                amountBaseUnits: fullAmountBase,
                 slippageBps: 1000, // High slippage for emergency
                 signer: emergencySigner,
+                useRealSwap: true,
               });
 
-              if (emergencySwap.success) {
+              if (emergencySwap.route === "skipped") {
+                // Another tick/process already has this position's exit
+                // claimed — not a real failure, don't count it toward
+                // recordSellFailure's backoff escalation.
+                log.debug(
+                  { tokenMint, wallet: pos.wallet },
+                  "Emergency exit sell already in flight — skipping this tick",
+                );
+              } else if (emergencySwap.success) {
                 const emergencyTrade = {
                   id: crypto.randomUUID(),
                   type: "sell" as const,
                   token: tokenMint,
                   inputMint: tokenMint,
                   outputMint: SOL_MINT,
-                  amount: Number(emergencyQuote?.outAmount ?? 0),
+                  amount: emergencySwap.solLamportsOut,
                   price: currentPrice,
                   pnl: pnlPercent,
                   wallet: pos.wallet,
@@ -618,32 +617,31 @@ export function startPositionMonitor(
 
               if (tieredSigner) {
                 // See emergency-exit block above: addTrade's `amount` is SOL
-                // lamports, so record the quoted SOL proceeds, not the token
-                // amount sold.
-                const tieredQuote = await getJupiterQuote(
+                // lamports; the router returns quoted/actual SOL proceeds
+                // regardless of which path (native or Jupiter) executed.
+                const tieredSwap = await sellExecutionRouterService.routeSell({
                   tokenMint,
-                  SOL_MINT,
-                  sellAmountBase,
-                  Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
-                );
-                const tieredSwap = await executeJupiterSwap({
-                  inputMint: tokenMint,
-                  outputMint: SOL_MINT,
-                  amount: sellAmountBase,
-                  userPublicKey: tieredSigner.publicKey.toBase58(),
+                  wallet: pos.wallet,
+                  amountBaseUnits: sellAmountBase,
                   slippageBps:
                     Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
                   signer: tieredSigner,
+                  useRealSwap: true,
                 });
 
-                if (tieredSwap.success) {
+                if (tieredSwap.route === "skipped") {
+                  log.debug(
+                    { tokenMint, wallet: pos.wallet },
+                    "Tiered profit sell already in flight — skipping this tick",
+                  );
+                } else if (tieredSwap.success) {
                   const tieredTrade = {
                     id: crypto.randomUUID(),
                     type: "sell" as const,
                     token: tokenMint,
                     inputMint: tokenMint,
                     outputMint: SOL_MINT,
-                    amount: Number(tieredQuote?.outAmount ?? 0),
+                    amount: tieredSwap.solLamportsOut,
                     price: currentPrice,
                     pnl: pnlPercent,
                     wallet: pos.wallet,
@@ -772,6 +770,8 @@ export function startPositionMonitor(
 
             let finalSellSolAmount = 0;
 
+            let sellSkipped = false;
+
             if (useRealSwap) {
               const finalSigner = await resolveSignerForPosition(pos.wallet);
 
@@ -794,24 +794,35 @@ export function startPositionMonitor(
                   },
                   "Executing final auto-sell",
                 );
-                // addTrade's `amount` is SOL lamports, so record the quoted SOL
-                // proceeds below, not the token amount sold (sellAmountBase).
-                const finalQuote = await getJupiterQuote(
+                const routed = await sellExecutionRouterService.routeSell({
                   tokenMint,
-                  SOL_MINT,
-                  sellAmountBase,
-                  Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
-                );
-                finalSellSolAmount = Number(finalQuote?.outAmount ?? 0);
-                swapRes = await executeJupiterSwap({
-                  inputMint: tokenMint,
-                  outputMint: SOL_MINT,
-                  amount: sellAmountBase,
-                  userPublicKey: finalSigner.publicKey.toBase58(),
+                  wallet: pos.wallet,
+                  amountBaseUnits: sellAmountBase,
                   slippageBps:
                     Number(process.env.DEFAULT_SLIPPAGE_PCT ?? 1) * 100,
                   signer: finalSigner,
+                  useRealSwap: true,
                 });
+                if (routed.route === "skipped") {
+                  sellSkipped = true;
+                  swapRes = {
+                    success: false,
+                    ...(routed.error ? { error: routed.error } : {}),
+                  };
+                } else {
+                  finalSellSolAmount = routed.solLamportsOut;
+                  swapRes = routed.success
+                    ? {
+                        success: true,
+                        ...(routed.signature
+                          ? { signature: routed.signature }
+                          : {}),
+                      }
+                    : {
+                        success: false,
+                        ...(routed.error ? { error: routed.error } : {}),
+                      };
+                }
               }
             } else {
               const simQuote = await getJupiterQuote(
@@ -825,6 +836,14 @@ export function startPositionMonitor(
                 success: true,
                 signature: `sim-sell-${Date.now()}`,
               };
+            }
+
+            if (sellSkipped) {
+              log.debug(
+                { tokenMint, wallet: pos.wallet },
+                "Final auto-sell already in flight — skipping this tick",
+              );
+              continue;
             }
 
             if (!swapRes.success) {

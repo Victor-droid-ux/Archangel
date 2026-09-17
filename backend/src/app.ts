@@ -26,6 +26,7 @@ import oldTokensRoute from "./routes/oldTokens.route.js";
 import socialRoute from "./routes/social.route.js";
 import userWalletRoute from "./routes/userWallet.route.js";
 import quicknodeRoute from "./routes/quicknode.route.js";
+import solamiRoute from "./routes/solami.route.js";
 
 import dbService from "./services/db.service.js";
 import { ENV } from "./utils/env.js";
@@ -108,5 +109,6 @@ export const createApp = () => {
   // Phase 1 of the candidate pipeline — mounted at the root (not under
   // /api) since it's an external QuickNode callback, not a frontend API call.
   app.use("/", quicknodeRoute);
+  app.use("/", solamiRoute);
   return app;
 };

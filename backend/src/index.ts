@@ -18,6 +18,7 @@ import { getLogger } from "./utils/logger.js";
 const log = getLogger("index");
 import { ENV } from "./utils/env.js";
 import candidatePipelineService from "./services/candidatePipeline.service.js";
+import { registerNativeExecutors } from "./services/execution/registerNativeExecutors.js";
 
 // pino-pretty runs its transport in a worker thread in dev; log.error()
 // immediately followed by process.exit() can race ahead of that flush and the
@@ -100,6 +101,7 @@ process.on("uncaughtException", (err: Error) => {
   // give it the socket server so it can emit progress events.
   candidatePipelineService.setSocketIO(io);
   log.info("🎣 QuickNode candidate pipeline ready (webhook-driven)");
+  registerNativeExecutors();
   server.listen(ENV.PORT, () => {
     log.info(`⚡ Backend online → http://localhost:${ENV.PORT}`);
   });

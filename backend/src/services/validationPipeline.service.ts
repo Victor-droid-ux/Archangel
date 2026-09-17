@@ -125,66 +125,32 @@ class ValidationPipelineService {
     );
 
     const results: ValidationResult[] = [];
-    const wallet = walletContext.publicKey;
 
-    // Stage 0: POSITION SIZING + RISK MANAGEMENT CHECK
-    // Size the trade as a percentage of live wallet balance (AUTO_TRADE_PERCENT_OF_BALANCE,
-    // 2% default) rather than a fixed SOL amount — a fixed amount either sits below the
-    // risk cap's true minimum-balance requirement (rejected forever on a modest wallet) or,
-    // on a larger wallet, wastes the chance to size up. Every eligible wallet's buy for a
-    // candidate mint funnels through this one runPipeline(), so this is the single place
-    // that guarantees sizing + MAX_OPEN_POSITIONS/MAX_DAILY_LOSS_PCT apply to every real
-    // buy the pipeline executes.
-    const walletBalance = await getBalanceInSol(wallet);
-    const riskPct = ENV.AUTO_TRADE_PERCENT_OF_BALANCE;
-    const config = await getEffectiveConfig(
-      walletContext.ownerWallet,
+    // Stage 0 is execution-method-agnostic (balance/risk sizing doesn't care
+    // whether the buy that follows goes through Jupiter or a native
+    // executor) — see sizePositionAndCheckRisk, shared with
+    // runNativePipeline below rather than duplicated.
+    const stage0 = await this.sizePositionAndCheckRisk(
       tokenMint,
+      walletContext,
     );
-    const buySol = Math.min(walletBalance * riskPct, config.maxTradeAmountSol);
-
-    if (buySol < this.MIN_TRADE_SOL) {
-      const neededBalance = this.MIN_TRADE_SOL / riskPct;
-      const reason =
-        `Wallet balance too low for a meaningful trade size ` +
-        `(${walletBalance.toFixed(4)} SOL × ${(riskPct * 100).toFixed(0)}% = ` +
-        `${buySol.toFixed(4)} SOL, below the ${this.MIN_TRADE_SOL} SOL minimum — ` +
-        `needs ~${neededBalance.toFixed(2)} SOL total to clear it)`;
-      const stage0: ValidationResult = {
-        passed: false,
-        stage: 0,
-        stageName: "Position Sizing",
-        reason,
-        details: { walletBalance, riskPct, buySol },
-      };
-      results.push(stage0);
-      await this.logFailure(tokenMint, 0, "Position Sizing", reason);
-      return this.buildFailureResult(0, "Position Sizing", reason, results);
-    }
-
-    const riskCheck = await canExecuteTrade(buySol, wallet);
-    if (!riskCheck.allowed) {
-      const stage0: ValidationResult = {
-        passed: false,
-        stage: 0,
-        stageName: "Risk Management",
-        reason: riskCheck.reason || "Risk limit exceeded",
-        details: riskCheck.currentRisk,
-      };
-      results.push(stage0);
+    if (!stage0.passed) {
+      results.push(stage0.result);
       await this.logFailure(
         tokenMint,
         0,
-        "Risk Management",
-        stage0.reason || "Unknown",
+        stage0.result.stageName,
+        stage0.result.reason || "Unknown",
       );
       return this.buildFailureResult(
         0,
-        "Risk Management",
-        stage0.reason,
+        stage0.result.stageName,
+        stage0.result.reason,
         results,
       );
     }
+    const buySol = stage0.buySol;
+    const wallet = walletContext.publicKey;
 
     // Stage 1 (Phase 5 — Jupiter quote): fresh, per-wallet-sized quote +
     // affordability check right before committing capital.
@@ -238,6 +204,237 @@ class ValidationPipelineService {
       results,
       executionResult: stage2.details?.executionResult,
     };
+  }
+
+  /**
+   * Native-execution counterpart to runPipeline() — same Stage 0 sizing
+   * and risk gating (reused, not duplicated), but the actual buy is
+   * delegated to `executeNative` instead of Jupiter. That indirection is
+   * deliberate: this file has no business importing a specific DEX
+   * executor (cpmm.ts, or a future ammV4.ts/clmm.ts) — the caller
+   * (executionRouter.service.ts, which already knows which executor and
+   * candidate it's routing to) supplies the actual buy as a callback.
+   *
+   * There is no per-wallet "pre-execution quote check" analogous to
+   * Jupiter's Stage 1 here — the native executor's own pool verification
+   * (poolVerification.service.ts, re-checked inside buy() regardless of
+   * whether the router already did it) and on-chain minimumAmountOut
+   * guard already are that check, just structured differently than a
+   * quote-then-execute split. Folding them into a separate synthetic
+   * "Stage 1" here would be re-implementing logic that already lives
+   * correctly in cpmm.ts, not adding a new safety layer.
+   */
+  async runNativePipeline(
+    tokenMint: string,
+    walletContext: WalletContext,
+    executeNative: (
+      buySol: number,
+      ctx: { ownerWallet: string; keypair: Keypair },
+    ) => Promise<{
+      success: boolean;
+      signature?: string;
+      tokensReceived?: number;
+      reason?: string;
+    }>,
+    routeLabel: "raydium-cpmm" | "raydium-amm-v4" | "raydium-clmm",
+  ): Promise<PipelineResult> {
+    LOG.info(
+      { wallet: walletContext.ownerWallet, route: routeLabel },
+      `🚀 Starting native per-wallet execution for ${tokenMint.slice(0, 8)}...`,
+    );
+
+    const results: ValidationResult[] = [];
+
+    const stage0 = await this.sizePositionAndCheckRisk(
+      tokenMint,
+      walletContext,
+    );
+    if (!stage0.passed) {
+      results.push(stage0.result);
+      await this.logFailure(
+        tokenMint,
+        0,
+        stage0.result.stageName,
+        stage0.result.reason || "Unknown",
+      );
+      return this.buildFailureResult(
+        0,
+        stage0.result.stageName,
+        stage0.result.reason,
+        results,
+      );
+    }
+    const buySol = stage0.buySol;
+
+    try {
+      const nativeResult = await executeNative(buySol, {
+        ownerWallet: walletContext.ownerWallet,
+        keypair: walletContext.keypair,
+      });
+
+      if (!nativeResult.success) {
+        const stage1: ValidationResult = {
+          passed: false,
+          stage: 1,
+          stageName: `${routeLabel} Buy Execution`,
+          reason: nativeResult.reason || "Native execution failed",
+        };
+        results.push(stage1);
+        await this.logFailure(
+          tokenMint,
+          1,
+          stage1.stageName,
+          stage1.reason || "Unknown",
+        );
+        return this.buildFailureResult(
+          1,
+          stage1.stageName,
+          stage1.reason,
+          results,
+        );
+      }
+
+      // Same decimals-lookup approach as Jupiter's Stage 2, and the same
+      // reason: nativeResult.tokensReceived is in raw base units (see
+      // cpmm.ts's buy(), which mirrors Jupiter's outAmount convention
+      // exactly for this reason), and a wrong decimals guess here
+      // corrupts cost basis the same way it would for a Jupiter trade.
+      let decimals: number | null = null;
+      try {
+        const info = await getConnection().getParsedAccountInfo(
+          new PublicKey(tokenMint),
+        );
+        const d = (info.value?.data as any)?.parsed?.info?.decimals;
+        if (typeof d === "number" && Number.isFinite(d)) decimals = d;
+      } catch {
+        // handled below
+      }
+      if (decimals === null) {
+        LOG.error(
+          { tokenMint },
+          "Could not determine real token decimals — recording cost basis with an assumed value of 9, verify this trade manually",
+        );
+        decimals = 9;
+      }
+      const tokensReceived =
+        (nativeResult.tokensReceived ?? 0) / 10 ** decimals;
+      const actualPrice = tokensReceived > 0 ? buySol / tokensReceived : 0;
+
+      const executionResult: ExecutionResult = {
+        success: true,
+        signature: nativeResult.signature ?? "",
+        tokensReceived,
+        actualPrice,
+        amountSol: buySol,
+      };
+
+      const useReal = process.env.USE_REAL_SWAP === "true";
+      await dbService.addTrade({
+        type: "buy",
+        token: tokenMint,
+        inputMint: SOL_MINT,
+        outputMint: tokenMint,
+        amount: Math.floor(buySol * 1e9),
+        price: actualPrice,
+        pnl: 0,
+        wallet: walletContext.ownerWallet,
+        simulated: !useReal,
+        signature: nativeResult.signature || "",
+        route: routeLabel,
+        custody: "custodial",
+      });
+
+      LOG.info(
+        `✅ Native execution PASSED for ${tokenMint.slice(0, 8)} (${nativeResult.signature})`,
+      );
+      results.push({
+        passed: true,
+        stage: 1,
+        stageName: `${routeLabel} Buy Execution`,
+        details: { executionResult },
+      });
+      return { success: true, results, executionResult };
+    } catch (error: any) {
+      LOG.error(`❌ Native execution error: ${error.message}`);
+      const reason = `Error: ${error.message}`;
+      results.push({
+        passed: false,
+        stage: 1,
+        stageName: `${routeLabel} Buy Execution`,
+        reason,
+      });
+      return this.buildFailureResult(
+        1,
+        `${routeLabel} Buy Execution`,
+        reason,
+        results,
+      );
+    }
+  }
+
+  /**
+   * Stage 0 — POSITION SIZING + RISK MANAGEMENT CHECK, shared by
+   * runPipeline() (Jupiter) and runNativePipeline(). Size the trade as a
+   * percentage of live wallet balance (AUTO_TRADE_PERCENT_OF_BALANCE, 2%
+   * default) rather than a fixed SOL amount — a fixed amount either sits
+   * below the risk cap's true minimum-balance requirement (rejected
+   * forever on a modest wallet) or, on a larger wallet, wastes the chance
+   * to size up. Every eligible wallet's buy for a candidate mint funnels
+   * through one of these two pipeline entry points, so this is the single
+   * place that guarantees sizing + MAX_OPEN_POSITIONS/MAX_DAILY_LOSS_PCT
+   * apply to every real buy either pipeline executes, regardless of
+   * execution method.
+   */
+  private async sizePositionAndCheckRisk(
+    tokenMint: string,
+    walletContext: WalletContext,
+  ): Promise<
+    | { passed: true; buySol: number }
+    | { passed: false; result: ValidationResult }
+  > {
+    const wallet = walletContext.publicKey;
+    const walletBalance = await getBalanceInSol(wallet);
+    const riskPct = ENV.AUTO_TRADE_PERCENT_OF_BALANCE;
+    const config = await getEffectiveConfig(
+      walletContext.ownerWallet,
+      tokenMint,
+    );
+    const buySol = Math.min(walletBalance * riskPct, config.maxTradeAmountSol);
+
+    if (buySol < this.MIN_TRADE_SOL) {
+      const neededBalance = this.MIN_TRADE_SOL / riskPct;
+      const reason =
+        `Wallet balance too low for a meaningful trade size ` +
+        `(${walletBalance.toFixed(4)} SOL × ${(riskPct * 100).toFixed(0)}% = ` +
+        `${buySol.toFixed(4)} SOL, below the ${this.MIN_TRADE_SOL} SOL minimum — ` +
+        `needs ~${neededBalance.toFixed(2)} SOL total to clear it)`;
+      return {
+        passed: false,
+        result: {
+          passed: false,
+          stage: 0,
+          stageName: "Position Sizing",
+          reason,
+          details: { walletBalance, riskPct, buySol },
+        },
+      };
+    }
+
+    const riskCheck = await canExecuteTrade(buySol, wallet);
+    if (!riskCheck.allowed) {
+      return {
+        passed: false,
+        result: {
+          passed: false,
+          stage: 0,
+          stageName: "Risk Management",
+          reason: riskCheck.reason || "Risk limit exceeded",
+          details: riskCheck.currentRisk,
+        },
+      };
+    }
+
+    return { passed: true, buySol };
   }
 
   /**

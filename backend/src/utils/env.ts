@@ -28,6 +28,11 @@ export const ENV = {
 
   // Feature flags
   USE_REAL_SWAP: process.env.USE_REAL_SWAP === "true",
+  // Execution router — see services/execution/executionRouter.service.ts.
+  // Off by default; no native executors exist yet, so enabling this today
+  // has no behavioral effect beyond an extra (currently-empty) lookup.
+  RAYDIUM_NATIVE_EXECUTION_ENABLED:
+    process.env.RAYDIUM_NATIVE_EXECUTION_ENABLED === "true",
 
   // Alerts
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN ?? "",
@@ -41,7 +46,7 @@ export const ENV = {
   // Quick tuning
   TOKEN_MIN_MARKETCAP_SOL: Number(process.env.TOKEN_MIN_MARKETCAP_SOL ?? "2"), // 2 SOL default
   AUTO_TRADE_PERCENT_OF_BALANCE: Number(
-    process.env.AUTO_TRADE_PERCENT_OF_BALANCE ?? "0.02"
+    process.env.AUTO_TRADE_PERCENT_OF_BALANCE ?? "0.02",
   ), // 2%
 
   // Advanced execution tuning
@@ -67,10 +72,9 @@ export const ENV = {
 
   // Time-based entry filter (seconds)
   MIN_SECONDS_SINCE_LAUNCH: Number(
-    process.env.MIN_SECONDS_SINCE_LAUNCH ?? "10"
+    process.env.MIN_SECONDS_SINCE_LAUNCH ?? "10",
   ),
   MAX_SECONDS_SINCE_LAUNCH: Number(
-    process.env.MAX_SECONDS_SINCE_LAUNCH ?? "60"
+    process.env.MAX_SECONDS_SINCE_LAUNCH ?? "60",
   ),
-
 };
