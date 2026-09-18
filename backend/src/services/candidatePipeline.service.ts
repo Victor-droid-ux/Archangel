@@ -90,6 +90,7 @@ export function isFreshCandidate(
  */
 export async function processCandidateMint(
   candidate: CandidateMint,
+  source: "quicknode" | "solami" = "quicknode",
 ): Promise<void> {
   const { mint } = candidate;
   const config = loadConfig();
@@ -126,8 +127,8 @@ export async function processCandidateMint(
   }
 
   LOG.info(
-    { mint: mint.slice(0, 8), dex: candidate.dex },
-    "🎯 New candidate from QuickNode webhook",
+    { mint: mint.slice(0, 8), dex: candidate.dex, source },
+    "🎯 New candidate discovered",
   );
 
   await dbService.upsertTokenState({
@@ -135,7 +136,7 @@ export async function processCandidateMint(
     symbol: "UNKNOWN",
     name: "Unknown Token",
     state: "DISCOVERED",
-    source: "quicknode",
+    source,
     poolCreatedAt: candidate.poolCreatedAt,
     poolAddress: candidate.poolAddress,
     dex: candidate.dex,
@@ -144,6 +145,7 @@ export async function processCandidateMint(
   io?.emit("candidate:detected", {
     mint,
     dex: candidate.dex,
+    source,
     timestamp: new Date().toISOString(),
   });
 
@@ -154,7 +156,7 @@ export async function processCandidateMint(
     symbol: "UNKNOWN",
     name: "Unknown Token",
     state: tradeability.tradeable ? "TRADABLE" : "DISCOVERED",
-    source: "quicknode",
+    source,
     jupiterTradable: tradeability.tradeable,
     liquiditySOL: tradeability.liquiditySol,
     liquidityUSD: tradeability.liquidityUsd,
@@ -214,7 +216,7 @@ export async function processCandidateMint(
     symbol: "UNKNOWN",
     name: "Unknown Token",
     state: "TRADABLE",
-    source: "quicknode",
+    source,
     detectedAt: new Date(),
     autoBuyEligible: filterResult.approved,
   });

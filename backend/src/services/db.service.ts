@@ -165,7 +165,7 @@ export type TokenState = {
   // current single discovery path). "jupiter" is kept for rows written by
   // the old Jupiter-polling discovery loops prior to this pipeline
   // consolidation; "other" remains a catch-all.
-  source: "quicknode" | "jupiter" | "other";
+  source: "quicknode" | "solami" | "jupiter" | "other";
 
   marketCapUSD?: number;
   launchMarketCapUSD?: number;

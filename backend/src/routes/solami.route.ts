@@ -102,7 +102,7 @@ router.post("/webhooks/solami", (req: Request, res: Response) => {
     return;
   }
 
-  processCandidateMint(candidate).catch((err) => {
+  processCandidateMint(candidate, "solami").catch((err) => {
     LOG.error(
       { mint: candidate.mint.slice(0, 8), err: err?.message },
       "Candidate pipeline failed unexpectedly",
