@@ -156,12 +156,7 @@ describe("POST/GET /api/user/settings — real persistence round-trip", () => {
       .post("/api/user/settings")
       .send({
         wallet,
-        amount: 0.3,
-        slippage: 3,
-        takeProfit: 20,
-        stopLoss: 8,
         autoTrade: true,
-        dexRoute: "Jupiter",
         ...signWalletAuth(),
       });
     expect(saveRes.statusCode).toBe(200);
@@ -171,7 +166,6 @@ describe("POST/GET /api/user/settings — real persistence round-trip", () => {
       `/api/user/settings?wallet=${wallet}`,
     );
     expect(loadRes.statusCode).toBe(200);
-    expect(loadRes.body.data.amount).toBe(0.3);
     expect(loadRes.body.data.autoTrade).toBe(true);
   });
 

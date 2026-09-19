@@ -337,8 +337,6 @@ router.post("/confirm", async (req, res) => {
       type,
       token,
       amountLamports,
-      takeProfit,
-      stopLoss,
       wallet,
       slippageBps,
     } = req.body;
@@ -488,11 +486,7 @@ router.post("/confirm", async (req, res) => {
 
     return res.json({
       success: true,
-      data: {
-        ...trade,
-        takeProfit,
-        stopLoss,
-      },
+      data: trade,
     });
   } catch (err: any) {
     logger.error("Confirm trade error: " + String(err));

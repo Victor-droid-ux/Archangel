@@ -153,9 +153,21 @@ export function TokenConfigModal({
         await handleSave();
       }
 
+      // Trade size comes from the wallet's global "Max Trade Amount"
+      // setting (see trader-config-modal.tsx) — this modal has no amount
+      // input of its own.
+      const maxTradeAmountSol = effectiveConfig?.maxTradeAmountSol;
+      if (!Number.isFinite(maxTradeAmountSol) || maxTradeAmountSol <= 0) {
+        toast.error(
+          "Set a Max Trade Amount in Global Auto-Trade Rules before trading."
+        );
+        return;
+      }
+      const amountLamports = Math.floor(maxTradeAmountSol * 1e9);
+
       // Execute the trade
       console.log("🚀 Executing trade:", type, token.mint);
-      const result = await executeTrade(type, token.mint);
+      const result = await executeTrade(type, token.mint, amountLamports);
       console.log("✅ Trade result:", result);
 
       if (result) {

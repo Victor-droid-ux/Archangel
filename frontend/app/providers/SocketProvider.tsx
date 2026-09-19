@@ -40,7 +40,7 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({
   const socketRef = useRef<Socket | null>(null);
 
   const { publicKey } = useSolanaWallet();
-  const { autoTrade, amount } = useTradingConfigStore();
+  const { autoTrade } = useTradingConfigStore();
 
   useEffect(() => {
     // Attach to the shared singleton (frontend/lib/socket.ts) rather than
@@ -78,10 +78,9 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({
       socketRef.current.emit("identify", {
         wallet: publicKey.toString(),
         autoMode: autoTrade,
-        manualAmountSol: amount,
       });
     }
-  }, [connected, publicKey, autoTrade, amount]);
+  }, [connected, publicKey, autoTrade]);
 
   const send = (event: string, payload?: any) => {
     if (socketRef.current && socketRef.current.connected) {

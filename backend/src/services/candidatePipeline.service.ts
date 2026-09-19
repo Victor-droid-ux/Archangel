@@ -6,11 +6,11 @@
 // storedTokenChecker.service.ts) that used to each run their own take on
 // "Jupiter validation + filtering" concurrently. There is now exactly one
 // entry point — processCandidateMint() — invoked once per mint, driven by
-// the QuickNode webhook (see routes/quicknode.route.ts) instead of three
-// independent polling timers:
+// the Solami Blur pool_create stream (see blurStream.service.ts) instead of
+// three independent polling timers:
 //
-//   Phase 1  QuickNode webhook        → routes/quicknode.route.ts
-//   Phase 2  Token extraction         → tokenExtraction.service.ts
+//   Phase 1  Blur pool_create stream  → blurStream.service.ts
+//   Phase 2  Candidate extraction     → blurExtraction.service.ts
 //   Phase 3  Jupiter validation       → jupiterTradeability.service.ts
 //   Phase 4  Token filtering          → tokenFiltering.service.ts (mint/freeze
 //                                        authority, buy/sell tax, honeypot,
@@ -90,7 +90,7 @@ export function isFreshCandidate(
  */
 export async function processCandidateMint(
   candidate: CandidateMint,
-  source: "quicknode" | "solami" = "quicknode",
+  source: "blur" = "blur",
 ): Promise<void> {
   const { mint } = candidate;
   const config = loadConfig();

@@ -198,7 +198,7 @@ describe("getStats — openTrades is derived live, not a drifting counter", () =
     const stillOpen = positionsAfterClose.find((p) => p.token === token);
     expect(stillOpen ? stillOpen.netSol < 0.0005 : true).toBe(true);
     expect(statsAfterClose.openTrades).toBe(
-      positionsAfterClose.filter((p) => p.netSol >= 0.0005).length
+      positionsAfterClose.filter((p) => p.netSol >= 0.0005).length,
     );
   });
 });
@@ -245,22 +245,16 @@ describe("user settings persistence", () => {
   it("round-trips real settings for a wallet", async () => {
     const wallet = "TestWallet1111111111111111111111111111111";
     await dbService.saveUserSettings(wallet, {
-      amount: 0.25,
-      slippage: 2,
-      takeProfit: 15,
-      stopLoss: 5,
       autoTrade: true,
-      dexRoute: "Jupiter",
     });
 
     const loaded = await dbService.getUserSettings(wallet);
-    expect(loaded?.amount).toBe(0.25);
     expect(loaded?.autoTrade).toBe(true);
   });
 
   it("returns null for a wallet that never saved settings", async () => {
     const loaded = await dbService.getUserSettings(
-      "NeverSavedWallet22222222222222222222222222"
+      "NeverSavedWallet22222222222222222222222222",
     );
     expect(loaded).toBeNull();
   });

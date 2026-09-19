@@ -26,7 +26,7 @@ export function registerSocketHandlers(io: Server) {
         tokenMint,
         message: `A Jupiter route is now available for token ${tokenMint.slice(
           0,
-          8
+          8,
         )}...! You can now trade this token.`,
         timestamp: new Date().toISOString(),
       });
@@ -34,8 +34,8 @@ export function registerSocketHandlers(io: Server) {
       logger.info(
         `Notified wallet ${wallet.slice(
           0,
-          8
-        )}... that pool is available for ${tokenMint.slice(0, 8)}...`
+          8,
+        )}... that pool is available for ${tokenMint.slice(0, 8)}...`,
       );
     }
   });
@@ -49,7 +49,7 @@ export function registerSocketHandlers(io: Server) {
         tokenMint,
         message: `Monitoring timed out for token ${tokenMint.slice(
           0,
-          8
+          8,
         )}... after 10 minutes. Pool may not be available yet.`,
         timestamp: new Date().toISOString(),
       });
@@ -66,7 +66,7 @@ export function registerSocketHandlers(io: Server) {
     } catch (err: any) {
       logger.warn(
         { err: err?.message },
-        "Failed to send token snapshot on connect"
+        "Failed to send token snapshot on connect",
       );
     }
 
@@ -87,7 +87,7 @@ export function registerSocketHandlers(io: Server) {
      */
     socket.on("identify", async (payload: any) => {
       try {
-        const { wallet, balanceSol, autoMode, manualAmountSol } = payload || {};
+        const { wallet, balanceSol, autoMode } = payload || {};
         if (!wallet) {
           logger.warn("identify event without wallet address");
           return;
@@ -111,14 +111,14 @@ export function registerSocketHandlers(io: Server) {
           logger.info(
             `🔄 Wallet ${wallet.slice(
               0,
-              8
-            )}... reconnected with new socket ${socket.id.slice(0, 8)}...`
+              8,
+            )}... reconnected with new socket ${socket.id.slice(0, 8)}...`,
           );
           updateWalletSocketId(wallet, socket.id);
         } else {
           // Start continuous balance syncing for this wallet
           logger.info(
-            `🆕 Starting balance sync for wallet ${wallet.slice(0, 8)}...`
+            `🆕 Starting balance sync for wallet ${wallet.slice(0, 8)}...`,
           );
           await startWalletBalanceSync(io, wallet, socket.id, {
             intervalMs: 5000, // Sync every 5 seconds
@@ -126,14 +126,14 @@ export function registerSocketHandlers(io: Server) {
           });
         }
 
-        // autoMode/manualAmountSol here are legacy identify-handshake fields,
-        // logged only. Real settings persistence is REST-based —
+        // autoMode here is a legacy identify-handshake field, logged only.
+        // Real settings persistence is REST-based —
         // POST/GET /api/user/settings (user.route.ts, db.service.ts's
         // userSettings collection) — and independent of this socket payload.
 
         logger.info(
-          { wallet, autoMode: !!autoMode, manualAmountSol },
-          `Socket identified for wallet`
+          { wallet, autoMode: !!autoMode },
+          `Socket identified for wallet`,
         );
 
         // Acknowledge identification
@@ -141,7 +141,7 @@ export function registerSocketHandlers(io: Server) {
       } catch (err: any) {
         logger.error(
           { err: err?.message ?? String(err) },
-          "identify event failed"
+          "identify event failed",
         );
         socket.emit("identified", { success: false, error: err?.message });
       }
@@ -265,7 +265,7 @@ export function registerSocketHandlers(io: Server) {
         } catch (err: any) {
           logger.error("Failed to fetch watchlist:", err?.message);
         }
-      }
+      },
     );
 
     /** DISCONNECT */
@@ -278,15 +278,15 @@ export function registerSocketHandlers(io: Server) {
         logger.info(
           `🛑 Wallet ${wallet.slice(
             0,
-            8
-          )}... disconnected, balance sync stopped`
+            8,
+          )}... disconnected, balance sync stopped`,
         );
       }
       logger.warn(`❌ Disconnected: ${socket.id} (${reason})`);
     });
 
     socket.on("error", (err) =>
-      logger.error("Socket error: " + (err?.message ?? String(err)))
+      logger.error("Socket error: " + (err?.message ?? String(err))),
     );
   });
 

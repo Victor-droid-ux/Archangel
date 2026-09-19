@@ -25,8 +25,6 @@ import userRoutes from "./routes/user.route.js";
 import oldTokensRoute from "./routes/oldTokens.route.js";
 import socialRoute from "./routes/social.route.js";
 import userWalletRoute from "./routes/userWallet.route.js";
-import quicknodeRoute from "./routes/quicknode.route.js";
-import solamiRoute from "./routes/solami.route.js";
 
 import dbService from "./services/db.service.js";
 import { ENV } from "./utils/env.js";
@@ -40,19 +38,7 @@ export const createApp = () => {
       credentials: true,
     }),
   );
-  app.use(
-    express.json({
-      // Captures the exact raw bytes of every request body before JSON
-      // parsing — quicknode.route.ts's webhook signature check needs this
-      // (see types/index.d.ts's rawBody doc comment for why). Applied
-      // globally rather than only on the webhook route: cheap (one extra
-      // Buffer reference per request) and no other route reads req.rawBody,
-      // so there's no behavior change anywhere else.
-      verify: (req, _res, buf) => {
-        (req as express.Request).rawBody = buf;
-      },
-    }),
-  );
+  app.use(express.json());
   app.get("/", (_, res) =>
     res.json({ message: "🚀 ArchAngel Backend Running" }),
   );
@@ -106,9 +92,5 @@ export const createApp = () => {
   app.use("/api/old-tokens", oldTokensRoute);
   app.use("/api/social", socialRoute);
   app.use("/api/user-wallet", userWalletRoute);
-  // Phase 1 of the candidate pipeline — mounted at the root (not under
-  // /api) since it's an external QuickNode callback, not a frontend API call.
-  app.use("/", quicknodeRoute);
-  app.use("/", solamiRoute);
   return app;
 };

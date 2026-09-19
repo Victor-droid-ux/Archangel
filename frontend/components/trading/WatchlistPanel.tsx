@@ -49,7 +49,10 @@ export function WatchlistPanel() {
     }
   };
 
-  const openAlertForm = (mint: string, existing?: { targetPrice: number; condition: "above" | "below" }) => {
+  const openAlertForm = (
+    mint: string,
+    existing?: { targetPrice: number; condition: "above" | "below" }
+  ) => {
     setAlertingMint(mint);
     setAlertPrice(existing?.targetPrice ? String(existing.targetPrice) : "");
     setAlertCondition(existing?.condition ?? "above");
@@ -83,27 +86,30 @@ export function WatchlistPanel() {
       </CardHeader>
 
       <CardContent className="space-y-3">
-        {/* Add form */}
-        <div className="flex gap-2">
+        {/* Add form — stacked so the symbol input + Add button never get
+            squeezed past the card's edge in this narrow column. */}
+        <div className="flex flex-col gap-2">
           <Input
             placeholder="Token mint address"
             value={mintInput}
             onChange={(e) => setMintInput(e.target.value)}
-            className="flex-1"
+            className="w-full"
           />
-          <Input
-            placeholder="Symbol (optional)"
-            value={symbolInput}
-            onChange={(e) => setSymbolInput(e.target.value)}
-            className="w-28 flex-shrink-0"
-          />
-          <Button
-            onClick={handleAdd}
-            disabled={adding || !mintInput.trim()}
-            className="flex-shrink-0"
-          >
-            {adding ? <Loader2 className="h-4 w-4 animate-spin" /> : "Add"}
-          </Button>
+          <div className="flex gap-2">
+            <Input
+              placeholder="Symbol (optional)"
+              value={symbolInput}
+              onChange={(e) => setSymbolInput(e.target.value)}
+              className="flex-1 min-w-0"
+            />
+            <Button
+              onClick={handleAdd}
+              disabled={adding || !mintInput.trim()}
+              className="flex-shrink-0"
+            >
+              {adding ? <Loader2 className="h-4 w-4 animate-spin" /> : "Add"}
+            </Button>
+          </div>
         </div>
 
         {/* List */}
@@ -170,9 +176,7 @@ export function WatchlistPanel() {
                     <select
                       value={alertCondition}
                       onChange={(e) =>
-                        setAlertCondition(
-                          e.target.value as "above" | "below"
-                        )
+                        setAlertCondition(e.target.value as "above" | "below")
                       }
                       className="bg-base-100 border border-base-300 rounded px-2 py-1 text-xs"
                     >

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useEffect } from "react";
 import { motion } from "framer-motion";
 import { Card } from "@components/ui/card";
 import LiveFeed from "@components/trading/live-feed";
@@ -15,18 +15,15 @@ import { NewTokens } from "@app/trading/new-tokens";
 import TradeSummary from "@components/trading/trade-summary"; // ✅ imported from ui version
 import TradeHistory from "@components/trading/trade-history";
 import { useStatsSync } from "@hooks/useStatsSync";
-import { TraderConfigModal } from "@components/trading/trader-config-modal";
 import { AutoTradeReadiness } from "@components/trading/AutoTradeReadiness";
 import { RiskManagementPanel } from "@components/trading/risk-management-panel";
 import { ValidationStatus } from "@components/trading/ValidationStatus";
 import { useValidation } from "@hooks/useValidation";
 import { useConfig } from "@hooks/useConfig";
-import { Settings } from "lucide-react";
 import { useSocket } from "@hooks/useSocket";
 import { toast } from "react-hot-toast";
 import { StoredTokenCheckerStatus } from "@components/trading/StoredTokenCheckerStatus";
 import { WatchlistPanel } from "@components/trading/WatchlistPanel";
-import { Button } from "@components/ui/button";
 
 // Content must never depend on this animation actually running to become
 // visible — opacity starts at 1 so a stalled/skipped animation (reduced
@@ -51,12 +48,10 @@ export default function TradingDashboard() {
   const { lastMessage } = useSocket();
 
   // Get selected token for validation
-  const { selectedToken, setAmount } = useConfig();
+  const { selectedToken } = useConfig();
 
   // Initialize validation hook
   const { validation } = useValidation(selectedToken);
-
-  const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
 
   // Listen for pool monitoring events
   useEffect(() => {
@@ -114,27 +109,19 @@ export default function TradingDashboard() {
           </div>
           <div className="flex items-center gap-3">
             <AutoTradeReadiness compact />
-            <Button
-              variant="primary"
-              onClick={() => setIsConfigModalOpen(true)}
-              suppressHydrationWarning
-            >
-              <Settings className="w-4 h-4" />
-              Trading Settings
-            </Button>
           </div>
         </div>
       </motion.div>
 
-      {/* Trader Config Modal */}
-      <TraderConfigModal
-        isOpen={isConfigModalOpen}
-        onClose={() => setIsConfigModalOpen(false)}
-      />
-
       {/* ========================== SUMMARY (Animated) ========================== */}
       <motion.div {...fadeIn(0.2)}>
         <TradeSummary />
+      </motion.div>
+
+      {/* Risk Management & Global Trading Settings — full width so its many
+          fields lay out horizontally instead of forcing a long scroll. */}
+      <motion.div {...fadeIn(0.25)}>
+        <RiskManagementPanel />
       </motion.div>
 
       {/* ========================== GRID LAYOUT ========================== */}
@@ -146,11 +133,6 @@ export default function TradingDashboard() {
 
           {/* Stored Token Checker Status */}
           <StoredTokenCheckerStatus />
-
-          {/* Risk Management Panel — feeds its computed position size into
-              the trade-amount used by Buy/Sell (actions-bar.tsx) and manual
-              buy; previously computed a number nobody downstream ever read. */}
-          <RiskManagementPanel onAmountChange={setAmount} />
 
           <WatchlistPanel />
 

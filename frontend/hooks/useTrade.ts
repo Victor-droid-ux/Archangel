@@ -13,8 +13,7 @@ import { VersionedTransaction } from "@solana/web3.js";
 export const useTrade = () => {
   const { publicKey, connected, refreshBalance } = useWallet();
   const wallet = useSolanaWallet();
-  const { amount, slippage, takeProfit, stopLoss, selectedToken } =
-    useTradingConfigStore();
+  const { selectedToken } = useTradingConfigStore();
 
   const { stats, updateStats } = useStats();
   const { sendMessage } = useSocket();
@@ -27,10 +26,9 @@ export const useTrade = () => {
     // Already in the correct base unit for the swap direction — SOL lamports
     // for a buy, the token's own raw units for a sell (see the Sell page,
     // which fetches the real on-chain balance rather than assuming a SOL
-    // quantity means anything for a token that isn't SOL). Falls back to the
-    // trading-config store's SOL amount for callers that don't pass one
-    // (the legacy generic Buy button behavior).
-    amountLamportsOverride?: number | string
+    // quantity means anything for a token that isn't SOL). Required — there's
+    // no longer a store-wide default trade size to fall back to.
+    amountLamportsOverride: number | string
   ) => {
     if (!connected || !publicKey) {
       toast.error("Connect your wallet to trade.");
@@ -39,6 +37,14 @@ export const useTrade = () => {
 
     if (!wallet.signTransaction) {
       toast.error("Wallet does not support transaction signing.");
+      return null;
+    }
+
+    if (
+      amountLamportsOverride === undefined ||
+      amountLamportsOverride === null
+    ) {
+      toast.error("Missing trade amount.");
       return null;
     }
 
@@ -54,14 +60,8 @@ export const useTrade = () => {
       // silently loses precision (and can render in scientific notation once
       // serialized), which breaks Jupiter's fixed-width amount encoding
       // downstream ("encoding overruns Uint8Array"). Passed through as-is —
-      // already a valid integer string/number in the right base unit — for
-      // any override; only the store's own SOL amount (always a small,
-      // safe number) goes through Math.floor.
-      const amountLamports: number | string =
-        amountLamportsOverride !== undefined
-          ? amountLamportsOverride
-          : Math.floor(amount * 1e9);
-      const slippageBps = Math.floor(slippage * 100);
+      // already a valid integer string/number in the right base unit.
+      const amountLamports: number | string = amountLamportsOverride;
       const inputMint =
         type === "buy"
           ? "So11111111111111111111111111111111111111112"
@@ -83,7 +83,6 @@ export const useTrade = () => {
           outputMint,
           wallet: publicKey,
           amountLamports,
-          slippageBps,
         }),
       });
 
@@ -116,10 +115,7 @@ export const useTrade = () => {
           type,
           token: mint,
           amountLamports,
-          takeProfit,
-          stopLoss,
           wallet: publicKey,
-          slippageBps,
         }),
       });
 
@@ -127,9 +123,7 @@ export const useTrade = () => {
         // A failed confirmation is a real failure — surface it as one instead
         // of fabricating a fake "successful" trade with random price/PnL. This
         // used to silently show a success toast for trades that never happened.
-        throw new Error(
-          confirmRes?.message || "Trade confirmation failed"
-        );
+        throw new Error(confirmRes?.message || "Trade confirmation failed");
       }
 
       const d = confirmRes.data;

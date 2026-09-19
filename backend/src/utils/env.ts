@@ -22,6 +22,20 @@ export const ENV = {
   HELIUS_RPC_URL: process.env.HELIUS_RPC_URL ?? "",
   SOLANA_RPC_URL: process.env.SOLANA_RPC_URL ?? "",
 
+  // Solami Blur realtime stream (services/blurStream.service.ts). The stream
+  // only starts when SOLAMI_BLUR_API_KEY is set; the key needs the DataApi
+  // permission. SOLAMI_BLUR_WS_URL may point at a regional endpoint (e.g.
+  // wss://fra.ws.solami.dev/data/subscribe). SOLAMI_BLUR_DEXES is an optional
+  // comma-separated ALLOW-list of DEX names — Blur's dex filter can only
+  // include, not exclude. Empty = every DEX.
+  SOLAMI_BLUR_API_KEY: process.env.SOLAMI_BLUR_API_KEY ?? "",
+  SOLAMI_BLUR_WS_URL:
+    process.env.SOLAMI_BLUR_WS_URL ?? "wss://ws.solami.dev/data/subscribe",
+  SOLAMI_BLUR_DEXES: (process.env.SOLAMI_BLUR_DEXES ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+
   // Jupiter aggregator API
   JUPITER_API_URL: process.env.JUPITER_API_URL ?? "https://lite-api.jup.ag",
   JUPITER_API_KEY: process.env.JUPITER_API_KEY ?? "",

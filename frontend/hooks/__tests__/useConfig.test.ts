@@ -8,12 +8,7 @@ vi.mock("@lib/utils", () => ({
 import { useTradingConfigStore } from "../useConfig";
 
 const defaults = {
-  amount: 0.1,
-  slippage: 1,
-  takeProfit: 10,
-  stopLoss: 2,
   autoTrade: false,
-  dexRoute: "Jupiter",
   selectedToken: undefined,
 };
 
@@ -25,16 +20,14 @@ beforeEach(() => {
 
 describe("useTradingConfigStore", () => {
   it("round-trips through localStorage via saveConfig/loadConfig", () => {
-    useTradingConfigStore.getState().setAmount(0.5);
-    useTradingConfigStore.getState().setSlippage(3);
+    useTradingConfigStore.getState().setAutoTrade(true);
     useTradingConfigStore.getState().saveConfig();
 
     // Reset in-memory state to defaults, then reload from storage.
     useTradingConfigStore.setState({ ...defaults });
     useTradingConfigStore.getState().loadConfig();
 
-    expect(useTradingConfigStore.getState().amount).toBe(0.5);
-    expect(useTradingConfigStore.getState().slippage).toBe(3);
+    expect(useTradingConfigStore.getState().autoTrade).toBe(true);
   });
 
   it("migrates a stale saved BONK selectedToken to undefined on load", () => {
@@ -48,13 +41,13 @@ describe("useTradingConfigStore", () => {
 
   it("does nothing when there is no saved config", () => {
     useTradingConfigStore.getState().loadConfig();
-    expect(useTradingConfigStore.getState().amount).toBe(defaults.amount);
+    expect(useTradingConfigStore.getState().autoTrade).toBe(defaults.autoTrade);
   });
 
   it("loadConfigFromAPI populates the store from a successful response", async () => {
     fetcherMock.mockResolvedValue({
       success: true,
-      data: { amount: 0.77, autoTrade: true },
+      data: { autoTrade: true },
     });
 
     await useTradingConfigStore.getState().loadConfigFromAPI("SomeWallet111");
@@ -62,7 +55,6 @@ describe("useTradingConfigStore", () => {
     expect(fetcherMock).toHaveBeenCalledWith(
       "/api/user/settings?wallet=SomeWallet111"
     );
-    expect(useTradingConfigStore.getState().amount).toBe(0.77);
     expect(useTradingConfigStore.getState().autoTrade).toBe(true);
   });
 

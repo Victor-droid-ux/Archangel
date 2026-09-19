@@ -21,7 +21,7 @@ export const useWallet = (): WalletState => {
   const [currentSolBalance, setCurrentSolBalance] = useState<number>(0);
 
   const { identify } = useSocket();
-  const { autoTrade, amount } = useTradingConfigStore();
+  const { autoTrade } = useTradingConfigStore();
 
   // Sync connection state from Solana wallet adapter
   const connected = solanaWallet.connected;
@@ -152,7 +152,6 @@ export const useWallet = (): WalletState => {
         wallet: solanaWallet.publicKey.toString(),
         balanceSol: currentSolBalance,
         autoMode: autoTrade,
-        manualAmountSol: amount,
       });
 
       // "Sign up" this wallet — generates its custodial trading wallet on

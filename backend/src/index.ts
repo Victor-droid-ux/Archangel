@@ -19,6 +19,7 @@ const log = getLogger("index");
 import { ENV } from "./utils/env.js";
 import candidatePipelineService from "./services/candidatePipeline.service.js";
 import { registerNativeExecutors } from "./services/execution/registerNativeExecutors.js";
+import { startBlurStream } from "./services/blurStream.service.js";
 
 // pino-pretty runs its transport in a worker thread in dev; log.error()
 // immediately followed by process.exit() can race ahead of that flush and the
@@ -94,13 +95,15 @@ process.on("uncaughtException", (err: Error) => {
   startPnLBroadcaster(io, { intervalMs: 30000 }); // Broadcast every 30 seconds
   // Detect SOL deposited into each custodial wallet (see depositTracker.service.ts)
   startDepositTracker({ intervalMs: 60000 }, io);
-  // Candidate discovery is now event-driven, not polled: QuickNode posts new
-  // pool-creation events to /webhooks/quicknode (see routes/quicknode.route.ts),
-  // which runs every mint through the single linear pipeline in
-  // candidatePipeline.service.ts. No background loop to start here — just
-  // give it the socket server so it can emit progress events.
+  // Candidate discovery is event-driven, not polled: the Solami Blur stream
+  // pushes every new pool over one outbound WebSocket, and each event runs
+  // through the single linear pipeline in candidatePipeline.service.ts. Give
+  // the pipeline the socket server first so it can emit progress events, then
+  // start the stream. If SOLAMI_BLUR_API_KEY is unset the stream does not
+  // start and NO discovery runs (startBlurStream logs that as an error).
   candidatePipelineService.setSocketIO(io);
-  log.info("🎣 QuickNode candidate pipeline ready (webhook-driven)");
+  startBlurStream();
+  log.info("🎣 Candidate pipeline ready (Blur stream-driven)");
   registerNativeExecutors();
   server.listen(ENV.PORT, () => {
     log.info(`⚡ Backend online → http://localhost:${ENV.PORT}`);

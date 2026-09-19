@@ -159,7 +159,7 @@ export async function getBalanceInSol(
             : pubkey.toBase58().slice(0, 8) + "...",
         lamports,
         sol: sol.toFixed(4),
-        rpcUrl: process.env.SOLANA_RPC_URL || "default",
+        
       },
       "Fetched wallet balance"
     );

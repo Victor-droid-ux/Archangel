@@ -8,19 +8,14 @@ const router = express.Router();
 const log = getLogger("user.route");
 
 // POST /api/user/settings
-// body: { wallet, amount?, slippage?, takeProfit?, stopLoss?, autoTrade?, dexRoute?, selectedToken? }
+// body: { wallet, autoTrade?, selectedToken? }
 // Field names mirror frontend/hooks/useConfig.ts's TradingConfig exactly so
 // the frontend can apply the saved doc straight back into the store.
 router.post("/settings", async (req, res) => {
   try {
     const {
       wallet,
-      amount,
-      slippage,
-      takeProfit,
-      stopLoss,
       autoTrade,
-      dexRoute,
       selectedToken,
       walletAuthTimestamp,
       walletAuthSignature,
@@ -48,12 +43,7 @@ router.post("/settings", async (req, res) => {
     }
 
     const saved = await dbService.saveUserSettings(verifiedWallet, {
-      amount,
-      slippage,
-      takeProfit,
-      stopLoss,
       autoTrade,
-      dexRoute,
       selectedToken,
     });
 

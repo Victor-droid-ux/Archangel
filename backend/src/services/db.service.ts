@@ -85,12 +85,7 @@ export type StatsDoc = {
 // autoTrade/amount fields and silently no-op'd).
 export type UserSettings = {
   wallet: string;
-  amount?: number;
-  slippage?: number;
-  takeProfit?: number;
-  stopLoss?: number;
   autoTrade?: boolean;
-  dexRoute?: string;
   selectedToken?: string;
   updatedAt: Date;
 };
@@ -165,7 +160,7 @@ export type TokenState = {
   // current single discovery path). "jupiter" is kept for rows written by
   // the old Jupiter-polling discovery loops prior to this pipeline
   // consolidation; "other" remains a catch-all.
-  source: "quicknode" | "solami" | "jupiter" | "other";
+  source: "quicknode" | "solami" | "blur" | "jupiter" | "other";
 
   marketCapUSD?: number;
   launchMarketCapUSD?: number;
