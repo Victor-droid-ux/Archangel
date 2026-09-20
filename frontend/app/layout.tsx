@@ -7,6 +7,7 @@ import { Toaster } from "react-hot-toast";
 import type { Metadata, Viewport } from "next";
 import { SocketProvider } from "./providers/SocketProvider";
 import { SolanaWalletProvider } from "./providers/WalletProvider";
+import { WalletDataProvider } from "./providers/WalletDataProvider";
 import { AccountNotifications } from "@components/trading/AccountNotifications";
 
 // Genuinely self-hosted — the actual variable-font .woff2 files ship inside
@@ -110,23 +111,27 @@ export default function RootLayout({
       <body className="min-h-screen flex flex-col bg-base-100 text-base-content font-sans transition-colors duration-300">
         <SolanaWalletProvider>
           <SocketProvider>
-            <AccountNotifications />
-            <Navbar />
+            {/* Wallet balance polling, provisioning and the authenticated
+                socket identify run ONCE here; useWallet() reads the result. */}
+            <WalletDataProvider>
+              <AccountNotifications />
+              <Navbar />
 
-            <main className="flex-grow container mx-auto px-4 py-8">
-              {children}
-            </main>
+              <main className="flex-grow container mx-auto px-4 py-8">
+                {children}
+              </main>
 
-            <Footer />
+              <Footer />
 
-            <Toaster
-              position="bottom-right"
-              toastOptions={{
-                className:
-                  "bg-neutral text-neutral-content rounded-lg shadow-md",
-                duration: 3000,
-              }}
-            />
+              <Toaster
+                position="bottom-right"
+                toastOptions={{
+                  className:
+                    "bg-neutral text-neutral-content rounded-lg shadow-md",
+                  duration: 3000,
+                }}
+              />
+            </WalletDataProvider>
           </SocketProvider>
         </SolanaWalletProvider>
       </body>

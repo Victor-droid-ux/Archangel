@@ -42,21 +42,43 @@ interface RiskCheckResult {
 /**
  * Check if a trade is allowed based on risk management rules
  */
+export interface CanExecuteTradeOptions {
+  /**
+   * The wallet that OWNS the position/trade history. Trades are recorded
+   * against the owner wallet, while `walletAddress` (the hot wallet that
+   * holds the funds) is what the balance is read from. They are the same
+   * wallet for the operator, but different for every custodial user — and
+   * without this the open-position and daily-loss checks looked for a user's
+   * trades under their hot wallet's address, found none, and never enforced.
+   */
+  ownerWallet?: string;
+  /**
+   * Apply the MAX_RISK_PER_TRADE_PCT cap (default true). Auto-buys sized by
+   * utils/positionSizing.ts (balance / free slots) turn this off: a slice of
+   * 1/N of the wallet is what the trader asked for, and a flat percentage cap
+   * would refuse it. The open-position and daily-loss limits still apply.
+   */
+  enforcePerTradeCap?: boolean;
+}
+
 export async function canExecuteTrade(
   tradeAmountSol: number,
-  walletAddress: string
+  walletAddress: string,
+  options: CanExecuteTradeOptions = {},
 ): Promise<RiskCheckResult> {
   try {
+    const ownerWallet = options.ownerWallet ?? walletAddress;
+    const enforcePerTradeCap = options.enforcePerTradeCap ?? true;
+
     // Scoped to this specific wallet — each user's exposure/risk state must
-    // be independent. Without walletAddress here, one user's open positions
+    // be independent. Without an owner here, one user's open positions
     // would count against (and could block) every other user's trades.
-    const positions = await dbService.getPositions(walletAddress);
-    const openPositions = positions.filter((p) => p.netSol > 0).length;
+    const openPositions = await dbService.getOpenPositionCount(ownerWallet);
 
     // Check max open positions (0/unset = no cap)
     if (MAX_OPEN_POSITIONS > 0 && openPositions >= MAX_OPEN_POSITIONS) {
       log.warn(
-        `Trade blocked: Max ${MAX_OPEN_POSITIONS} open positions reached (current: ${openPositions})`
+        `Trade blocked: Max ${MAX_OPEN_POSITIONS} open positions reached (current: ${openPositions})`,
       );
       return {
         allowed: false,
@@ -71,26 +93,27 @@ export async function canExecuteTrade(
     }
 
     // Calculate daily loss
-    const dailyLoss = await calculateDailyLoss(walletAddress);
+    const dailyLoss = await calculateDailyLoss(ownerWallet);
     // Position sizing must be based on actual wallet equity, not on money
     // already committed to positions (dbService.getPortfolioPnL().totalInvestedSol
     // is a running sum of past buys — with few/no trades yet that's ~0, which made
     // "2% of portfolio" collapse to ~0 SOL and reject every trade regardless of
     // real wallet balance).
     const portfolioValue = await getBalanceInSol(walletAddress);
-    const dailyLossPct = portfolioValue > 0 ? (dailyLoss / portfolioValue) * 100 : 0;
+    const dailyLossPct =
+      portfolioValue > 0 ? (dailyLoss / portfolioValue) * 100 : 0;
 
     // Check max daily loss
     if (dailyLossPct >= MAX_DAILY_LOSS_PCT) {
       log.warn(
         `Trade blocked: Max daily loss ${MAX_DAILY_LOSS_PCT}% reached (current: ${dailyLossPct.toFixed(
-          2
-        )}%)`
+          2,
+        )}%)`,
       );
       return {
         allowed: false,
         reason: `Daily loss limit ${MAX_DAILY_LOSS_PCT}% exceeded (${dailyLossPct.toFixed(
-          2
+          2,
         )}%)`,
         currentRisk: {
           openPositions,
@@ -109,16 +132,16 @@ export async function canExecuteTrade(
     // formula (`(x * pct) / 100` vs `x * (pct / 100)`), which can disagree by a
     // sub-lamport floating-point rounding error on an otherwise-identical value.
     // A tiny relative tolerance absorbs that noise without loosening the real cap.
-    if (tradeAmountSol > maxTradeSize * (1 + 1e-6)) {
+    if (enforcePerTradeCap && tradeAmountSol > maxTradeSize * (1 + 1e-6)) {
       log.warn(
         `Trade blocked: Amount ${tradeAmountSol} SOL exceeds max ${MAX_RISK_PER_TRADE_PCT}% risk (${maxTradeSize.toFixed(
-          2
-        )} SOL)`
+          2,
+        )} SOL)`,
       );
       return {
         allowed: false,
         reason: `Trade size ${tradeAmountSol} SOL exceeds ${MAX_RISK_PER_TRADE_PCT}% max risk (${maxTradeSize.toFixed(
-          2
+          2,
         )} SOL)`,
         currentRisk: {
           openPositions,
@@ -132,8 +155,8 @@ export async function canExecuteTrade(
     // All checks passed
     log.info(
       `Risk check PASSED: ${tradeAmountSol} SOL trade allowed | Open: ${openPositions}/${MAX_OPEN_POSITIONS} | Daily Loss: ${dailyLossPct.toFixed(
-        2
-      )}%/${MAX_DAILY_LOSS_PCT}%`
+        2,
+      )}%/${MAX_DAILY_LOSS_PCT}%`,
     );
 
     return {
@@ -173,7 +196,7 @@ async function calculateDailyLoss(walletAddress: string): Promise<number> {
 
     // Filter trades from today
     const todayTrades = trades.filter(
-      (t) => t.timestamp >= startOfDay && t.type === "sell"
+      (t) => t.timestamp >= startOfDay && t.type === "sell",
     );
 
     // Sum up losses (negative pnlSol)

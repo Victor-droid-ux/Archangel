@@ -89,40 +89,6 @@ describe("GET /api/positions", () => {
   });
 });
 
-describe("POST /api/trade/calculate-risk", () => {
-  it("rejects a missing balance", async () => {
-    const res = await request(app).post("/api/trade/calculate-risk").send({});
-    expect(res.statusCode).toBe(400);
-  });
-
-  it("computes riskAmount from an explicit riskPercent", async () => {
-    const res = await request(app)
-      .post("/api/trade/calculate-risk")
-      .send({ balance: 10, riskPercent: 5 });
-    expect(res.statusCode).toBe(200);
-    expect(res.body.data.riskAmount).toBeCloseTo(0.5, 6);
-    expect(res.body.data.amountLamports).toBe(500_000_000);
-  });
-
-  it("defaults to 1% of balance when nothing is specified", async () => {
-    const res = await request(app)
-      .post("/api/trade/calculate-risk")
-      .send({ balance: 10 });
-    expect(res.statusCode).toBe(200);
-    expect(res.body.data.riskPercent).toBeCloseTo(1, 6);
-    expect(res.body.data.riskAmount).toBeCloseTo(0.1, 6);
-  });
-
-  it("caps the calculated amount at the full balance", async () => {
-    const res = await request(app)
-      .post("/api/trade/calculate-risk")
-      .send({ balance: 1, riskAmount: 5 });
-    expect(res.statusCode).toBe(200);
-    expect(res.body.data.riskAmount).toBe(1);
-    expect(res.body.data.riskPercent).toBe(100);
-  });
-});
-
 describe("POST/GET /api/user/settings — real persistence round-trip", () => {
   // POST requires a real wallet-signature proof (see user.route.ts's
   // verifyWalletAuth) — a fixed placeholder string can't produce one, so

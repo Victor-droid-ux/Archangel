@@ -13,8 +13,8 @@ import {
 import { PublicKey, Keypair } from "@solana/web3.js";
 import dbService from "./db.service.js";
 import { canExecuteTrade } from "./riskManagement.service.js";
-import { ENV } from "../utils/env.js";
 import { getEffectiveConfig } from "./traderConfig.service.js";
+import { computePositionSize, sizingEnv } from "../utils/positionSizing.js";
 
 /**
  * Identifies which wallet a pipeline run buys/sells for — the custodial
@@ -70,12 +70,6 @@ class ValidationPipelineService {
   // trading behavior — this just makes it tunable.
   private readonly MAX_SLIPPAGE = Number(
     process.env.MAX_PIPELINE_SLIPPAGE_PCT ?? 49,
-  );
-  // Floor below which a trade is too small to be worth executing, not a hard
-  // trade-size constant — the actual buy amount is computed per-run in
-  // runPipeline() as a percentage of live wallet balance (see there for why).
-  private readonly MIN_TRADE_SOL = Number(
-    process.env.MIN_AUTO_TRADE_SOL ?? 0.003,
   );
   private readonly AUTO_BUY_SLIPPAGE = parseFloat(
     process.env.AUTO_BUY_SLIPPAGE_PCT || "10",
@@ -374,16 +368,22 @@ class ValidationPipelineService {
 
   /**
    * Stage 0 — POSITION SIZING + RISK MANAGEMENT CHECK, shared by
-   * runPipeline() (Jupiter) and runNativePipeline(). Size the trade as a
-   * percentage of live wallet balance (AUTO_TRADE_PERCENT_OF_BALANCE, 2%
-   * default) rather than a fixed SOL amount — a fixed amount either sits
-   * below the risk cap's true minimum-balance requirement (rejected
-   * forever on a modest wallet) or, on a larger wallet, wastes the chance
-   * to size up. Every eligible wallet's buy for a candidate mint funnels
-   * through one of these two pipeline entry points, so this is the single
-   * place that guarantees sizing + MAX_OPEN_POSITIONS/MAX_DAILY_LOSS_PCT
-   * apply to every real buy either pipeline executes, regardless of
-   * execution method.
+   * runPipeline() (Jupiter) and runNativePipeline().
+   *
+   * The trader's "Max Open Positions" (N) says how many positions the bot
+   * may hold at once, and the trading wallet's live balance is split across
+   * the slots still free: buy = spendable balance / free slots (see
+   * utils/positionSizing.ts for the rule and its edge cases). What stops the
+   * bot opening another position is either every slot being in use or a low
+   * balance — not a fixed SOL amount and not a percentage cap.
+   *
+   * Every eligible wallet's buy for a candidate mint funnels through one of
+   * the two pipeline entry points, and each runs inside that wallet's lock
+   * (utils/walletMutex.ts), so concurrent candidates size one after another
+   * against a balance and open-position count that already include the
+   * previous buy. This is the single place that guarantees sizing and the
+   * MAX_OPEN_POSITIONS / MAX_DAILY_LOSS_PCT limits apply to every real buy,
+   * regardless of execution method.
    */
   private async sizePositionAndCheckRisk(
     tokenMint: string,
@@ -393,34 +393,67 @@ class ValidationPipelineService {
     | { passed: false; result: ValidationResult }
   > {
     const wallet = walletContext.publicKey;
-    const walletBalance = await getBalanceInSol(wallet);
-    const riskPct = ENV.AUTO_TRADE_PERCENT_OF_BALANCE;
-    const config = await getEffectiveConfig(
-      walletContext.ownerWallet,
-      tokenMint,
-    );
-    const buySol = Math.min(walletBalance * riskPct, config.maxTradeAmountSol);
+    const [walletBalance, config, openPositions] = await Promise.all([
+      getBalanceInSol(wallet),
+      getEffectiveConfig(walletContext.ownerWallet, tokenMint),
+      dbService.getOpenPositionCount(walletContext.ownerWallet),
+    ]);
+    const { minTradeSol, feeReserveSol } = sizingEnv();
 
-    if (buySol < this.MIN_TRADE_SOL) {
-      const neededBalance = this.MIN_TRADE_SOL / riskPct;
-      const reason =
-        `Wallet balance too low for a meaningful trade size ` +
-        `(${walletBalance.toFixed(4)} SOL × ${(riskPct * 100).toFixed(0)}% = ` +
-        `${buySol.toFixed(4)} SOL, below the ${this.MIN_TRADE_SOL} SOL minimum — ` +
-        `needs ~${neededBalance.toFixed(2)} SOL total to clear it)`;
+    const sizing = computePositionSize({
+      balanceSol: walletBalance,
+      openPositions,
+      maxOpenPositions: config.maxOpenPositions,
+      minTradeSol,
+      feeReserveSol,
+    });
+
+    if (!sizing.ok) {
+      const details = {
+        walletBalance,
+        openPositions,
+        maxOpenPositions: config.maxOpenPositions,
+        minTradeSol,
+        feeReserveSol,
+      };
+      if (sizing.code === "AT_CAPACITY") {
+        return {
+          passed: false,
+          result: {
+            passed: false,
+            stage: 0,
+            stageName: "Max Open Positions",
+            reason:
+              `All ${sizing.maxOpenPositions} position slots are in use ` +
+              `(${sizing.openPositions} open) — a new position opens when one closes`,
+            details,
+          },
+        };
+      }
       return {
         passed: false,
         result: {
           passed: false,
           stage: 0,
-          stageName: "Position Sizing",
-          reason,
-          details: { walletBalance, riskPct, buySol },
+          stageName: "Low Balance",
+          reason:
+            `Low balance: ${walletBalance.toFixed(4)} SOL, minus ` +
+            `${feeReserveSol} SOL kept for fees, is under the ${minTradeSol} SOL ` +
+            `minimum for a new position — top up to at least ` +
+            `${sizing.neededSol.toFixed(3)} SOL`,
+          details,
         },
       };
     }
 
-    const riskCheck = await canExecuteTrade(buySol, wallet);
+    const buySol = sizing.buySol;
+
+    const riskCheck = await canExecuteTrade(buySol, wallet, {
+      ownerWallet: walletContext.ownerWallet,
+      // The per-trade percentage cap is for sizing-by-percentage; here the
+      // size is the trader's own 1/N split (see the doc comment above).
+      enforcePerTradeCap: false,
+    });
     if (!riskCheck.allowed) {
       return {
         passed: false,
@@ -599,7 +632,12 @@ class ValidationPipelineService {
       }
 
       if (process.env.USE_REAL_SWAP === "true") {
-        const hasBalance = await hasSufficientBalance(wallet, buySol);
+        // buySol was sized (Stage 0) from the balance MINUS a fee reserve, so
+        // the fee margin is already held back. The default 5% buffer on top
+        // would refuse the last free slot on any wallet above ~0.21 SOL
+        // (balance < 1.05 x (balance - reserve)); 0 keeps this a plain
+        // "is the money still there" check.
+        const hasBalance = await hasSufficientBalance(wallet, buySol, 0);
         if (!hasBalance) {
           return {
             passed: false,

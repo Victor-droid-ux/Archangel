@@ -2,11 +2,20 @@
 
 import React, { useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { TrendingUp, TrendingDown, Zap, Loader2, Ban } from "lucide-react";
+import {
+  TrendingUp,
+  TrendingDown,
+  Zap,
+  Loader2,
+  Ban,
+  Pause,
+  Play,
+} from "lucide-react";
 import { Button } from "@components/ui/button";
 import { useWallet } from "@hooks/useWallet";
 import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { useSocket } from "@hooks/useSocket";
+import { useTraderConfig } from "@hooks/useTraderConfig";
 import { fetcher } from "@lib/utils";
 import { signWalletAuth } from "@lib/walletAuth";
 import { toast } from "react-hot-toast";
@@ -18,7 +27,54 @@ export default function ActionsBar() {
   const { signMessage } = useSolanaWallet();
   const { connected: socketConnected } = useSocket();
 
+  const { config, refetch } = useTraderConfig();
+
   const [stopping, setStopping] = useState(false);
+  const [toggling, setToggling] = useState(false);
+
+  // Unknown (settings not loaded) is neither paused nor running.
+  const autoTradeEnabled: boolean | null = config
+    ? (config.globalSettings?.autoTradeEnabled ?? false)
+    : null;
+
+  // Pause / resume: flips ONLY the auto-trade switch. Nothing is sold and no
+  // other setting changes, and open positions keep being managed by the exit
+  // monitor. ("Sell All & Stop" below is the heavy version of this.)
+  const handleToggleAutoTrade = useCallback(
+    async (enable: boolean) => {
+      if (!connected || !publicKey) {
+        toast.error("Please connect your wallet first.");
+        return;
+      }
+      setToggling(true);
+      try {
+        const auth = await signWalletAuth(signMessage, publicKey);
+        const res = await fetcher<{
+          success: boolean;
+          autoTradeEnabled?: boolean;
+          error?: string;
+        }>(`/api/user-wallet/${publicKey}/auto-trade`, {
+          method: "POST",
+          body: JSON.stringify({ enabled: enable, ...auth }),
+        });
+        if (!res?.success) {
+          throw new Error(res?.error || "Couldn't change auto-trade");
+        }
+        void refetch();
+        toast.success(
+          enable
+            ? "Auto-trade resumed."
+            : "Auto-trade paused. Nothing was sold — open positions keep being managed."
+        );
+      } catch (err: any) {
+        toast.error(err?.message || "Couldn't change auto-trade");
+        console.error(err);
+      } finally {
+        setToggling(false);
+      }
+    },
+    [connected, publicKey, signMessage, refetch]
+  );
 
   const handleStopAutoTrade = useCallback(async () => {
     if (!connected || !publicKey) {
@@ -26,7 +82,7 @@ export default function ActionsBar() {
       return;
     }
     const confirmed = window.confirm(
-      "This disables auto-trading for your wallet and sells every position the bot has bought for you. This cannot be undone. Continue?"
+      "This sells EVERY position the bot has bought for you and turns auto-trading off. The sales cannot be undone. (To just stop new buys without selling anything, use Pause Auto Trade instead.) Continue?"
     );
     if (!confirmed) return;
 
@@ -53,9 +109,13 @@ export default function ActionsBar() {
 
       toast.dismiss("stop-auto-trade");
       if (res.sold.length === 0 && res.failed.length === 0) {
-        toast.success("Auto-trade disabled. You had no bot-bought positions to sell.");
+        toast.success(
+          "Auto-trade disabled. You had no bot-bought positions to sell."
+        );
       } else if (res.failed.length === 0) {
-        toast.success(`Auto-trade disabled. Sold ${res.sold.length} position(s).`);
+        toast.success(
+          `Auto-trade disabled. Sold ${res.sold.length} position(s).`
+        );
       } else {
         // Auto-trade is already off at this point regardless — only the
         // sell-off is partial. List exactly which tokens didn't sell (not
@@ -68,7 +128,7 @@ export default function ActionsBar() {
           `Auto-trade disabled. Sold ${res.sold.length} position(s).`
         );
         toast.error(
-          `${res.failed.length} position(s) failed to sell:\n${failedList}\n\nClick Stop Auto Trade again to retry.`,
+          `${res.failed.length} position(s) failed to sell:\n${failedList}\n\nClick Sell All & Stop again to retry.`,
           { duration: 10000 }
         );
         console.warn("Stop auto-trade: some sells failed", res.failed);
@@ -126,13 +186,36 @@ export default function ActionsBar() {
 
         <Button
           variant="outline"
-          disabled={!connected || stopping}
+          disabled={
+            !connected || toggling || stopping || autoTradeEnabled === null
+          }
+          onClick={() => handleToggleAutoTrade(!autoTradeEnabled)}
+          className="flex items-center gap-2"
+          title={
+            autoTradeEnabled
+              ? "Stop opening new positions. Nothing is sold; open positions keep being managed."
+              : "Start opening positions again"
+          }
+        >
+          {toggling ? (
+            <Loader2 className="animate-spin" />
+          ) : autoTradeEnabled ? (
+            <Pause />
+          ) : (
+            <Play />
+          )}
+          {autoTradeEnabled ? "Pause Auto Trade" : "Resume Auto Trade"}
+        </Button>
+
+        <Button
+          variant="outline"
+          disabled={!connected || stopping || toggling}
           onClick={handleStopAutoTrade}
           className="flex items-center gap-2"
           title="Sell everything the bot has bought for you and turn off auto-trade"
         >
           {stopping ? <Loader2 className="animate-spin" /> : <Ban />}
-          Stop Auto Trade
+          Sell All &amp; Stop
         </Button>
       </div>
     </motion.div>

@@ -1,0 +1,174 @@
+// frontend/lib/globalSettings.ts
+//
+// One definition of the "Global Trading Settings" form — defaults, validation
+// and the conversion to the PATCH payload — shared by
+// components/trading/trader-config-modal.tsx and
+// components/trading/risk-management-panel.tsx. Those two used to carry
+// separate copies of this logic that had already drifted apart.
+//
+// The limits mirror what backend/src/routes/traderConfig.route.ts enforces
+// (take profit and stop loss are decimals between 0 and 1, i.e. at most
+// 100%). A value the server would reject is caught here, so the user sees why
+// BEFORE saving instead of a save that silently doesn't happen.
+import type { TraderConfig } from "@hooks/useTraderConfig";
+
+type GlobalSettings = TraderConfig["globalSettings"];
+
+export interface GlobalSettingsForm {
+  minMarketCapSol: number;
+  /** Percent as typed by the user: 10 means +10%. */
+  takeProfitPct: number;
+  /** Percent as typed by the user: 30 means -30%. */
+  stopLossPct: number;
+  /** "" = not set; stored as 0 (buy as soon as a token passes the checks). */
+  minSecondsSinceLaunch: number | "";
+  autoTradeEnabled: boolean;
+  /**
+   * How many positions the bot may hold at once. The trading wallet's balance
+   * is split across them (balance / free slots), so this is a COUNT — not a
+   * SOL amount.
+   */
+  maxOpenPositions: number;
+  /** "" = unlimited. */
+  maxTotalTrades: number | "";
+}
+
+export type GlobalSettingsErrors = Partial<
+  Record<keyof GlobalSettingsForm, string>
+>;
+
+export const DEFAULT_GLOBAL_SETTINGS_FORM: GlobalSettingsForm = {
+  minMarketCapSol: 5,
+  takeProfitPct: 10,
+  stopLossPct: 30,
+  minSecondsSinceLaunch: "",
+  autoTradeEnabled: false,
+  // Matches the backend's default when a wallet has never chosen one.
+  maxOpenPositions: 5,
+  maxTotalTrades: "",
+};
+
+export const MAX_LAUNCH_AGE_SECONDS = 30 * 24 * 3600;
+export const MAX_TOTAL_TRADES_LIMIT = 100000;
+export const MAX_OPEN_POSITIONS_LIMIT = 50;
+// The backend checks a token's launch age once, a few seconds to ~40s after
+// the pool appears, and never comes back to it. A minimum age above this
+// therefore skips almost every token.
+export const LAUNCH_AGE_WARN_SECONDS = 10;
+
+const round = (n: number, digits: number) => Number(n.toFixed(digits));
+
+// x * 100 turns 0.07 into 7.000000000000001; rounding keeps the form clean.
+export const decimalToPercent = (d: number) => round(d * 100, 4);
+export const percentToDecimal = (p: number) => round(p / 100, 6);
+
+export function formFromSettings(
+  g?: GlobalSettings | null
+): GlobalSettingsForm {
+  const d = DEFAULT_GLOBAL_SETTINGS_FORM;
+  return {
+    minMarketCapSol: g?.minMarketCapSol ?? d.minMarketCapSol,
+    takeProfitPct:
+      g?.takeProfitPct != null
+        ? decimalToPercent(g.takeProfitPct)
+        : d.takeProfitPct,
+    stopLossPct:
+      g?.stopLossPct != null ? decimalToPercent(g.stopLossPct) : d.stopLossPct,
+    minSecondsSinceLaunch: g?.minSecondsSinceLaunch ?? "",
+    autoTradeEnabled: g?.autoTradeEnabled ?? false,
+    maxOpenPositions: g?.maxOpenPositions ?? d.maxOpenPositions,
+    maxTotalTrades: g?.maxTotalTrades ?? "",
+  };
+}
+
+/**
+ * Take profit / stop loss, as percentages. 0 would exit immediately (take
+ * profit at break-even, stop loss on any dip) and the server rejects anything
+ * above 100%. Shared with the per-token settings dialog.
+ */
+export function validateTakeProfitStopLoss(
+  takeProfitPct: number,
+  stopLossPct: number
+): { takeProfitPct?: string; stopLossPct?: string } {
+  const errors: { takeProfitPct?: string; stopLossPct?: string } = {};
+  if (
+    !Number.isFinite(takeProfitPct) ||
+    takeProfitPct <= 0 ||
+    takeProfitPct > 100
+  ) {
+    errors.takeProfitPct = "Enter a take profit above 0% and up to 100%";
+  }
+  if (!Number.isFinite(stopLossPct) || stopLossPct <= 0 || stopLossPct > 100) {
+    errors.stopLossPct = "Enter a stop loss above 0% and up to 100%";
+  }
+  return errors;
+}
+
+export function validateGlobalSettings(
+  f: GlobalSettingsForm
+): GlobalSettingsErrors {
+  const errors: GlobalSettingsErrors = {};
+
+  if (!Number.isFinite(f.minMarketCapSol) || f.minMarketCapSol < 0) {
+    errors.minMarketCapSol = "Enter a finite non-negative minimum market cap";
+  }
+
+  Object.assign(
+    errors,
+    validateTakeProfitStopLoss(f.takeProfitPct, f.stopLossPct)
+  );
+
+  if (f.minSecondsSinceLaunch !== "") {
+    const v = Number(f.minSecondsSinceLaunch);
+    if (!Number.isFinite(v) || v < 0 || v > MAX_LAUNCH_AGE_SECONDS) {
+      errors.minSecondsSinceLaunch =
+        "Enter 0 to 2,592,000 seconds (30 days), or leave blank";
+    }
+  }
+
+  if (
+    !Number.isInteger(f.maxOpenPositions) ||
+    f.maxOpenPositions < 1 ||
+    f.maxOpenPositions > MAX_OPEN_POSITIONS_LIMIT
+  ) {
+    errors.maxOpenPositions = `Enter a whole number from 1 to ${MAX_OPEN_POSITIONS_LIMIT}`;
+  }
+
+  if (f.maxTotalTrades !== "") {
+    const v = f.maxTotalTrades;
+    if (!Number.isFinite(v) || !Number.isInteger(v) || v <= 0) {
+      errors.maxTotalTrades =
+        "Enter a positive whole number, or leave blank for unlimited";
+    } else if (v > MAX_TOTAL_TRADES_LIMIT) {
+      errors.maxTotalTrades = "Must be 100000 or less";
+    }
+  }
+
+  return errors;
+}
+
+export function hasErrors(errors: GlobalSettingsErrors): boolean {
+  return Object.values(errors).some(Boolean);
+}
+
+/** A non-blocking warning: valid, but very likely not what the user wants. */
+export function launchAgeWarning(f: GlobalSettingsForm): string | null {
+  if (f.minSecondsSinceLaunch === "") return null;
+  const v = Number(f.minSecondsSinceLaunch);
+  if (!Number.isFinite(v) || v <= LAUNCH_AGE_WARN_SECONDS) return null;
+  return `Values above ${LAUNCH_AGE_WARN_SECONDS}s will skip most tokens: the bot checks each new token once, within seconds of launch, and doesn't come back to it. Leave blank to buy as soon as a token passes the checks.`;
+}
+
+export function toSettingsPayload(f: GlobalSettingsForm): GlobalSettings {
+  return {
+    minMarketCapSol: f.minMarketCapSol,
+    takeProfitPct: percentToDecimal(f.takeProfitPct),
+    stopLossPct: percentToDecimal(f.stopLossPct),
+    minSecondsSinceLaunch:
+      f.minSecondsSinceLaunch === "" ? 0 : Number(f.minSecondsSinceLaunch),
+    autoTradeEnabled: f.autoTradeEnabled,
+    maxOpenPositions: f.maxOpenPositions,
+    // null explicitly clears a previously-set cap (unlimited).
+    maxTotalTrades: f.maxTotalTrades === "" ? null : f.maxTotalTrades,
+  };
+}

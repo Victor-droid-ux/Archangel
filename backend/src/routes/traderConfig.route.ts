@@ -10,6 +10,7 @@ import {
 } from "../services/traderConfig.service.js";
 import { verifyWalletAuth } from "../utils/walletAuth.js";
 import dbService from "../services/db.service.js";
+import { MAX_OPEN_POSITIONS_LIMIT } from "../utils/positionSizing.js";
 
 const router = Router();
 const log = getLogger("traderConfig.route");
@@ -154,16 +155,29 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
       }
     }
 
-    if (
-      settings?.maxTradeAmountSol !== undefined &&
-      (typeof settings.maxTradeAmountSol !== "number" ||
-        !Number.isFinite(settings.maxTradeAmountSol) ||
-        settings.maxTradeAmountSol <= 0)
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: "maxTradeAmountSol must be a finite positive number",
-      });
+    // "Max Trade Amount (SOL)" no longer exists — the bot splits the trading
+    // wallet's balance across Max Open Positions instead (utils/
+    // positionSizing.ts). An older cached dashboard may still send the field;
+    // drop it rather than persisting a setting nothing reads.
+    if (settings && "maxTradeAmountSol" in settings) {
+      delete (settings as Record<string, unknown>).maxTradeAmountSol;
+    }
+
+    // Max Open Positions — a count of simultaneous positions, not an amount.
+    if (settings && "maxOpenPositions" in settings) {
+      const v = settings.maxOpenPositions;
+      if (
+        v !== undefined &&
+        (typeof v !== "number" ||
+          !Number.isInteger(v) ||
+          v < 1 ||
+          v > MAX_OPEN_POSITIONS_LIMIT)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: `maxOpenPositions must be a whole number between 1 and ${MAX_OPEN_POSITIONS_LIMIT}`,
+        });
+      }
     }
     if (
       settings?.autoTradeEnabled !== undefined &&

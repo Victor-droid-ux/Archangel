@@ -2,24 +2,16 @@
 import { Router, Request, Response } from "express";
 import { getLogger } from "../utils/logger.js";
 import userWalletService from "../services/userWallet.service.js";
+import dbService from "../services/db.service.js";
+import {
+  getMaxOpenPositions,
+  setAutoTradeEnabled,
+} from "../services/traderConfig.service.js";
+import { minBalanceForSlots, sizingEnv } from "../utils/positionSizing.js";
 import { verifyWalletAuth } from "../utils/walletAuth.js";
 
 const router = Router();
 const log = getLogger("userWallet.route");
-
-// Below this, AUTO_TRADE_PERCENT_OF_BALANCE sizing (validationPipeline.service.ts's
-// runPipeline, Stage 0) can never produce a trade that clears MIN_AUTO_TRADE_SOL, regardless of
-// auto-trade being enabled — e.g. 0.02 * balance >= 0.01 needs >= 0.5 SOL.
-// Exposed here so the frontend can tell a user this concretely, instead of
-// auto-trade silently never firing for an underfunded wallet.
-const AUTO_TRADE_PERCENT_OF_BALANCE = Number(
-  process.env.AUTO_TRADE_PERCENT_OF_BALANCE ?? 0.02
-);
-const MIN_AUTO_TRADE_SOL = Number(process.env.MIN_AUTO_TRADE_SOL ?? 0.003);
-const MIN_BALANCE_FOR_AUTO_TRADE_SOL =
-  AUTO_TRADE_PERCENT_OF_BALANCE > 0
-    ? MIN_AUTO_TRADE_SOL / AUTO_TRADE_PERCENT_OF_BALANCE
-    : MIN_AUTO_TRADE_SOL;
 
 /**
  * GET /api/user-wallet/:ownerWallet
@@ -30,12 +22,32 @@ router.get("/:ownerWallet", async (req: Request, res: Response) => {
   try {
     const { ownerWallet } = req.params;
     const result = await userWalletService.getUserWalletBalanceSol(
-      ownerWallet!
+      ownerWallet!,
     );
+
+    // What the dashboard needs to explain — concretely — whether the bot can
+    // open another position for this wallet: how many slots the trader
+    // allows, how many are in use, and the sizing floors. The split itself is
+    // computed from these (utils/positionSizing.ts), on both sides.
+    const [maxOpenPositions, openPositions] = await Promise.all([
+      getMaxOpenPositions(ownerWallet!),
+      dbService.getOpenPositionCount(ownerWallet!),
+    ]);
+    const { minTradeSol, feeReserveSol } = sizingEnv();
+
     return res.json({
       success: true,
       ...result,
-      minBalanceForAutoTradeSol: MIN_BALANCE_FOR_AUTO_TRADE_SOL,
+      maxOpenPositions,
+      openPositions,
+      minTradeSol,
+      feeReserveSol,
+      // Enough to open every one of the trader's slots at the minimum size.
+      minBalanceForAutoTradeSol: minBalanceForSlots(
+        maxOpenPositions,
+        minTradeSol,
+        feeReserveSol,
+      ),
     });
   } catch (err: any) {
     log.error({ err: err.message }, "Failed to load/create user wallet");
@@ -73,7 +85,7 @@ router.post("/:ownerWallet/withdraw", async (req: Request, res: Response) => {
 
     const result = await userWalletService.withdrawToOwner(
       verifiedWallet,
-      Number(amountSol)
+      Number(amountSol),
     );
     return res.json({ success: true, ...result });
   } catch (err: any) {
@@ -116,7 +128,7 @@ router.post(
       const io = (req.app as any).locals.io;
       const result = await userWalletService.stopAutoTradeAndLiquidate(
         verifiedWallet,
-        io
+        io,
       );
       return res.json({ success: true, ...result });
     } catch (err: any) {
@@ -126,7 +138,52 @@ router.post(
         error: err.message || "Stop auto-trade failed",
       });
     }
-  }
+  },
 );
+
+/**
+ * POST /api/user-wallet/:ownerWallet/auto-trade
+ * body: { enabled: boolean, walletAuthTimestamp, walletAuthSignature }
+ * Pauses or resumes auto-trading for this wallet WITHOUT selling anything
+ * and without touching any other saved setting. (stop-auto-trade above turns
+ * it off AND liquidates every bot position; this is the gentle version —
+ * open positions keep being managed by the exit monitor either way.)
+ */
+router.post("/:ownerWallet/auto-trade", async (req: Request, res: Response) => {
+  try {
+    const { ownerWallet } = req.params;
+    const { enabled, walletAuthTimestamp, walletAuthSignature } =
+      req.body ?? {};
+
+    if (typeof enabled !== "boolean") {
+      return res
+        .status(400)
+        .json({ success: false, error: "enabled must be true or false" });
+    }
+
+    const verifiedWallet = verifyWalletAuth({
+      wallet: ownerWallet,
+      timestamp: walletAuthTimestamp,
+      signature: walletAuthSignature,
+    });
+    if (!verifiedWallet) {
+      return res.status(401).json({
+        success: false,
+        error:
+          "Wallet signature required or invalid — sign the auth message with the connected wallet and retry.",
+      });
+    }
+
+    const io = (req.app as any).locals.io;
+    await setAutoTradeEnabled(verifiedWallet, enabled, io);
+    return res.json({ success: true, autoTradeEnabled: enabled });
+  } catch (err: any) {
+    log.error({ err: err.message }, "Failed to change auto-trade state");
+    return res.status(400).json({
+      success: false,
+      error: err.message || "Failed to change auto-trade state",
+    });
+  }
+});
 
 export default router;

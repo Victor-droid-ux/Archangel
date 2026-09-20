@@ -1,195 +1,119 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@components/ui/card";
 import { Switch } from "@components/ui/switch";
 import { Button } from "@components/ui/button";
 import { toast } from "react-hot-toast";
-import { useWallet } from "@hooks/useWallet";
-import { useRiskManagement } from "@hooks/useRiskManagement";
-import { useTradingConfigStore } from "@hooks/useConfig";
 import { useTraderConfig } from "@hooks/useTraderConfig";
 import { useSolPrice } from "@hooks/useSolPrice";
-import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
+import { useUserWallet } from "@hooks/useUserWallet";
+import { computePositionSize, describeSizing } from "@lib/positionSizing";
+import {
+  DEFAULT_GLOBAL_SETTINGS_FORM,
+  formFromSettings,
+  hasErrors,
+  launchAgeWarning,
+  toSettingsPayload,
+  validateGlobalSettings,
+  type GlobalSettingsForm,
+} from "@lib/globalSettings";
 import { TrendingUp, AlertTriangle, Shield } from "lucide-react";
 
-interface RiskManagementPanelProps {
-  onAmountChange?: (amount: number, lamports: number) => void;
-}
+const INPUT_CLASS =
+  "w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary";
 
-export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
-  onAmountChange,
-}) => {
-  const { balance } = useWallet();
-  const {
-    riskPercent,
-    riskAmount,
-    setRiskPercent,
-    setRiskAmount,
-    tradeAmountLamports,
-    recommendation,
-  } = useRiskManagement();
-
-  const { saveConfig, syncConfig, loadConfig, loadConfigFromAPI } =
-    useTradingConfigStore();
-  const { publicKey, signMessage } = useSolanaWallet();
-
+export const RiskManagementPanel: React.FC = () => {
   // Global, per-wallet auto-trade rules — the real settings the bot's
-  // execution engine reads (see multiUserExecution.service.ts), as opposed
-  // to the trading-config store above, which is display-only.
-  const { config, updateGlobalSettings, loading } = useTraderConfig();
+  // execution engine reads (see multiUserExecution.service.ts).
+  const { config, updateGlobalSettings, loading, loadError, refetch } =
+    useTraderConfig();
+  // The bot trades from this custodial wallet, NOT the wallet connected to
+  // the dashboard — so its balance is the one that decides what a buy looks
+  // like. (The panel used to use the connected wallet's balance here.)
+  const { balanceSol, openPositions, minTradeSol, feeReserveSol } =
+    useUserWallet();
   const solPriceUsd = useSolPrice();
 
-  const [formData, setFormData] = useState({
-    minMarketCapSol: 5,
-    takeProfitPct: 10,
-    stopLossPct: 30,
-    minSecondsSinceLaunch: "" as number | "",
-    autoTradeEnabled: false,
-    maxTradeAmountSol: 1,
-    // "" means unlimited (cleared/never set) — distinct from 0, which would
-    // read as "take zero trades" rather than "no cap".
-    maxTotalTrades: "" as number | "",
-  });
+  const [formData, setFormData] = useState<GlobalSettingsForm>(
+    DEFAULT_GLOBAL_SETTINGS_FORM
+  );
   const [saving, setSaving] = useState(false);
+  // True once the user has touched a field, so a config broadcast doesn't
+  // overwrite what they're typing.
+  const dirty = useRef(false);
+
+  // Whether the form has been filled from the saved settings yet. Until it
+  // has, incoming settings always win: anything typed before they arrived was
+  // typed over defaults, and saving that would overwrite the real settings.
+  const hydrated = useRef(false);
 
   useEffect(() => {
-    if (config?.globalSettings) {
-      const g = config.globalSettings;
-      setFormData({
-        minMarketCapSol: g.minMarketCapSol ?? 5,
-        takeProfitPct: (g.takeProfitPct ?? 0.1) * 100,
-        stopLossPct: (g.stopLossPct ?? 0.3) * 100,
-        minSecondsSinceLaunch: g.minSecondsSinceLaunch ?? "",
-        autoTradeEnabled: g.autoTradeEnabled ?? false,
-        maxTradeAmountSol: g.maxTradeAmountSol ?? 1,
-        maxTotalTrades: g.maxTotalTrades ?? "",
-      });
+    if (!config?.globalSettings) {
+      hydrated.current = false; // wallet switched / not loaded
+      return;
+    }
+    if (!hydrated.current || !dirty.current) {
+      setFormData(formFromSettings(config.globalSettings));
+      hydrated.current = true;
+      dirty.current = false;
     }
   }, [config]);
 
-  // A minimum launch age is required before auto-trading can start.
-  const launchWindowError =
-    formData.minSecondsSinceLaunch === "" ||
-    !Number.isFinite(Number(formData.minSecondsSinceLaunch)) ||
-    Number(formData.minSecondsSinceLaunch) < 0 ||
-    Number(formData.minSecondsSinceLaunch) > 30 * 24 * 3600
-      ? "Set a minimum launch age between 0 and 30 days"
+  const setField = <K extends keyof GlobalSettingsForm>(
+    key: K,
+    value: GlobalSettingsForm[K]
+  ) => {
+    dirty.current = true;
+    setFormData((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const errors = validateGlobalSettings(formData);
+  const launchWarning = launchAgeWarning(formData);
+  const loaded = config != null;
+
+  // What the split means for the wallet as it is right now.
+  const sizing =
+    !errors.maxOpenPositions &&
+    balanceSol != null &&
+    minTradeSol != null &&
+    feeReserveSol != null
+      ? computePositionSize({
+          balanceSol,
+          openPositions: openPositions ?? 0,
+          maxOpenPositions: formData.maxOpenPositions,
+          minTradeSol,
+          feeReserveSol,
+        })
       : null;
-
-  // Blank ("") means unlimited and is always valid — only a filled-in value
-  // needs to be a real positive whole number.
-  const maxTotalTradesError =
-    formData.maxTotalTrades === ""
-      ? null
-      : !Number.isFinite(formData.maxTotalTrades) ||
-          !Number.isInteger(formData.maxTotalTrades) ||
-          formData.maxTotalTrades <= 0
-        ? "Enter a positive whole number, or leave blank for unlimited"
-        : formData.maxTotalTrades > 100000
-          ? "Must be 100000 or less"
-          : null;
-
-  const maxTradeAmountError =
-    !Number.isFinite(formData.maxTradeAmountSol) ||
-    formData.maxTradeAmountSol <= 0
-      ? "Enter a finite positive trade amount"
-      : null;
-
-  const minMarketCapError =
-    !Number.isFinite(formData.minMarketCapSol) || formData.minMarketCapSol < 0
-      ? "Enter a finite non-negative minimum market cap"
-      : null;
-
-  // Local config first (fast, always available), then reconcile with this
-  // wallet's cloud-saved settings once it's connected — cloud wins for a
-  // returning wallet since that's the source of truth across devices.
-  // Re-runs on every wallet change (not just mount) — otherwise switching
-  // from Wallet A to Wallet B in the same browser session would leave A's
-  // values in the live store until/unless B happens to have cloud-saved
-  // settings that overwrite every field.
-  React.useEffect(() => {
-    loadConfig?.(publicKey?.toString());
-  }, [publicKey, loadConfig]);
-
-  React.useEffect(() => {
-    if (publicKey) {
-      loadConfigFromAPI?.(publicKey.toString());
-    }
-  }, [publicKey, loadConfigFromAPI]);
+  const sizingNote = describeSizing(sizing, balanceSol);
+  const nextBuySol = sizing?.status === "ready" ? sizing.buySol : null;
 
   const handleSave = async () => {
-    if (
-      launchWindowError ||
-      maxTotalTradesError ||
-      maxTradeAmountError ||
-      minMarketCapError
-    )
-      return;
+    if (hasErrors(errors) || !loaded) return;
     setSaving(true);
     try {
-      await updateGlobalSettings({
-        minMarketCapSol: formData.minMarketCapSol,
-        takeProfitPct: formData.takeProfitPct / 100,
-        stopLossPct: formData.stopLossPct / 100,
-        minSecondsSinceLaunch: Number(formData.minSecondsSinceLaunch),
-        autoTradeEnabled: formData.autoTradeEnabled,
-        maxTradeAmountSol: formData.maxTradeAmountSol,
-        maxTotalTrades:
-          formData.maxTotalTrades === "" ? null : formData.maxTotalTrades,
-      });
-      saveConfig?.(publicKey?.toString());
-      if (publicKey) {
-        await syncConfig?.(publicKey.toString(), signMessage);
-      }
+      await updateGlobalSettings(toSettingsPayload(formData));
+      dirty.current = false;
       toast.success("✅ Settings saved!");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to save settings:", err);
-      toast.error("❌ Failed to save settings.");
+      toast.error(
+        `❌ Couldn't save settings: ${err?.message || "unknown error"}`
+      );
     } finally {
       setSaving(false);
     }
   };
 
-  const handleLoadCloud = async () => {
-    try {
-      if (!publicKey) {
-        toast.error("⚠️ Please connect your wallet first.");
-        return;
-      }
-      await loadConfigFromAPI?.(publicKey.toString());
-      toast.success("☁️ Config loaded from cloud!");
-    } catch {
-      toast.error("⚠️ Failed to load from cloud.");
+  const handleReload = async () => {
+    dirty.current = false;
+    const ok = await refetch();
+    if (ok) {
+      toast.success("Reloaded your saved settings");
+    } else {
+      toast.error("⚠️ Couldn't reload your saved settings.");
     }
-  };
-
-  // Notify parent when risk amount changes
-  React.useEffect(() => {
-    if (onAmountChange && riskAmount > 0) {
-      onAmountChange(riskAmount, tradeAmountLamports);
-    }
-  }, [riskAmount, tradeAmountLamports, onAmountChange]);
-
-  const handlePresetClick = (
-    preset: "conservative" | "moderate" | "aggressive"
-  ) => {
-    if (!recommendation) return;
-
-    const amount = recommendation[preset];
-    setRiskAmount(amount);
-  };
-
-  const getRiskColor = () => {
-    if (riskPercent <= 2) return "text-green-400";
-    if (riskPercent <= 5) return "text-yellow-400";
-    return "text-red-400";
-  };
-
-  const getRiskLevel = () => {
-    if (riskPercent <= 2) return "Conservative";
-    if (riskPercent <= 5) return "Moderate";
-    return "Aggressive";
   };
 
   return (
@@ -205,42 +129,46 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
       </CardHeader>
 
       <CardContent className="space-y-4">
+        {loadError && !loaded && (
+          <div className="flex items-start justify-between gap-3 p-2.5 bg-red-900/20 border border-red-500/30 rounded-lg">
+            <div className="text-xs text-red-300">
+              <strong>Couldn&apos;t load your saved settings:</strong>{" "}
+              {loadError}. Saving is disabled so the defaults shown here
+              can&apos;t overwrite them.
+            </div>
+            <Button variant="outline" size="sm" onClick={handleReload}>
+              Retry
+            </Button>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {/* Risk Input Options */}
-          <div className="p-2.5 bg-base-300 rounded-lg grid grid-cols-2 gap-2">
-            <div>
-              <label className="text-xs text-gray-400 mb-0.5 block">
-                Risk %
-              </label>
-              <input
-                type="number"
-                min="0.1"
-                max="100"
-                step="0.1"
-                value={riskPercent || ""}
-                onChange={(e) => setRiskPercent(Number(e.target.value))}
-                className="w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-                placeholder="%"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-gray-400 mb-0.5 block">
-                Fixed (SOL)
-              </label>
-              <input
-                type="number"
-                min="0.001"
-                max={balance}
-                step="0.001"
-                value={riskAmount || ""}
-                onChange={(e) => setRiskAmount(Number(e.target.value))}
-                className="w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-                placeholder="Amount"
-              />
-            </div>
+          {/* Max Open Positions — how many positions at once; the balance is
+              split across them */}
+          <div className="p-2.5 bg-base-300 rounded-lg">
+            <label className="text-xs text-gray-400 mb-0.5 block">
+              Max Open Positions
+            </label>
+            <input
+              type="number"
+              min="1"
+              max="50"
+              step="1"
+              value={formData.maxOpenPositions}
+              onChange={(e) =>
+                setField("maxOpenPositions", Number(e.target.value))
+              }
+              className={INPUT_CLASS}
+              placeholder="e.g. 5"
+            />
+            {errors.maxOpenPositions && (
+              <p className="text-xs text-red-500 mt-0.5">
+                {errors.maxOpenPositions}
+              </p>
+            )}
           </div>
 
-          {/* Market Cap Range */}
+          {/* Min Market Cap */}
           <div className="p-2.5 bg-base-300 rounded-lg">
             <label className="text-xs text-gray-400 mb-0.5 block">
               Min Market Cap (SOL)
@@ -249,12 +177,9 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
               type="number"
               value={formData.minMarketCapSol}
               onChange={(e) =>
-                setFormData({
-                  ...formData,
-                  minMarketCapSol: Number(e.target.value),
-                })
+                setField("minMarketCapSol", Number(e.target.value))
               }
-              className="w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className={INPUT_CLASS}
               min="0"
               step="1"
             />
@@ -263,8 +188,10 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
                 ~${(formData.minMarketCapSol * solPriceUsd).toLocaleString()}
               </p>
             )}
-            {minMarketCapError && (
-              <p className="text-xs text-red-500 mt-0.5">{minMarketCapError}</p>
+            {errors.minMarketCapSol && (
+              <p className="text-xs text-red-500 mt-0.5">
+                {errors.minMarketCapSol}
+              </p>
             )}
           </div>
 
@@ -278,15 +205,18 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
                 type="number"
                 value={formData.takeProfitPct}
                 onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    takeProfitPct: Number(e.target.value),
-                  })
+                  setField("takeProfitPct", Number(e.target.value))
                 }
-                className="w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                className={INPUT_CLASS}
                 min="0"
+                max="100"
                 step="1"
               />
+              {errors.takeProfitPct && (
+                <p className="text-xs text-red-500 mt-0.5">
+                  {errors.takeProfitPct}
+                </p>
+              )}
             </div>
             <div>
               <label className="text-xs text-gray-400 mb-0.5 block">
@@ -296,15 +226,18 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
                 type="number"
                 value={formData.stopLossPct}
                 onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    stopLossPct: Number(e.target.value),
-                  })
+                  setField("stopLossPct", Number(e.target.value))
                 }
-                className="w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                className={INPUT_CLASS}
                 min="0"
+                max="100"
                 step="0.5"
               />
+              {errors.stopLossPct && (
+                <p className="text-xs text-red-500 mt-0.5">
+                  {errors.stopLossPct}
+                </p>
+              )}
             </div>
           </div>
         </div>
@@ -313,24 +246,33 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
           {/* Minimum Launch Age */}
           <div className="p-2.5 bg-base-300 rounded-lg">
             <label className="text-xs text-gray-400 mb-0.5 block">
-              Min Launch Age (seconds)
+              Min Launch Age (seconds){" "}
+              <span className="text-gray-500">optional</span>
             </label>
             <input
               type="number"
               value={formData.minSecondsSinceLaunch}
               onChange={(e) =>
-                setFormData({
-                  ...formData,
-                  minSecondsSinceLaunch: Number(e.target.value),
-                })
+                setField(
+                  "minSecondsSinceLaunch",
+                  e.target.value === "" ? "" : Number(e.target.value)
+                )
               }
-              className="w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className={INPUT_CLASS}
               min="0"
               step="1"
-              placeholder="Seconds"
+              placeholder="None — buy immediately"
             />
-            {launchWindowError && (
-              <p className="text-xs text-red-500 mt-0.5">{launchWindowError}</p>
+            {errors.minSecondsSinceLaunch ? (
+              <p className="text-xs text-red-500 mt-0.5">
+                {errors.minSecondsSinceLaunch}
+              </p>
+            ) : (
+              launchWarning && (
+                <p className="text-xs text-yellow-400 mt-0.5">
+                  {launchWarning}
+                </p>
+              )
             )}
           </div>
 
@@ -343,21 +285,26 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
               type="number"
               value={formData.maxTotalTrades}
               onChange={(e) =>
-                setFormData({
-                  ...formData,
-                  maxTotalTrades:
-                    e.target.value === "" ? "" : Number(e.target.value),
-                })
+                setField(
+                  "maxTotalTrades",
+                  e.target.value === "" ? "" : Number(e.target.value)
+                )
               }
-              className="w-full px-2 py-1 bg-base-100 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className={INPUT_CLASS}
               min="1"
               step="1"
               placeholder="Unlimited"
             />
-            {maxTotalTradesError && (
+            {errors.maxTotalTrades ? (
               <p className="text-xs text-red-500 mt-0.5">
-                {maxTotalTradesError}
+                {errors.maxTotalTrades}
               </p>
+            ) : (
+              config?.tradesTaken != null && (
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {config.tradesTaken} taken so far (closed trades count)
+                </p>
+              )
             )}
           </div>
 
@@ -366,109 +313,70 @@ export const RiskManagementPanel: React.FC<RiskManagementPanelProps> = ({
             <span className="text-sm text-gray-400">Enable Auto Trading</span>
             <Switch
               checked={formData.autoTradeEnabled}
-              onCheckedChange={(value) =>
-                setFormData({ ...formData, autoTradeEnabled: value })
+              onCheckedChange={(value: boolean) =>
+                setField("autoTradeEnabled", value)
               }
             />
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          {/* Quick Presets */}
-          {recommendation && (
-            <div className="p-2.5 bg-base-300 rounded-lg">
-              <div className="text-sm text-gray-400 mb-1">Quick Presets</div>
-              <div className="grid grid-cols-3 gap-2">
-                <button
-                  onClick={() => handlePresetClick("conservative")}
-                  className="px-2 py-1.5 bg-green-600 hover:bg-green-500 text-white text-xs rounded-lg transition-colors"
-                >
-                  Conservative
-                  <div className="text-xs opacity-75">
-                    {recommendation.conservative.toFixed(3)} SOL
-                  </div>
-                </button>
-                <button
-                  onClick={() => handlePresetClick("moderate")}
-                  className="px-2 py-1.5 bg-yellow-600 hover:bg-yellow-500 text-white text-xs rounded-lg transition-colors"
-                >
-                  Moderate
-                  <div className="text-xs opacity-75">
-                    {recommendation.moderate.toFixed(3)} SOL
-                  </div>
-                </button>
-                <button
-                  onClick={() => handlePresetClick("aggressive")}
-                  className="px-2 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs rounded-lg transition-colors"
-                >
-                  Aggressive
-                  <div className="text-xs opacity-75">
-                    {recommendation.aggressive.toFixed(3)} SOL
-                  </div>
-                </button>
-              </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {/* What a buy will actually be */}
+          <div className="p-2.5 bg-base-300 rounded-lg border border-primary/20">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-sm text-gray-400">
+                Trading wallet balance
+              </span>
+              <span className="text-sm text-white">
+                {balanceSol != null ? `${balanceSol.toFixed(4)} SOL` : "—"}
+              </span>
             </div>
-          )}
-
-          {/* Risk Summary */}
-          {riskAmount > 0 && (
-            <div className="p-2.5 bg-base-300 rounded-lg border border-primary/20">
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-sm text-gray-400">Trade Amount</span>
-                <span className="text-lg font-bold text-primary">
-                  {riskAmount.toFixed(4)} SOL
-                </span>
-              </div>
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-sm text-gray-400">Risk Level</span>
-                <span className={`text-sm font-semibold ${getRiskColor()}`}>
-                  {getRiskLevel()} ({riskPercent.toFixed(2)}%)
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-sm text-gray-400">Remaining Balance</span>
-                <span className="text-sm text-white">
-                  {(balance - riskAmount).toFixed(4)} SOL
-                </span>
-              </div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-sm text-gray-400">Open positions</span>
+              <span className="text-sm text-white">
+                {openPositions != null ? openPositions : "—"} /{" "}
+                {Number.isInteger(formData.maxOpenPositions)
+                  ? formData.maxOpenPositions
+                  : "—"}
+              </span>
             </div>
-          )}
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-gray-400">Next position</span>
+              <span className="text-lg font-bold text-primary">
+                {nextBuySol != null ? `${nextBuySol.toFixed(4)} SOL` : "—"}
+              </span>
+            </div>
+          </div>
 
-          {/* Risk Warning / Info */}
-          {riskPercent > 10 ? (
+          {/* Warning / Info */}
+          {sizingNote?.tone === "warn" ? (
             <div className="flex items-start gap-2 p-2.5 bg-red-900/20 border border-red-500/30 rounded-lg">
               <AlertTriangle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
-              <div className="text-xs text-red-300">
-                <strong>High Risk Warning:</strong> Trading more than 10% of
-                your balance per trade significantly increases your risk of
-                loss.
-              </div>
+              <div className="text-xs text-red-300">{sizingNote.text}</div>
             </div>
           ) : (
             <div className="flex items-start gap-2 p-2.5 bg-blue-900/20 border border-blue-500/30 rounded-lg">
               <TrendingUp className="w-4 h-4 text-blue-400 flex-shrink-0 mt-0.5" />
               <div className="text-xs text-blue-300">
-                Set either a percentage of your balance or a fixed amount per
-                trade.
+                The bot splits your trading wallet&apos;s balance across up to{" "}
+                {Number.isInteger(formData.maxOpenPositions)
+                  ? formData.maxOpenPositions
+                  : "N"}{" "}
+                open positions, and stops opening new ones when they&apos;re all
+                in use or the balance runs low.
+                {sizingNote ? ` ${sizingNote.text}` : ""}
               </div>
             </div>
           )}
         </div>
 
         <div className="flex items-center justify-end gap-3">
-          <Button variant="outline" onClick={handleLoadCloud}>
-            Load Config from Cloud
+          <Button variant="outline" onClick={handleReload}>
+            Reload saved settings
           </Button>
           <Button
             onClick={handleSave}
-            disabled={
-              saving ||
-              loading ||
-              !!launchWindowError ||
-              !!maxTotalTradesError ||
-              !!maxTradeAmountError ||
-              !!minMarketCapError
-            }
+            disabled={saving || loading || !loaded || hasErrors(errors)}
           >
             {saving ? "Saving..." : "Save Settings"}
           </Button>

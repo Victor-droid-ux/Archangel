@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useRef } from "react";
+import React, { useCallback, useEffect, useState, useRef } from "react";
 import {
   Sparkles,
   ArrowUpRight,
@@ -8,7 +8,7 @@ import {
   Settings2,
 } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
-import { useSocket } from "@hooks/useSocket";
+import { useSocketEvent } from "@hooks/useSocketEvent";
 import { fetcher, formatNumber, formatPrice } from "@lib/utils";
 import { TokenConfigModal } from "@components/trading/token-config-modal";
 
@@ -41,22 +41,22 @@ export const NewTokens = () => {
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
   const [lifecycleSummary, setLifecycleSummary] = useState<any>(null);
 
-  const { lastMessage } = useSocket();
-
   // A token enters this list only after the backend records its Phase 4
   // approval. The legacy tokenFeed can include unqualified candidates.
-  useEffect(() => {
-    fetcher("/api/tokens/approved-candidates").then((res) =>
-      setTokens(res.tokens || [])
-    );
+  const loadApproved = useCallback(() => {
+    fetcher("/api/tokens/approved-candidates")
+      .then((res) => setTokens(res.tokens || []))
+      .catch((err) => console.warn("Failed to load approved candidates:", err));
   }, []);
 
   useEffect(() => {
-    if (lastMessage?.event !== "candidate:approved") return;
-    fetcher("/api/tokens/approved-candidates").then((res) =>
-      setTokens(res.tokens || [])
-    );
-  }, [lastMessage]);
+    loadApproved();
+  }, [loadApproved]);
+
+  // Refresh when the backend approves a new candidate. Subscribed directly:
+  // candidate:* events never reached useSocket()'s lastMessage, so this list
+  // used to refresh only on page load.
+  useSocketEvent("candidate:approved", loadApproved);
 
   return (
     <Card className="bg-base-200 rounded-xl shadow p-4">
@@ -191,7 +191,11 @@ export const NewTokens = () => {
 
                   <td className="py-2 px-4 text-center">
                     <button
-                      onClick={() => {
+                      onClick={(e) => {
+                        // The whole row navigates to the token page on click;
+                        // without this the click also bubbled there and
+                        // left the page before the modal could be used.
+                        e.stopPropagation();
                         setSelectedToken(t);
                         setIsConfigModalOpen(true);
                       }}

@@ -4,6 +4,9 @@ import { getLatestTokens } from "../services/tokenPrice.service.js";
 import dbService from "../services/db.service.js";
 import { poolMonitor } from "../services/poolMonitor.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
+import { verifyWalletAuth } from "../utils/walletAuth.js";
+import { issueSocketToken, verifySocketToken } from "../utils/socketSession.js";
+import { normalizeWalletAddress } from "../services/solana.service.js";
 import {
   startWalletBalanceSync,
   stopWalletBalanceSync,
@@ -83,13 +86,78 @@ export function registerSocketHandlers(io: Server) {
 
     /**
      * WALLET IDENTIFICATION
-     * Client sends wallet address to register for auto-trading
+     * Client registers this socket for one wallet's private events (its
+     * trades, balance, buy-failure reasons, settings changes...).
+     *
+     * This MUST be authenticated. It used to accept any wallet address as-is,
+     * so anyone could join any wallet's private room and read its activity,
+     * and every unauthenticated identify started a 5-second RPC balance loop
+     * — a cheap way to exhaust the RPC quota. Now the client proves control
+     * of the wallet with either
+     *   - { wallet, walletAuthTimestamp, walletAuthSignature }: the same
+     *     signed message the REST API uses (utils/walletAuth.ts), or
+     *   - { wallet, token }: a session token issued by a previous successful
+     *     identify, so reconnects don't need another wallet popup
+     *     (utils/socketSession.ts).
+     * A successful signature identify is answered with a fresh token.
      */
     socket.on("identify", async (payload: any) => {
       try {
-        const { wallet, balanceSol, autoMode } = payload || {};
-        if (!wallet) {
-          logger.warn("identify event without wallet address");
+        const {
+          wallet: claimedWallet,
+          token,
+          walletAuthTimestamp,
+          walletAuthSignature,
+          autoMode,
+        } = payload || {};
+
+        const reject = (error: string) => {
+          // A socket that keeps failing is probing, not a dashboard that
+          // needs to sign again — cut it off.
+          socket.data.identifyFailures =
+            (socket.data.identifyFailures ?? 0) + 1;
+          logger.warn(
+            {
+              socketId: socket.id,
+              error,
+              failures: socket.data.identifyFailures,
+            },
+            "identify rejected",
+          );
+          socket.emit("identified", { success: false, error });
+          if (socket.data.identifyFailures >= 5) socket.disconnect(true);
+        };
+
+        if (typeof claimedWallet !== "string" || !claimedWallet) {
+          return reject("wallet_required");
+        }
+
+        let wallet: string;
+        try {
+          wallet = normalizeWalletAddress(claimedWallet);
+        } catch {
+          return reject("invalid_wallet");
+        }
+
+        let issued: { token: string; expiresAt: number } | undefined;
+        if (!verifySocketToken(wallet, token)) {
+          const verified = verifyWalletAuth({
+            wallet,
+            timestamp: walletAuthTimestamp,
+            signature: walletAuthSignature,
+          });
+          if (!verified) return reject("auth_required");
+          issued = issueSocketToken(wallet);
+        }
+
+        // Already identified as this wallet on this very socket (a dashboard
+        // re-announcing itself): nothing to redo, just re-acknowledge.
+        if (socket.data.wallet === wallet) {
+          socket.emit("identified", {
+            wallet,
+            success: true,
+            ...(issued && { token: issued.token, expiresAt: issued.expiresAt }),
+          });
           return;
         }
 
@@ -120,9 +188,10 @@ export function registerSocketHandlers(io: Server) {
           logger.info(
             `🆕 Starting balance sync for wallet ${wallet.slice(0, 8)}...`,
           );
+          // The balance is always read server-side — a client-supplied
+          // starting balance is no longer trusted or accepted.
           await startWalletBalanceSync(io, wallet, socket.id, {
             intervalMs: 5000, // Sync every 5 seconds
-            initialBalance: balanceSol || undefined,
           });
         }
 
@@ -136,8 +205,14 @@ export function registerSocketHandlers(io: Server) {
           `Socket identified for wallet`,
         );
 
-        // Acknowledge identification
-        socket.emit("identified", { wallet, success: true });
+        // Acknowledge identification (with a session token when this
+        // identify was proven by signature, so the client can reconnect
+        // without signing again).
+        socket.emit("identified", {
+          wallet,
+          success: true,
+          ...(issued && { token: issued.token, expiresAt: issued.expiresAt }),
+        });
       } catch (err: any) {
         logger.error(
           { err: err?.message ?? String(err) },
@@ -178,20 +253,11 @@ export function registerSocketHandlers(io: Server) {
       }
     });
 
-    /**
-     * TOKEN DISCOVERY LIVE UPDATES
-     */
-    socket.on("tokenFeed", (payload) => {
-      logger.info("🔄 tokenFeed update");
-      io.emit("tokenFeed", payload);
-    });
-
-    /**
-     * PRICE STREAM PASS-THROUGH
-     */
-    socket.on("priceUpdate", (payload) => {
-      io.emit("priceUpdate", payload);
-    });
+    // "tokenFeed" and "priceUpdate" used to be re-broadcast to EVERY
+    // connected client exactly as a client sent them — so any visitor could
+    // inject fake tokens and prices into every open dashboard. Only the
+    // server emits those events now (tokenPrice / monitor services), so
+    // there is deliberately no client -> everyone relay here.
 
     /**
      * FRONTEND CAN REQUEST CURRENT STATS — scoped to this socket's own
@@ -256,17 +322,18 @@ export function registerSocketHandlers(io: Server) {
     /**
      * WATCHLIST REQUEST
      */
-    socket.on(
-      "watchlist:request",
-      async (payload: { userId?: string } = {}) => {
-        try {
-          const watchlist = await dbService.getWatchlist(payload.userId);
-          socket.emit("watchlist:update", watchlist);
-        } catch (err: any) {
-          logger.error("Failed to fetch watchlist:", err?.message);
-        }
-      },
-    );
+    socket.on("watchlist:request", async () => {
+      try {
+        // Only the identified wallet's own list — the client-supplied
+        // userId used to be trusted, letting any socket read anyone's.
+        const watchlist = socket.data?.wallet
+          ? await dbService.getWatchlist(socket.data.wallet)
+          : [];
+        socket.emit("watchlist:update", watchlist);
+      } catch (err: any) {
+        logger.error("Failed to fetch watchlist:", err?.message);
+      }
+    });
 
     /** DISCONNECT */
     socket.on("disconnect", (reason) => {

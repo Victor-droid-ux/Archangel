@@ -1,11 +1,12 @@
 "use client";
 
-import React, { useEffect } from "react";
+import React, { useRef } from "react";
 import useSWR from "swr";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
 import { fetcher, formatPrice } from "@lib/utils";
 import { Loader2 } from "lucide-react";
 import { useSocket } from "@hooks/useSocket";
+import { useSocketEvent } from "@hooks/useSocketEvent";
 
 // Shared type from backend socket payload (see tokenPrice.service.ts's
 // TokenInfo — the field is priceChange24h, there is no "pnl" field)
@@ -33,24 +34,29 @@ export default function TokenTable() {
     }
   );
 
-  const { lastMessage, connected } = useSocket();
+  const { connected } = useSocket();
 
   /** SOCKET — realtime token refresh */
-  useEffect(() => {
-    if (!lastMessage?.event) return;
-    if (
-      ![
-        "token_prices",
-        "candidate:detected",
-        "candidate:tradeable",
-        "candidate:filtered_out",
-        "candidate:approved",
-      ].includes(lastMessage.event)
-    )
-      return;
-
-    mutate(); // 🔄 Update SWR cache live
-  }, [lastMessage, mutate]);
+  // Subscribed directly: none of these events were ever forwarded into
+  // useSocket()'s lastMessage, so this only ever refreshed on the 10s poll.
+  // candidate:detected fires for every new pool (every few seconds), so
+  // refreshes are throttled to one per 3s.
+  const lastRefreshAt = useRef(0);
+  useSocketEvent(
+    [
+      "token_prices",
+      "candidate:detected",
+      "candidate:tradeable",
+      "candidate:filtered_out",
+      "candidate:approved",
+    ],
+    () => {
+      const now = Date.now();
+      if (now - lastRefreshAt.current < 3000) return;
+      lastRefreshAt.current = now;
+      mutate(); // 🔄 Update SWR cache live
+    }
+  );
 
   if (isLoading)
     return (

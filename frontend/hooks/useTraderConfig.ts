@@ -1,11 +1,12 @@
 // frontend/hooks/useTraderConfig.ts
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { socket } from "@lib/socket";
 import { useWallet } from "./useWallet";
 import { ENV } from "@lib/constant";
 import { signWalletAuth } from "@lib/walletAuth";
+import { callConfigApi } from "@lib/configApi";
 
 export interface TraderConfig {
   walletAddress: string;
@@ -16,7 +17,9 @@ export interface TraderConfig {
     minSecondsSinceLaunch?: number;
     minTokenScore?: number;
     autoTradeEnabled?: boolean;
-    maxTradeAmountSol?: number;
+    // How many positions the bot may hold at once; the trading wallet's
+    // balance is split across them. A count, not a SOL amount.
+    maxOpenPositions?: number;
     // null explicitly clears a previously-set cap (unlimited); undefined
     // just means "not included in this update".
     maxTotalTrades?: number | null;
@@ -43,34 +46,62 @@ export function useTraderConfig() {
   const { signMessage } = useSolanaWallet();
   const [config, setConfig] = useState<TraderConfig | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // The wallet this hook instance is currently serving; lets an in-flight
+  // response for a previous wallet be dropped instead of overwriting the new
+  // wallet's config.
+  const activeWallet = useRef<string | null>(null);
+
+  const applyConfig = useCallback((next: TraderConfig) => {
+    // Write responses and socket broadcasts carry the stored config only;
+    // `tradesTaken` is added by the GET route. Keep the last known value
+    // rather than letting every save/broadcast erase it.
+    setConfig((prev) => ({
+      ...next,
+      tradesTaken: next.tradesTaken ?? prev?.tradesTaken,
+    }));
+  }, []);
+
+  /** Re-reads the saved config. Resolves true on success. */
+  const fetchConfig = useCallback(async (): Promise<boolean> => {
+    const wallet = activeWallet.current;
+    if (!wallet) return false;
+    try {
+      const data = await callConfigApi(
+        `${ENV.API_BASE_URL}/trader-config/${wallet}`
+      );
+      if (activeWallet.current !== wallet) return false;
+      applyConfig(data.config);
+      setLoadError(null);
+      return true;
+    } catch (err: any) {
+      if (activeWallet.current !== wallet) return false;
+      console.error("Failed to fetch trader config:", err);
+      setLoadError(err?.message || "Couldn't load your saved settings.");
+      return false;
+    }
+  }, [applyConfig]);
 
   // Fetch config when wallet connects
   useEffect(() => {
+    activeWallet.current = publicKey;
+    setConfig(null);
+    setLoadError(null);
     if (!publicKey) {
-      setConfig(null);
+      setLoading(false);
       return;
     }
 
     const walletAddress = publicKey;
-
     setLoading(true);
-    fetch(`${ENV.API_BASE_URL}/trader-config/${walletAddress}`)
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.success) {
-          setConfig(data.config);
-        }
-      })
-      .catch((err) => console.error("Failed to fetch trader config:", err))
-      .finally(() => setLoading(false));
+    fetchConfig().finally(() => {
+      if (activeWallet.current === walletAddress) setLoading(false);
+    });
 
-    // Listen for config updates. Named handler + matching off() below: this
-    // hook is used by two separate modals (trader-config-modal.tsx,
-    // token-config-modal.tsx), and an unqualified socket.off("traderConfig:updated")
-    // would strip the other modal's still-mounted listener too.
-    const handleConfigUpdate = (updatedConfig: TraderConfig) => {
-      if (updatedConfig.walletAddress === walletAddress) {
-        setConfig(updatedConfig);
+    // Listen for real-time config updates
+    const handleConfigUpdate = (updated: TraderConfig) => {
+      if (updated.walletAddress === walletAddress) {
+        applyConfig(updated);
       }
     };
     socket.on("traderConfig:updated", handleConfigUpdate);
@@ -78,118 +109,89 @@ export function useTraderConfig() {
     return () => {
       socket.off("traderConfig:updated", handleConfigUpdate);
     };
-  }, [publicKey]);
+  }, [publicKey, fetchConfig, applyConfig]);
 
-  // Update global settings
-  const updateGlobalSettings = async (
-    settings: TraderConfig["globalSettings"]
-  ) => {
-    if (!publicKey) return null;
-
-    const walletAddress = publicKey;
-
-    try {
-      const auth = await signWalletAuth(signMessage, walletAddress);
-      const response = await fetch(
-        `${ENV.API_BASE_URL}/trader-config/${walletAddress}/global`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...settings, ...auth }),
-        }
-      );
-
-      const data = await response.json();
-      if (data.success) {
-        setConfig(data.config);
-        return data.config;
-      }
-      return null;
-    } catch (err) {
-      console.error("Failed to update global settings:", err);
-      return null;
-    }
+  const requireWallet = (): string => {
+    if (!publicKey) throw new Error("Connect your wallet first.");
+    return publicKey;
   };
 
-  // Set token-specific configuration
+  // Write operations THROW on failure (bad signature, rejected by the server,
+  // network down). They used to swallow the error and return null, which every
+  // caller ignored — so a rejected save closed the dialog and looked done.
+
+  /** Update global settings (requires a wallet signature). */
+  const updateGlobalSettings = async (
+    settings: TraderConfig["globalSettings"]
+  ): Promise<TraderConfig> => {
+    const walletAddress = requireWallet();
+    const auth = await signWalletAuth(signMessage, walletAddress);
+    const data = await callConfigApi(
+      `${ENV.API_BASE_URL}/trader-config/${walletAddress}/global`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...settings, ...auth }),
+      }
+    );
+    applyConfig(data.config);
+    return data.config;
+  };
+
+  /** Set token-specific configuration (requires a wallet signature). */
   const setTokenConfig = async (
     mint: string,
     tokenConfig: TraderConfig["tokenSpecificSettings"][string]
-  ) => {
-    if (!publicKey) return null;
-
-    const walletAddress = publicKey;
-
-    try {
-      const auth = await signWalletAuth(signMessage, walletAddress);
-      const response = await fetch(
-        `${ENV.API_BASE_URL}/trader-config/${walletAddress}/token/${mint}`,
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...tokenConfig, ...auth }),
-        }
-      );
-
-      const data = await response.json();
-      if (data.success) {
-        setConfig(data.config);
-        return data.config;
+  ): Promise<TraderConfig> => {
+    const walletAddress = requireWallet();
+    const auth = await signWalletAuth(signMessage, walletAddress);
+    const data = await callConfigApi(
+      `${ENV.API_BASE_URL}/trader-config/${walletAddress}/token/${mint}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...tokenConfig, ...auth }),
       }
-      return null;
-    } catch (err) {
-      console.error("Failed to set token config:", err);
-      return null;
-    }
+    );
+    applyConfig(data.config);
+    return data.config;
   };
 
-  // Remove token-specific configuration
-  const removeTokenConfig = async (mint: string) => {
-    if (!publicKey) return null;
-
-    const walletAddress = publicKey;
-
+  /**
+   * Remove token-specific configuration (requires a wallet signature).
+   * Resolves null when there was nothing to remove.
+   */
+  const removeTokenConfig = async (
+    mint: string
+  ): Promise<TraderConfig | null> => {
+    const walletAddress = requireWallet();
+    const auth = await signWalletAuth(signMessage, walletAddress);
+    const qs = new URLSearchParams({
+      walletAuthTimestamp: String(auth.walletAuthTimestamp),
+      walletAuthSignature: auth.walletAuthSignature,
+    }).toString();
     try {
-      const auth = await signWalletAuth(signMessage, walletAddress);
-      const qs = new URLSearchParams({
-        walletAuthTimestamp: String(auth.walletAuthTimestamp),
-        walletAuthSignature: auth.walletAuthSignature,
-      });
-      const response = await fetch(
+      const data = await callConfigApi(
         `${ENV.API_BASE_URL}/trader-config/${walletAddress}/token/${mint}?${qs}`,
-        {
-          method: "DELETE",
-        }
+        { method: "DELETE" }
       );
-
-      const data = await response.json();
-      if (data.success) {
-        setConfig(data.config);
-        return data.config;
-      }
-      return null;
-    } catch (err) {
-      console.error("Failed to remove token config:", err);
-      return null;
+      applyConfig(data.config);
+      return data.config;
+    } catch (err: any) {
+      // 404 = no custom config existed; "reset to defaults" is already true.
+      if (err?.status === 404) return null;
+      throw err;
     }
   };
 
-  // Get effective config for a token
+  /** Get effective configuration for a token (token > global > defaults). */
   const getEffectiveConfig = async (mint: string) => {
     if (!publicKey) return null;
-
-    const walletAddress = publicKey;
-
     try {
-      const response = await fetch(
-        `${ENV.API_BASE_URL}/trader-config/${walletAddress}/effective/${mint}`
+      const data = await callConfigApi(
+        `${ENV.API_BASE_URL}/trader-config/${publicKey}/effective/${mint}`
       );
-
-      const data = await response.json();
-      if (data.success) {
-        return data.config;
-      }
-      return null;
+      return data.config;
     } catch (err) {
       console.error("Failed to get effective config:", err);
       return null;
@@ -199,6 +201,8 @@ export function useTraderConfig() {
   return {
     config,
     loading,
+    loadError,
+    refetch: fetchConfig,
     updateGlobalSettings,
     setTokenConfig,
     removeTokenConfig,

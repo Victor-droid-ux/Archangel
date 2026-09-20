@@ -926,6 +926,21 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
   return positions;
 }
 
+/**
+ * How many positions the BOT currently holds for this owner wallet — what
+ * "Max Open Positions" counts. Self-custody (manual) positions are the user's
+ * own and don't use one of the bot's slots; positions below the dust
+ * threshold are economically closed (see getStats / monitor.service.ts).
+ */
+export async function getOpenPositionCount(
+  ownerWallet: string,
+): Promise<number> {
+  const positions = await getPositions(ownerWallet);
+  return positions.filter(
+    (p) => p.custody !== "self" && p.netSol >= POSITION_DUST_THRESHOLD_SOL,
+  ).length;
+}
+
 export async function updatePositionMetadata(
   token: string,
   wallet: string,
@@ -1441,6 +1456,7 @@ export default {
   getTotalTradesCount,
   getStats,
   getPositions,
+  getOpenPositionCount,
   recoverPositionCostBasis,
   updateStats,
   updatePositionMetadata,

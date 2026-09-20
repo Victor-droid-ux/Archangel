@@ -35,6 +35,10 @@ type Position = {
   soldAt150?: boolean;
   trailingActivated?: boolean;
   highestPnlPct?: number;
+  // This position's own exit levels (decimals), snapshotted when it was
+  // bought — see monitor.service.ts.
+  tpPct?: number;
+  slPct?: number;
 };
 
 export const PositionsPanel: React.FC = () => {
@@ -211,6 +215,8 @@ export const PositionsPanel: React.FC = () => {
                               soldAt80={p.soldAt80}
                               soldAt150={p.soldAt150}
                               currentPnl={pnlFraction}
+                              tpPct={p.tpPct}
+                              slPct={p.slPct}
                               trailingActivated={
                                 trailing?.trailingActivated ??
                                 p.trailingActivated

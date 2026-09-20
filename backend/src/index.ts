@@ -67,6 +67,12 @@ process.on("uncaughtException", (err: Error) => {
     return;
   }
 
+  if (!ENV.FRONTEND_URL) {
+    log.warn(
+      "FRONTEND_URL is not set — CORS and the socket accept requests from ANY origin. Set it to your dashboard's URL in production.",
+    );
+  }
+
   const app = createApp();
   const server = http.createServer(app);
   const io = new SocketIOServer(server, {

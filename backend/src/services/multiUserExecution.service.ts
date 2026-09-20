@@ -287,10 +287,12 @@ export async function runPipelineForAllEligibleWallets(
       }
 
       // Serialized per wallet (see walletMutex.ts) — this pipeline sizes
-      // trades as a percentage of live balance, so a wallet with a buy
-      // already in flight (for a different candidate mint) must not have a
-      // second one read the same stale balance concurrently. This one waits
-      // its turn and sizes against whatever's actually left afterward.
+      // each buy from the wallet's live balance and its count of open
+      // positions (utils/positionSizing.ts), so a wallet with a buy already
+      // in flight (for a different candidate mint) must not have a second one
+      // read the same stale balance/count concurrently. This one waits its
+      // turn and sizes against what's actually left afterward — which is what
+      // makes the "balance / free slots" split come out even.
       const result = await withWalletLock(walletContext.ownerWallet, () =>
         runPipelineFn(tokenMint, lpSol, walletContext),
       );

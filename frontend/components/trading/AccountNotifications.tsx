@@ -10,10 +10,11 @@
 // no signal at all.
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { AlertTriangle, XCircle, Info, CheckCircle2 } from "lucide-react";
 import { useSocket } from "@hooks/useSocket";
+import { useSocketEvent } from "@hooks/useSocketEvent";
 
 interface Alert {
   id: string;
@@ -22,9 +23,53 @@ interface Alert {
   timestamp: number;
 }
 
+// The backend reports why a wallet's buy didn't go through as
+// "candidate:buy_failed" (wallet-scoped). The same reason repeats for every
+// candidate while the cause persists (e.g. "balance too low"), so show each
+// distinct reason at most once a minute instead of a popup per token.
+const BUY_FAILED_DEDUPE_MS = 60_000;
+const MAX_STACKED_ALERTS = 5;
+
+interface BuyFailedPayload {
+  mint?: string;
+  failedStageName?: string;
+  reason?: string;
+}
+
 export const AccountNotifications: React.FC = () => {
   const { lastMessage } = useSocket();
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const lastBuyFailedAt = useRef<Map<string, number>>(new Map());
+
+  // Subscribed directly rather than through lastMessage: that slot only
+  // holds the latest event and never carried candidate:* events at all, so
+  // these reasons were never shown.
+  useSocketEvent<BuyFailedPayload>("candidate:buy_failed", (payload) => {
+    const stage = payload?.failedStageName || "validation";
+    const reason = payload?.reason || "condition not met";
+    const key = `${stage}|${reason}`;
+    const now = Date.now();
+
+    const last = lastBuyFailedAt.current.get(key);
+    if (last !== undefined && now - last < BUY_FAILED_DEDUPE_MS) return;
+    lastBuyFailedAt.current.set(key, now);
+    if (lastBuyFailedAt.current.size > 50) {
+      const oldest = lastBuyFailedAt.current.keys().next().value;
+      if (oldest !== undefined) lastBuyFailedAt.current.delete(oldest);
+    }
+
+    setAlerts((prev) =>
+      [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          type: "warning" as const,
+          message: `⏭️ Auto-buy skipped: ${stage} — ${reason}`,
+          timestamp: now,
+        },
+      ].slice(-MAX_STACKED_ALERTS)
+    );
+  });
 
   useEffect(() => {
     if (!lastMessage) return;

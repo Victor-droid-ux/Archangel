@@ -9,7 +9,7 @@ const config = {
   minMarketCapSol: 3,
   takeProfitPct: 0.1,
   stopLossPct: 0.3,
-  maxTradeAmountSol: 1,
+  maxOpenPositions: 5,
   autoTrade: true,
 };
 

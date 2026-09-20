@@ -3,6 +3,7 @@ import { getLogger } from "../utils/logger.js";
 import { MongoClient, Db } from "mongodb";
 import { Server } from "socket.io";
 import dotenv from "dotenv";
+import { normalizeMaxOpenPositions } from "../utils/positionSizing.js";
 
 // Defensive, same as db.service.ts — this module can be reached (via
 // trade.route.ts's import, evaluated early in app.ts's route list) before
@@ -34,7 +35,12 @@ export interface TraderConfig {
     // Only buy a token once its pool is at least this old in seconds.
     minSecondsSinceLaunch?: number;
     autoTradeEnabled?: boolean;
-    maxTradeAmountSol?: number;
+    // How many positions the bot may hold at once. The trading wallet's
+    // balance is split across them (balance / free slots — see
+    // utils/positionSizing.ts), so this is a COUNT, not a SOL amount. Unset
+    // falls back to DEFAULT_MAX_OPEN_POSITIONS. (Replaces the old
+    // maxTradeAmountSol; a stored copy of that field is simply ignored.)
+    maxOpenPositions?: number;
     // Lifetime cap on how many trades the bot may take for this wallet —
     // null/undefined means unlimited. Enforced in
     // multiUserExecution.service.ts's getEligibleWallets() against the live
@@ -49,7 +55,6 @@ export interface TraderConfig {
       minMarketCapSol?: number;
       takeProfitPct?: number;
       stopLossPct?: number;
-      maxTradeAmountSol?: number;
       entryPriceSol?: number;
       triggerMarketCapSol?: number; // MC at which trade should trigger
       autoTrade?: boolean;
@@ -270,6 +275,17 @@ export async function removeTokenConfig(
 }
 
 /**
+ * How many positions this wallet's bot may hold at once (its "Max Open
+ * Positions" setting, or the default if it never chose one).
+ */
+export async function getMaxOpenPositions(
+  walletAddress: string,
+): Promise<number> {
+  const config = await getTraderConfig(walletAddress);
+  return normalizeMaxOpenPositions(config?.globalSettings?.maxOpenPositions);
+}
+
+/**
  * Get effective configuration for a specific token
  * (token-specific settings override global settings)
  */
@@ -280,7 +296,7 @@ export async function getEffectiveConfig(
   minMarketCapSol: number;
   takeProfitPct: number;
   stopLossPct: number;
-  maxTradeAmountSol: number;
+  maxOpenPositions: number;
   triggerMarketCapSol?: number;
   autoTrade: boolean;
 }> {
@@ -290,9 +306,7 @@ export async function getEffectiveConfig(
   const defaults = {
     minMarketCapSol: Number(process.env.MIN_MARKETCAP_SOL ?? 3),
     takeProfitPct: Number(process.env.TP_PCT ?? 0.1),
-    maxTradeAmountSol: Number(
-      process.env.MAX_TRADE_AMOUNT_SOL ?? Number.MAX_VALUE,
-    ),
+    maxOpenPositions: normalizeMaxOpenPositions(undefined),
     // Must match monitor.service.ts's DEFAULT_SL_PCT fallback (0.3) — that
     // 2% figure was the pre-fix default that caused a self-inflicted
     // stop-loss bug (see monitor.service.ts). Both read SL_PCT so they agree
@@ -313,7 +327,7 @@ export async function getEffectiveConfig(
     minMarketCapSol: number;
     takeProfitPct: number;
     stopLossPct: number;
-    maxTradeAmountSol: number;
+    maxOpenPositions: number;
     triggerMarketCapSol?: number;
     autoTrade: boolean;
   } = {
@@ -329,10 +343,9 @@ export async function getEffectiveConfig(
       tokenSettings.stopLossPct ??
       config.globalSettings.stopLossPct ??
       defaults.stopLossPct,
-    maxTradeAmountSol:
-      tokenSettings.maxTradeAmountSol ??
-      config.globalSettings.maxTradeAmountSol ??
-      defaults.maxTradeAmountSol,
+    maxOpenPositions: normalizeMaxOpenPositions(
+      config.globalSettings.maxOpenPositions,
+    ),
     autoTrade:
       tokenSettings.autoTrade ??
       config.globalSettings.autoTradeEnabled ??

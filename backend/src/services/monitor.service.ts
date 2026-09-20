@@ -561,6 +561,13 @@ export function startPositionMonitor(
           // ✨ RULE 9: TIERED PROFIT TARGETS (30% at +40%, +80%, +150%)
           // (remainingPct <= 0 already handled above, before the price fetch)
 
+          // A tier only applies BELOW this position's take profit. At or
+          // above it the TP would already have closed the whole position, so
+          // a tier there was unreachable in practice — except when a price
+          // gap crossed both in one tick, where it sold 30% and left the
+          // rest to the next tick instead of honoring the TP the trader set.
+          // (With the default 10% TP no tier applies; set a TP above +40%
+          // to scale out on the way to it.)
           // Check for tiered profit target triggers
           let shouldSellTiered = false;
           let tieredSellSucceeded = false;
@@ -569,6 +576,7 @@ export function startPositionMonitor(
 
           if (
             !pos.soldAt40 &&
+            TIER1_PROFIT_PCT < tpPct &&
             pnlPercent >= TIER1_PROFIT_PCT &&
             remainingPct > 0
           ) {
@@ -577,6 +585,7 @@ export function startPositionMonitor(
             tierReason = `Tier 1: +${(TIER1_PROFIT_PCT * 100).toFixed(0)}% profit`;
           } else if (
             !pos.soldAt80 &&
+            TIER2_PROFIT_PCT < tpPct &&
             pnlPercent >= TIER2_PROFIT_PCT &&
             remainingPct > 0
           ) {
@@ -585,6 +594,7 @@ export function startPositionMonitor(
             tierReason = `Tier 2: +${(TIER2_PROFIT_PCT * 100).toFixed(0)}% profit`;
           } else if (
             !pos.soldAt150 &&
+            TIER3_PROFIT_PCT < tpPct &&
             pnlPercent >= TIER3_PROFIT_PCT &&
             remainingPct > 0
           ) {

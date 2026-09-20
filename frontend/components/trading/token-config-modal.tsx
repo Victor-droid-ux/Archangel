@@ -1,12 +1,17 @@
 // frontend/components/trading/token-config-modal.tsx
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useTraderConfig } from "@hooks/useTraderConfig";
 import { useTrade } from "@hooks/useTrade";
 import { useWallet } from "@hooks/useWallet";
 import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
 import { useSolPrice } from "@hooks/useSolPrice";
+import {
+  decimalToPercent,
+  percentToDecimal,
+  validateTakeProfitStopLoss,
+} from "@lib/globalSettings";
 import {
   X,
   Target,
@@ -14,7 +19,6 @@ import {
   AlertCircle,
   ShoppingCart,
   TrendingDown,
-  Zap,
 } from "lucide-react";
 import { toast } from "react-hot-toast";
 
@@ -38,55 +42,84 @@ export function TokenConfigModal({
   const { config, setTokenConfig, removeTokenConfig, getEffectiveConfig } =
     useTraderConfig();
   const { executeTrade, loading: tradeLoading } = useTrade();
-  const { connected } = useWallet();
+  const { connected, balance: connectedBalance } = useWallet();
   const solanaWallet = useSolanaWallet();
   const solPriceUsd = useSolPrice();
 
   // Use Solana wallet adapter connection status as fallback
   const isWalletConnected = connected || solanaWallet.connected;
 
+  // Until the wallet's real settings load, show the backend's own defaults
+  // (10% take profit / 30% stop loss). The form used to start at a 2% stop
+  // loss, which the backend deliberately moved away from — a tight stop like
+  // that stops a volatile new token out almost immediately.
   const [formData, setFormData] = useState({
     triggerMarketCapSol: 0,
     takeProfitPct: 10,
-    stopLossPct: 2,
-    autoTrade: false,
+    stopLossPct: 30,
     useCustomConfig: false,
   });
+  // Manual Buy/Sell Now spends from the connected wallet, so it needs its own
+  // amount — it can't borrow one from the auto-trade settings (those split the
+  // TRADING wallet's balance across open positions and have no SOL amount).
+  const [tradeAmountSol, setTradeAmountSol] = useState(0.1);
 
   const [effectiveConfig, setEffectiveConfig] = useState<any>(null);
   const [saving, setSaving] = useState(false);
+  // True once the user has edited take profit / stop loss, so the effective
+  // config arriving late doesn't overwrite their typing.
+  const exitEdited = useRef(false);
 
   useEffect(() => {
-    if (isOpen && token.mint) {
-      // Load existing token config
-      const tokenConfig = config?.tokenSpecificSettings?.[token.mint];
-      if (tokenConfig) {
-        setFormData({
-          triggerMarketCapSol: tokenConfig.triggerMarketCapSol ?? 0,
-          takeProfitPct: (tokenConfig.takeProfitPct ?? 0.1) * 100,
-          stopLossPct: (tokenConfig.stopLossPct ?? 0.02) * 100,
-          autoTrade: tokenConfig.autoTrade ?? false,
-          useCustomConfig: true,
-        });
-      } else {
-        setFormData({
-          triggerMarketCapSol: token.currentMarketCapSol ?? 0,
-          takeProfitPct: 10,
-          stopLossPct: 2,
-          autoTrade: false,
-          useCustomConfig: false,
-        });
-      }
+    if (!(isOpen && token.mint)) return;
+    let cancelled = false;
+    exitEdited.current = false;
 
-      // Load effective config (what will actually be used)
-      getEffectiveConfig(token.mint).then((cfg: any) => {
-        setEffectiveConfig(cfg);
-      });
-    }
+    // Load existing token config
+    const tokenConfig = config?.tokenSpecificSettings?.[token.mint];
+    setFormData((prev) => ({
+      ...prev,
+      triggerMarketCapSol:
+        tokenConfig?.triggerMarketCapSol ?? token.currentMarketCapSol ?? 0,
+      useCustomConfig: !!tokenConfig,
+    }));
+
+    // Load effective config (what will actually be used: token > global >
+    // defaults) and start the fields from THAT, not from hard-coded numbers.
+    getEffectiveConfig(token.mint).then((cfg: any) => {
+      if (cancelled) return;
+      setEffectiveConfig(cfg);
+      if (cfg && !exitEdited.current) {
+        setFormData((prev) => ({
+          ...prev,
+          takeProfitPct: decimalToPercent(cfg.takeProfitPct),
+          stopLossPct: decimalToPercent(cfg.stopLossPct),
+        }));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, token.mint]);
 
-  const handleSave = async () => {
+  const exitErrors = formData.useCustomConfig
+    ? validateTakeProfitStopLoss(formData.takeProfitPct, formData.stopLossPct)
+    : {};
+
+  /** Saves the per-token settings. Resolves true only if they were saved. */
+  const handleSave = async (): Promise<boolean> => {
+    if (
+      formData.useCustomConfig &&
+      (exitErrors.takeProfitPct || exitErrors.stopLossPct)
+    ) {
+      toast.error(
+        exitErrors.takeProfitPct ||
+          exitErrors.stopLossPct ||
+          "Invalid exit settings"
+      );
+      return false;
+    }
     setSaving(true);
     try {
       if (!formData.useCustomConfig) {
@@ -96,32 +129,35 @@ export function TokenConfigModal({
         // Save custom config
         await setTokenConfig(token.mint, {
           triggerMarketCapSol: formData.triggerMarketCapSol || undefined,
-          takeProfitPct: formData.takeProfitPct / 100,
-          stopLossPct: formData.stopLossPct / 100,
-          autoTrade: formData.autoTrade,
+          takeProfitPct: percentToDecimal(formData.takeProfitPct),
+          stopLossPct: percentToDecimal(formData.stopLossPct),
         });
       }
       toast.success("Configuration saved!");
-    } catch (err) {
+      return true;
+    } catch (err: any) {
       console.error("Failed to save token config:", err);
-      toast.error("Failed to save configuration");
+      toast.error(err?.message || "Failed to save configuration");
+      return false;
     } finally {
       setSaving(false);
     }
   };
 
   const handleTrade = async (type: "buy" | "sell") => {
-    console.log(
-      "🔵 handleTrade called - type:",
-      type,
-      "connected:",
-      isWalletConnected,
-      "tradeLoading:",
-      tradeLoading
-    );
-
     if (!isWalletConnected) {
       toast.error("Please connect your wallet first");
+      return;
+    }
+
+    if (!Number.isFinite(tradeAmountSol) || tradeAmountSol <= 0) {
+      toast.error("Enter an amount in SOL greater than 0.");
+      return;
+    }
+    if (type === "buy" && tradeAmountSol > connectedBalance) {
+      toast.error(
+        `Your connected wallet has ${connectedBalance.toFixed(4)} SOL — not enough for a ${tradeAmountSol} SOL buy.`
+      );
       return;
     }
 
@@ -129,12 +165,6 @@ export function TokenConfigModal({
       // Check if trigger MC condition is met (only for buy)
       if (type === "buy" && formData.triggerMarketCapSol > 0) {
         const currentMC = token.currentMarketCapSol ?? 0;
-        console.log(
-          "Checking trigger MC:",
-          currentMC,
-          ">=",
-          formData.triggerMarketCapSol
-        );
         if (currentMC < formData.triggerMarketCapSol) {
           toast.error(
             `Market cap (${currentMC.toFixed(
@@ -147,28 +177,15 @@ export function TokenConfigModal({
         }
       }
 
-      // Save config first if custom config is enabled
+      // Save config first if custom config is enabled — and don't trade on
+      // settings that failed to save.
       if (formData.useCustomConfig) {
-        console.log("💾 Saving custom config before trade...");
-        await handleSave();
+        const saved = await handleSave();
+        if (!saved) return;
       }
 
-      // Trade size comes from the wallet's global "Max Trade Amount"
-      // setting (see trader-config-modal.tsx) — this modal has no amount
-      // input of its own.
-      const maxTradeAmountSol = effectiveConfig?.maxTradeAmountSol;
-      if (!Number.isFinite(maxTradeAmountSol) || maxTradeAmountSol <= 0) {
-        toast.error(
-          "Set a Max Trade Amount in Global Auto-Trade Rules before trading."
-        );
-        return;
-      }
-      const amountLamports = Math.floor(maxTradeAmountSol * 1e9);
-
-      // Execute the trade
-      console.log("🚀 Executing trade:", type, token.mint);
+      const amountLamports = Math.floor(tradeAmountSol * 1e9);
       const result = await executeTrade(type, token.mint, amountLamports);
-      console.log("✅ Trade result:", result);
 
       if (result) {
         toast.success(`${type === "buy" ? "Bought" : "Sold"} ${token.symbol}`);
@@ -180,47 +197,7 @@ export function TokenConfigModal({
     }
   };
 
-  const handleAutoTrade = async () => {
-    if (!isWalletConnected) {
-      toast.error("Please connect your wallet first");
-      return;
-    }
-
-    // Enable auto-trade in config
-    const updatedFormData = { ...formData, autoTrade: true };
-    setFormData(updatedFormData);
-
-    setSaving(true);
-    try {
-      await setTokenConfig(token.mint, {
-        triggerMarketCapSol: formData.triggerMarketCapSol || undefined,
-        takeProfitPct: formData.takeProfitPct / 100,
-        stopLossPct: formData.stopLossPct / 100,
-        autoTrade: true,
-      });
-      toast.success(`Auto-trade enabled for ${token.symbol}`);
-      onClose();
-    } catch (err) {
-      console.error("Failed to enable auto-trade:", err);
-      toast.error("Failed to enable auto-trade");
-    } finally {
-      setSaving(false);
-    }
-  };
-
   if (!isOpen) return null;
-
-  // Debug button states
-  console.log("🔍 Modal Button States:", {
-    connected: isWalletConnected,
-    customWallet: connected,
-    solanaWallet: solanaWallet.connected,
-    saving,
-    tradeLoading,
-    buyDisabled: saving || tradeLoading || !isWalletConnected,
-    sellDisabled: saving || tradeLoading || !isWalletConnected,
-    autoTradeDisabled: saving || tradeLoading || !isWalletConnected,
-  });
 
   return (
     <div
@@ -373,19 +350,27 @@ export function TokenConfigModal({
                   <input
                     type="number"
                     value={formData.takeProfitPct}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      exitEdited.current = true;
                       setFormData({
                         ...formData,
                         takeProfitPct: Number(e.target.value),
-                      })
-                    }
+                      });
+                    }}
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
                     min="0"
+                    max="100"
                     step="1"
                   />
-                  <p className="text-xs text-green-500 mt-1">
-                    Exit at +{formData.takeProfitPct}%
-                  </p>
+                  {exitErrors.takeProfitPct ? (
+                    <p className="text-xs text-red-500 mt-1">
+                      {exitErrors.takeProfitPct}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-green-500 mt-1">
+                      Exit at +{formData.takeProfitPct}%
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -395,37 +380,28 @@ export function TokenConfigModal({
                   <input
                     type="number"
                     value={formData.stopLossPct}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      exitEdited.current = true;
                       setFormData({
                         ...formData,
                         stopLossPct: Number(e.target.value),
-                      })
-                    }
+                      });
+                    }}
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
                     min="0"
+                    max="100"
                     step="0.5"
                   />
-                  <p className="text-xs text-red-500 mt-1">
-                    Exit at -{formData.stopLossPct}%
-                  </p>
+                  {exitErrors.stopLossPct ? (
+                    <p className="text-xs text-red-500 mt-1">
+                      {exitErrors.stopLossPct}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-red-500 mt-1">
+                      Exit at -{formData.stopLossPct}%
+                    </p>
+                  )}
                 </div>
-              </div>
-
-              {/* Auto Trade */}
-              <div className="flex items-center">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={formData.autoTrade}
-                    onChange={(e) =>
-                      setFormData({ ...formData, autoTrade: e.target.checked })
-                    }
-                    className="w-4 h-4 rounded border-gray-700 bg-gray-800 text-blue-500 focus:ring-blue-500"
-                  />
-                  <span className="text-sm font-medium text-gray-300">
-                    Enable auto-trade for this token
-                  </span>
-                </label>
               </div>
             </>
           )}
@@ -463,12 +439,32 @@ export function TokenConfigModal({
 
         {/* Footer */}
         <div className="flex flex-col gap-3 p-6 border-t border-gray-800 bg-gray-800/50">
+          {/* Manual trade amount — spent from the connected wallet */}
+          <div>
+            <label className="block text-xs font-medium text-gray-400 mb-1">
+              Amount for Buy / Sell Now (SOL)
+            </label>
+            <input
+              type="number"
+              value={tradeAmountSol}
+              onChange={(e) => setTradeAmountSol(Number(e.target.value))}
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+              min="0"
+              step="0.01"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Manual trades use your connected wallet
+              {isWalletConnected ? ` (${connectedBalance.toFixed(4)} SOL)` : ""}
+              . Auto-trades use the trading wallet and are sized by Max Open
+              Positions in Trading Settings.
+            </p>
+          </div>
+
           {/* Trade Action Buttons */}
           <div className="flex items-center gap-3">
             <button
               type="button"
               onClick={(e) => {
-                console.log("🟢 BUY button clicked!", e);
                 e.preventDefault();
                 e.stopPropagation();
                 handleTrade("buy");
@@ -483,7 +479,6 @@ export function TokenConfigModal({
             <button
               type="button"
               onClick={(e) => {
-                console.log("🔴 SELL button clicked!", e);
                 e.preventDefault();
                 e.stopPropagation();
                 handleTrade("sell");
@@ -496,33 +491,17 @@ export function TokenConfigModal({
             </button>
           </div>
 
-          {/* Auto-Trade & Save Buttons */}
+          {/* Save / Close */}
           <div className="flex items-center gap-3">
             <button
               type="button"
               onClick={(e) => {
-                console.log("⚡ AUTO-TRADE button clicked!", e);
-                e.preventDefault();
-                e.stopPropagation();
-                handleAutoTrade();
-              }}
-              disabled={saving || tradeLoading || !isWalletConnected}
-              className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary hover:bg-primary-hover text-white font-semibold rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-            >
-              <Zap className="w-4 h-4" />
-              {saving ? "Enabling..." : "Enable Auto-Trade"}
-            </button>
-
-            <button
-              type="button"
-              onClick={(e) => {
-                console.log("💾 SAVE button clicked!", e);
                 e.preventDefault();
                 e.stopPropagation();
                 handleSave();
               }}
               disabled={saving || tradeLoading}
-              className="px-6 py-3 bg-base-300 hover:bg-base-300/70 text-white font-semibold rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+              className="flex-1 px-6 py-3 bg-primary hover:bg-primary-hover text-white font-semibold rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
               {saving ? "Saving..." : "Save Config"}
             </button>
@@ -530,7 +509,6 @@ export function TokenConfigModal({
             <button
               type="button"
               onClick={(e) => {
-                console.log("❌ CLOSE button clicked!", e);
                 e.preventDefault();
                 e.stopPropagation();
                 onClose();

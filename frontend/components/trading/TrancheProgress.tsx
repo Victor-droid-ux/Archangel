@@ -3,10 +3,22 @@
 
 import React from "react";
 import { motion } from "framer-motion";
-import { TrendingUp, TrendingDown, AlertTriangle } from "lucide-react";
+import { TrendingDown } from "lucide-react";
+
+// Profit tiers the monitor can scale out at, in percent. The monitor only
+// applies a tier BELOW the position's take profit (at or above it the take
+// profit has already closed the whole position), so a tier is shown only
+// when this position's take profit is higher.
+const PROFIT_TIERS = [
+  { level: 40, label: "Tier 1", key: "soldAt40" },
+  { level: 80, label: "Tier 2", key: "soldAt80" },
+  { level: 150, label: "Tier 3", key: "soldAt150" },
+] as const;
 
 interface TrancheProgressProps {
   token: string;
+  // Timestamp of the (single) buy that opened this position. The bot buys a
+  // position in one go; secondTrancheEntry is legacy and never set.
   firstTrancheEntry?: number;
   secondTrancheEntry?: number;
   remainingPct?: number;
@@ -16,12 +28,14 @@ interface TrancheProgressProps {
   currentPnl?: number;
   trailingActivated?: boolean;
   highestPnlPct?: number;
+  // This position's own exit levels, as decimals (0.1 = +10%).
+  tpPct?: number;
+  slPct?: number;
 }
 
 export const TrancheProgress: React.FC<TrancheProgressProps> = ({
   token,
   firstTrancheEntry,
-  secondTrancheEntry,
   remainingPct = 100,
   soldAt40,
   soldAt80,
@@ -29,62 +43,53 @@ export const TrancheProgress: React.FC<TrancheProgressProps> = ({
   currentPnl = 0,
   trailingActivated,
   highestPnlPct,
+  tpPct,
+  slPct,
 }) => {
-  const tranchesComplete = !!firstTrancheEntry && !!secondTrancheEntry;
-  const tranchesPending = !!firstTrancheEntry && !secondTrancheEntry;
-
-  // Calculate profit tier progress
   const profitPct = currentPnl * 100;
-  const nextTier = !soldAt40
-    ? { level: 40, label: "Tier 1" }
-    : !soldAt80
-    ? { level: 80, label: "Tier 2" }
-    : !soldAt150
-    ? { level: 150, label: "Tier 3" }
-    : null;
+  const sold = { soldAt40, soldAt80, soldAt150 };
 
+  // Only tiers that sit below this position's take profit can ever fire.
+  const tiers =
+    typeof tpPct === "number"
+      ? PROFIT_TIERS.filter((tier) => tier.level / 100 < tpPct)
+      : [];
+  const nextTier = tiers.find((tier) => !sold[tier.key]) ?? null;
   const progressToNextTier = nextTier
     ? Math.min((profitPct / nextTier.level) * 100, 100)
     : 100;
 
   return (
     <div className="bg-base-300 rounded-lg p-3 space-y-3">
-      {/* Tranche Status */}
+      {/* Entry */}
       <div className="flex items-center justify-between">
-        <div className="text-xs font-semibold text-slate-400">
-          Position Entry
-        </div>
-        <div className="flex items-center gap-2">
-          {tranchesComplete && (
-            <span className="text-xs text-green-400 flex items-center gap-1">
-              <TrendingUp size={14} /> 2 Tranches Complete
-            </span>
-          )}
-          {tranchesPending && (
-            <span className="text-xs text-yellow-400 flex items-center gap-1">
-              <AlertTriangle size={14} /> Waiting for Tranche 2
-            </span>
-          )}
-          {!firstTrancheEntry && (
-            <span className="text-xs text-slate-500">No entry yet</span>
-          )}
+        <div className="text-xs font-semibold text-slate-400">Entered</div>
+        <div className="text-xs text-slate-300">
+          {firstTrancheEntry
+            ? new Date(firstTrancheEntry).toLocaleString()
+            : "—"}
         </div>
       </div>
 
-      {/* Tranche Progress Bar */}
-      {(tranchesComplete || tranchesPending) && (
-        <div className="relative h-2 bg-base-100 rounded-full overflow-hidden">
-          <motion.div
-            initial={{ width: "0%" }}
-            animate={{ width: tranchesComplete ? "100%" : "60%" }}
-            transition={{ duration: 0.5 }}
-            className={`h-full ${
-              tranchesComplete ? "bg-green-500" : "bg-yellow-500"
-            }`}
-          />
-          <div className="absolute inset-0 flex">
-            <div className="w-[60%] border-r-2 border-base-300"></div>
-          </div>
+      {/* Exit levels */}
+      {(typeof tpPct === "number" || typeof slPct === "number") && (
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-slate-400">Exit levels</span>
+          <span>
+            {typeof tpPct === "number" && (
+              <span className="text-green-400">
+                Take profit +{Number((tpPct * 100).toFixed(2))}%
+              </span>
+            )}
+            {typeof tpPct === "number" && typeof slPct === "number" && (
+              <span className="text-slate-600"> · </span>
+            )}
+            {typeof slPct === "number" && (
+              <span className="text-red-400">
+                Stop loss −{Number((slPct * 100).toFixed(2))}%
+              </span>
+            )}
+          </span>
         </div>
       )}
 
@@ -99,10 +104,10 @@ export const TrancheProgress: React.FC<TrancheProgressProps> = ({
               remainingPct === 100
                 ? "text-white"
                 : remainingPct >= 40
-                ? "text-blue-400"
-                : remainingPct > 0
-                ? "text-yellow-400"
-                : "text-slate-500"
+                  ? "text-blue-400"
+                  : remainingPct > 0
+                    ? "text-yellow-400"
+                    : "text-slate-500"
             }
           >
             {remainingPct}%
@@ -110,8 +115,8 @@ export const TrancheProgress: React.FC<TrancheProgressProps> = ({
         </div>
       </div>
 
-      {/* Profit Tiers */}
-      {remainingPct > 0 && (
+      {/* Profit Tiers — only the ones this take profit leaves room for */}
+      {remainingPct > 0 && tiers.length > 0 && (
         <div className="space-y-2">
           <div className="flex items-center justify-between text-xs">
             <span className="text-slate-400">Profit Tiers</span>
@@ -133,8 +138,8 @@ export const TrancheProgress: React.FC<TrancheProgressProps> = ({
                   profitPct >= nextTier.level
                     ? "bg-green-500"
                     : profitPct >= 0
-                    ? "bg-blue-500"
-                    : "bg-red-500"
+                      ? "bg-blue-500"
+                      : "bg-red-500"
                 }`}
               />
             </div>
@@ -142,33 +147,18 @@ export const TrancheProgress: React.FC<TrancheProgressProps> = ({
 
           {/* Tier Badges */}
           <div className="flex gap-2">
-            <div
-              className={`text-xs px-2 py-1 rounded ${
-                soldAt40
-                  ? "bg-green-900/50 text-green-300"
-                  : "bg-slate-800/50 text-slate-500"
-              }`}
-            >
-              Tier 1: +40%
-            </div>
-            <div
-              className={`text-xs px-2 py-1 rounded ${
-                soldAt80
-                  ? "bg-green-900/50 text-green-300"
-                  : "bg-slate-800/50 text-slate-500"
-              }`}
-            >
-              Tier 2: +80%
-            </div>
-            <div
-              className={`text-xs px-2 py-1 rounded ${
-                soldAt150
-                  ? "bg-green-900/50 text-green-300"
-                  : "bg-slate-800/50 text-slate-500"
-              }`}
-            >
-              Tier 3: +150%
-            </div>
+            {tiers.map((tier) => (
+              <div
+                key={tier.key}
+                className={`text-xs px-2 py-1 rounded ${
+                  sold[tier.key]
+                    ? "bg-green-900/50 text-green-300"
+                    : "bg-slate-800/50 text-slate-500"
+                }`}
+              >
+                {tier.label}: +{tier.level}%
+              </div>
+            ))}
           </div>
         </div>
       )}

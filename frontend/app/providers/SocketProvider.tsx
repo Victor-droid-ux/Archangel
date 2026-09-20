@@ -10,8 +10,6 @@ import React, {
 } from "react";
 import { Socket } from "socket.io-client";
 import { socket } from "@lib/socket";
-import { useWallet as useSolanaWallet } from "@solana/wallet-adapter-react";
-import { useTradingConfigStore } from "@hooks/useConfig";
 
 interface SocketData {
   event: string;
@@ -38,9 +36,6 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({
   const [connected, setConnected] = useState(false);
   const [lastMessage, setLastMessage] = useState<SocketData | null>(null);
   const socketRef = useRef<Socket | null>(null);
-
-  const { publicKey } = useSolanaWallet();
-  const { autoTrade } = useTradingConfigStore();
 
   useEffect(() => {
     // Attach to the shared singleton (frontend/lib/socket.ts) rather than
@@ -71,16 +66,9 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({
     };
   }, []);
 
-  // Identify wallet when connected
-  useEffect(() => {
-    if (connected && publicKey && socketRef.current) {
-      console.log("🆔 Identifying wallet with backend:", publicKey.toString());
-      socketRef.current.emit("identify", {
-        wallet: publicKey.toString(),
-        autoMode: autoTrade,
-      });
-    }
-  }, [connected, publicKey, autoTrade]);
+  // Wallet identification lives in WalletDataProvider now: the server
+  // requires a signed proof of the wallet (or a session token from one), and
+  // this provider used to emit an unauthenticated identify of its own.
 
   const send = (event: string, payload?: any) => {
     if (socketRef.current && socketRef.current.connected) {

@@ -59,9 +59,6 @@ export const ENV = {
 
   // Quick tuning
   TOKEN_MIN_MARKETCAP_SOL: Number(process.env.TOKEN_MIN_MARKETCAP_SOL ?? "2"), // 2 SOL default
-  AUTO_TRADE_PERCENT_OF_BALANCE: Number(
-    process.env.AUTO_TRADE_PERCENT_OF_BALANCE ?? "0.02",
-  ), // 2%
 
   // Advanced execution tuning
   JUPITER_PRIORITY_FEE: Number(process.env.JUPITER_PRIORITY_FEE ?? "0.00003"), // in SOL

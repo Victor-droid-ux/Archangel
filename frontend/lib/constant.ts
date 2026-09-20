@@ -6,11 +6,29 @@
  */
 
 // 🔹 Environment-based settings
+//
+// ONE backend origin drives everything: NEXT_PUBLIC_BACKEND_URL, which the
+// rest of the app (lib/utils.ts's fetcher, lib/socket.ts) already reads.
+// API_BASE_URL and SOCKET_URL used to have their own variables with
+// localhost fallbacks, so a production build that set only
+// NEXT_PUBLIC_BACKEND_URL sent every settings request to the visitor's own
+// localhost:4000 and none of them worked. Both are now derived from it;
+// NEXT_PUBLIC_API_BASE_URL / NEXT_PUBLIC_SOCKET_URL still override if set.
+// (NEXT_PUBLIC_* values are inlined at BUILD time — rebuild after changing.)
+const stripTrailingSlashes = (url: string) => url.replace(/\/+$/, "");
+const BACKEND_URL = stripTrailingSlashes(
+  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000"
+);
+
 export const ENV = {
   NODE_ENV: process.env.NODE_ENV || "development",
-  API_BASE_URL:
-    process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:4000/api",
-  SOCKET_URL: process.env.NEXT_PUBLIC_SOCKET_URL || "http://localhost:4000", // backend socket server
+  BACKEND_URL,
+  API_BASE_URL: stripTrailingSlashes(
+    process.env.NEXT_PUBLIC_API_BASE_URL || `${BACKEND_URL}/api`
+  ),
+  SOCKET_URL: stripTrailingSlashes(
+    process.env.NEXT_PUBLIC_SOCKET_URL || BACKEND_URL
+  ), // backend socket server
   // Must match the env var names WalletProvider.tsx/useWallet.ts actually
   // read (NEXT_PUBLIC_SOLANA_ENDPOINT, with _RPC_URL as a legacy alias) —
   // this used to check NEXT_PUBLIC_SOLANA_RPC (no _URL), which nothing sets,

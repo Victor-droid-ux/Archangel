@@ -22,8 +22,9 @@ export default function SettingsPage() {
         <div className="kicker mb-1">Configuration</div>
         <h1 className="text-3xl font-bold text-white mb-1">Settings</h1>
         <p className="text-base-content/50 text-sm">
-          Deposit funds and check auto-trade readiness here; per-trade risk
-          sizing and auto-trade toggle live on the Trading dashboard.
+          Deposit funds and check auto-trade readiness here; how many positions
+          the bot may hold at once, your exit levels and the auto-trade switch
+          live on the Trading dashboard.
         </p>
       </motion.div>
 
