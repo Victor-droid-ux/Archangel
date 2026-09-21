@@ -94,12 +94,18 @@ export async function canExecuteTrade(
 
     // Calculate daily loss
     const dailyLoss = await calculateDailyLoss(ownerWallet);
-    // Position sizing must be based on actual wallet equity, not on money
-    // already committed to positions (dbService.getPortfolioPnL().totalInvestedSol
-    // is a running sum of past buys — with few/no trades yet that's ~0, which made
-    // "2% of portfolio" collapse to ~0 SOL and reject every trade regardless of
-    // real wallet balance).
-    const portfolioValue = await getBalanceInSol(walletAddress);
+    // Measured against what the wallet actually OWNS — the SOL it holds plus
+    // the cost of the positions it has open (see walletEquity) — not against
+    // the SOL balance alone. The cash balance shrinks every time a position
+    // opens, so a loss worth 2% of the wallet read as 6%+ as soon as a few
+    // positions were open, and the breaker stopped new buys for the day.
+    // (It also must not be "money committed to positions" alone —
+    // dbService.getPortfolioPnL().totalInvestedSol is a running sum of past
+    // buys, ~0 with few trades, which made every limit collapse to nothing.)
+    const { equity: portfolioValue } = await walletEquity(
+      ownerWallet,
+      walletAddress,
+    );
     const dailyLossPct =
       portfolioValue > 0 ? (dailyLoss / portfolioValue) * 100 : 0;
 
@@ -112,9 +118,11 @@ export async function canExecuteTrade(
       );
       return {
         allowed: false,
-        reason: `Daily loss limit ${MAX_DAILY_LOSS_PCT}% exceeded (${dailyLossPct.toFixed(
-          2,
-        )}%)`,
+        reason: `Daily loss limit reached: lost ${dailyLoss.toFixed(4)} SOL today, ${dailyLossPct.toFixed(
+          1,
+        )}% of the wallet's ${portfolioValue.toFixed(
+          4,
+        )} SOL (limit ${MAX_DAILY_LOSS_PCT}%) — new buys resume tomorrow`,
         currentRisk: {
           openPositions,
           dailyLossPct,
@@ -184,6 +192,20 @@ export async function canExecuteTrade(
 }
 
 /**
+ * What a bot wallet actually owns: the SOL sitting in its trading wallet plus
+ * the cost still tied up in its open positions. Positions are keyed by the
+ * OWNER wallet; the cash balance lives at the trading (hot) wallet.
+ */
+export async function walletEquity(
+  ownerWallet: string,
+  hotWallet: string,
+): Promise<{ cash: number; deployed: number; equity: number }> {
+  const cash = await getBalanceInSol(hotWallet);
+  const deployed = await dbService.getDeployedSol(ownerWallet);
+  return { cash, deployed, equity: cash + deployed };
+}
+
+/**
  * Calculate total loss for today, scoped to one wallet — otherwise one
  * user's losses would trip the daily-loss circuit breaker for everyone.
  */
@@ -214,7 +236,10 @@ async function calculateDailyLoss(walletAddress: string): Promise<number> {
 /**
  * Get current risk status
  */
-export async function getRiskStatus(walletAddress: string): Promise<{
+export async function getRiskStatus(
+  ownerWallet: string,
+  hotWallet: string = ownerWallet,
+): Promise<{
   openPositions: number;
   maxOpenPositions: number;
   dailyLossSol: number;
@@ -223,15 +248,14 @@ export async function getRiskStatus(walletAddress: string): Promise<{
   tradingAllowed: boolean;
   portfolioValue: number;
 }> {
-  const positions = await dbService.getPositions(walletAddress);
-  const openPositions = positions.filter((p) => p.netSol > 0).length;
+  const openPositions = await dbService.getOpenPositionCount(ownerWallet);
 
-  // Same fix as canExecuteTrade: live wallet balance, not a fake fallback of
-  // 100 SOL for a cumulative-invested figure that's ~0 with few/no trades yet.
-  const portfolioValue = await getBalanceInSol(walletAddress);
+  // Same basis as canExecuteTrade: what the wallet owns (cash + open positions).
+  const { equity: portfolioValue } = await walletEquity(ownerWallet, hotWallet);
 
-  const dailyLossSol = await calculateDailyLoss(walletAddress);
-  const dailyLossPct = (dailyLossSol / portfolioValue) * 100;
+  const dailyLossSol = await calculateDailyLoss(ownerWallet);
+  const dailyLossPct =
+    portfolioValue > 0 ? (dailyLossSol / portfolioValue) * 100 : 0;
 
   const tradingAllowed =
     (MAX_OPEN_POSITIONS <= 0 || openPositions < MAX_OPEN_POSITIONS) &&

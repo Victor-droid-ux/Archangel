@@ -41,6 +41,15 @@ export interface TraderConfig {
     // falls back to DEFAULT_MAX_OPEN_POSITIONS. (Replaces the old
     // maxTradeAmountSol; a stored copy of that field is simply ignored.)
     maxOpenPositions?: number;
+    // Trading budget: the most SOL the bot may have at work at once. Anything
+    // the wallet holds beyond it (profits, later deposits) is protected — the
+    // bot never trades it. null/undefined = no budget (it may use the whole
+    // wallet balance). See utils/positionSizing.ts.
+    tradingBudgetSol?: number | null;
+    // When the budget was last set or changed (ms since epoch). Set by the
+    // server, never trusted from the client: only losses realized after this
+    // moment lower the budget's capital. See routes/traderConfig.route.ts.
+    tradingBudgetSetAt?: number;
     // Lifetime cap on how many trades the bot may take for this wallet —
     // null/undefined means unlimited. Enforced in
     // multiUserExecution.service.ts's getEligibleWallets() against the live

@@ -13,7 +13,7 @@ let alertCheckInterval: NodeJS.Timeout | null = null;
  */
 export function startPriceAlertMonitor(
   io: Server,
-  opts?: { intervalMs?: number }
+  opts?: { intervalMs?: number },
 ) {
   const intervalMs = opts?.intervalMs ?? 60000; // Check every minute by default
 
@@ -27,7 +27,7 @@ export function startPriceAlertMonitor(
         (token) =>
           token.priceAlert &&
           token.priceAlert.targetPrice &&
-          !token.priceAlert.triggered
+          !token.priceAlert.triggered,
       );
 
       if (tokensWithAlerts.length === 0) {
@@ -61,18 +61,19 @@ export function startPriceAlertMonitor(
 
         if (triggered) {
           log.info(
-            `Price alert triggered: ${token.symbol} ${alert.condition} $${targetPrice} (current: $${currentPrice})`
+            `Price alert triggered: ${token.symbol} ${alert.condition} $${targetPrice} (current: $${currentPrice})`,
           );
 
           // Mark alert as triggered in database
           await dbService.updateWatchlistAlert(
             token.mint,
             { ...alert, triggered: true },
-            token.userId
+            token.userId,
           );
 
-          // Emit alert to frontend
-          io.emit("priceAlert:triggered", {
+          // Emit alert to the wallet that set it (legacy shared entries
+          // without an owner still go to everyone, as before).
+          const alertPayload = {
             mint: token.mint,
             symbol: token.symbol,
             name: token.name,
@@ -81,7 +82,10 @@ export function startPriceAlertMonitor(
             targetPrice,
             condition: alert.condition,
             timestamp: new Date().toISOString(),
-          });
+          };
+          if (token.userId)
+            io.to(token.userId).emit("priceAlert:triggered", alertPayload);
+          else io.emit("priceAlert:triggered", alertPayload);
 
           log.info(`Emitted priceAlert:triggered for ${token.symbol}`);
         }
@@ -89,7 +93,7 @@ export function startPriceAlertMonitor(
     } catch (err: any) {
       log.error(
         { err: err?.message ?? String(err) },
-        "Error checking price alerts"
+        "Error checking price alerts",
       );
     }
   };

@@ -2,6 +2,7 @@
 import { getJupiterQuote, getQuoteImpliedPriceSol } from "./jupiter.service.js";
 import sellExecutionRouterService from "./execution/sellExecutionRouter.service.js";
 import dbService, { Position } from "./db.service.js";
+import { isBotManagedOpenPosition } from "../utils/positionState.js";
 import { getLogger } from "../utils/logger.js";
 import notify from "./notifications/notify.service.js";
 import { Server } from "socket.io";
@@ -219,7 +220,12 @@ export function startPositionMonitor(
 
   const tick = async () => {
     try {
-      const positions: MonitorPosition[] = await dbService.getPositions();
+      // Only positions that are still open and bot-managed. A position sold
+      // at a loss used to stay in this list forever (its netSol stays
+      // positive), getting re-examined — and logged — every tick.
+      const positions: MonitorPosition[] = (
+        await dbService.getPositions()
+      ).filter(isBotManagedOpenPosition);
 
       for (const pos of positions) {
         try {
@@ -253,14 +259,11 @@ export function startPositionMonitor(
           // still doesn't trip (rounding residue across multiple partial
           // fills), which otherwise leaves it "open" forever and refetches
           // a live price for it on every single tick indefinitely.
+          // (Fully exited positions were already filtered out above; this
+          // stays as a guard for anything that reaches remainingPct <= 0
+          // mid-tick, without the per-tick log line it used to produce.)
           const remainingPct = pos.remainingPct ?? 100;
-          if (remainingPct <= 0) {
-            log.debug(
-              { tokenMint, wallet: pos.wallet, remainingPct },
-              "Skipping position: no remaining amount to sell",
-            );
-            continue;
-          }
+          if (remainingPct <= 0) continue;
           // netSol is derived from cumulative buy-minus-sell lamports; after a
           // position is fully exited this rarely lands on exactly 0 due to
           // floating-point/rounding residue across multiple fills, leaving a

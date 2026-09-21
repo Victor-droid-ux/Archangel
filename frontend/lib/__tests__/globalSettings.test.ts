@@ -58,91 +58,48 @@ describe("validateGlobalSettings", () => {
   });
 
   it("rejects take profit above 100% (the server would refuse it)", () => {
-    expect(
-      validateGlobalSettings(valid({ takeProfitPct: 200 })).takeProfitPct
-    ).toBeTruthy();
-    expect(
-      validateGlobalSettings(valid({ takeProfitPct: 100 })).takeProfitPct
-    ).toBeUndefined();
+    expect(validateGlobalSettings(valid({ takeProfitPct: 200 })).takeProfitPct).toBeTruthy();
+    expect(validateGlobalSettings(valid({ takeProfitPct: 100 })).takeProfitPct).toBeUndefined();
   });
 
   it("rejects 0% take profit / stop loss (would exit immediately)", () => {
-    expect(
-      validateGlobalSettings(valid({ takeProfitPct: 0 })).takeProfitPct
-    ).toBeTruthy();
-    expect(
-      validateGlobalSettings(valid({ stopLossPct: 0 })).stopLossPct
-    ).toBeTruthy();
+    expect(validateGlobalSettings(valid({ takeProfitPct: 0 })).takeProfitPct).toBeTruthy();
+    expect(validateGlobalSettings(valid({ stopLossPct: 0 })).stopLossPct).toBeTruthy();
   });
 
   it("rejects stop loss above 100%", () => {
-    expect(
-      validateGlobalSettings(valid({ stopLossPct: 101 })).stopLossPct
-    ).toBeTruthy();
+    expect(validateGlobalSettings(valid({ stopLossPct: 101 })).stopLossPct).toBeTruthy();
   });
 
   it("validates launch age only when one is entered", () => {
-    expect(
-      validateGlobalSettings(valid({ minSecondsSinceLaunch: "" }))
-        .minSecondsSinceLaunch
-    ).toBeUndefined();
-    expect(
-      validateGlobalSettings(valid({ minSecondsSinceLaunch: 0 }))
-        .minSecondsSinceLaunch
-    ).toBeUndefined();
-    expect(
-      validateGlobalSettings(valid({ minSecondsSinceLaunch: -1 }))
-        .minSecondsSinceLaunch
-    ).toBeTruthy();
-    expect(
-      validateGlobalSettings(valid({ minSecondsSinceLaunch: 31 * 24 * 3600 }))
-        .minSecondsSinceLaunch
-    ).toBeTruthy();
+    expect(validateGlobalSettings(valid({ minSecondsSinceLaunch: "" })).minSecondsSinceLaunch).toBeUndefined();
+    expect(validateGlobalSettings(valid({ minSecondsSinceLaunch: 0 })).minSecondsSinceLaunch).toBeUndefined();
+    expect(validateGlobalSettings(valid({ minSecondsSinceLaunch: -1 })).minSecondsSinceLaunch).toBeTruthy();
+    expect(validateGlobalSettings(valid({ minSecondsSinceLaunch: 31 * 24 * 3600 })).minSecondsSinceLaunch).toBeTruthy();
   });
 
   it("validates Max Total Trades", () => {
-    expect(
-      validateGlobalSettings(valid({ maxTotalTrades: "" })).maxTotalTrades
-    ).toBeUndefined();
-    expect(
-      validateGlobalSettings(valid({ maxTotalTrades: 5 })).maxTotalTrades
-    ).toBeUndefined();
-    expect(
-      validateGlobalSettings(valid({ maxTotalTrades: 0 })).maxTotalTrades
-    ).toBeTruthy();
-    expect(
-      validateGlobalSettings(valid({ maxTotalTrades: 2.5 })).maxTotalTrades
-    ).toBeTruthy();
-    expect(
-      validateGlobalSettings(valid({ maxTotalTrades: 100001 })).maxTotalTrades
-    ).toBeTruthy();
+    expect(validateGlobalSettings(valid({ maxTotalTrades: "" })).maxTotalTrades).toBeUndefined();
+    expect(validateGlobalSettings(valid({ maxTotalTrades: 5 })).maxTotalTrades).toBeUndefined();
+    expect(validateGlobalSettings(valid({ maxTotalTrades: 0 })).maxTotalTrades).toBeTruthy();
+    expect(validateGlobalSettings(valid({ maxTotalTrades: 2.5 })).maxTotalTrades).toBeTruthy();
+    expect(validateGlobalSettings(valid({ maxTotalTrades: 100001 })).maxTotalTrades).toBeTruthy();
   });
 
   it("accepts a whole number of open positions from 1 to 50", () => {
-    expect(
-      validateGlobalSettings(valid({ maxOpenPositions: 1 })).maxOpenPositions
-    ).toBeUndefined();
-    expect(
-      validateGlobalSettings(valid({ maxOpenPositions: 5 })).maxOpenPositions
-    ).toBeUndefined();
-    expect(
-      validateGlobalSettings(valid({ maxOpenPositions: 50 })).maxOpenPositions
-    ).toBeUndefined();
+    expect(validateGlobalSettings(valid({ maxOpenPositions: 1 })).maxOpenPositions).toBeUndefined();
+    expect(validateGlobalSettings(valid({ maxOpenPositions: 5 })).maxOpenPositions).toBeUndefined();
+    expect(validateGlobalSettings(valid({ maxOpenPositions: 50 })).maxOpenPositions).toBeUndefined();
   });
 
   it("rejects an invalid Max Open Positions", () => {
     for (const bad of [0, -1, 2.5, 51, NaN]) {
-      expect(
-        validateGlobalSettings(valid({ maxOpenPositions: bad }))
-          .maxOpenPositions
-      ).toBeTruthy();
+      expect(validateGlobalSettings(valid({ maxOpenPositions: bad })).maxOpenPositions).toBeTruthy();
     }
   });
 
   it("rejects a negative market cap", () => {
-    expect(
-      validateGlobalSettings(valid({ minMarketCapSol: -1 })).minMarketCapSol
-    ).toBeTruthy();
+    expect(validateGlobalSettings(valid({ minMarketCapSol: -1 })).minMarketCapSol).toBeTruthy();
   });
 });
 
@@ -162,9 +119,7 @@ describe("launchAgeWarning", () => {
   });
 
   it("warns when the wait is long enough to skip most tokens", () => {
-    expect(launchAgeWarning(valid({ minSecondsSinceLaunch: 60 }))).toContain(
-      "skip most tokens"
-    );
+    expect(launchAgeWarning(valid({ minSecondsSinceLaunch: 60 }))).toContain("skip most tokens");
   });
 });
 
@@ -182,14 +137,7 @@ describe("toSettingsPayload", () => {
   });
 
   it("converts percentages back to decimals the server accepts", () => {
-    const p = toSettingsPayload(
-      valid({
-        takeProfitPct: 50,
-        stopLossPct: 25,
-        maxTotalTrades: 5,
-        minSecondsSinceLaunch: 3,
-      })
-    );
+    const p = toSettingsPayload(valid({ takeProfitPct: 50, stopLossPct: 25, maxTotalTrades: 5, minSecondsSinceLaunch: 3 }));
     expect(p.takeProfitPct).toBe(0.5);
     expect(p.stopLossPct).toBe(0.25);
     expect(p.maxTotalTrades).toBe(5);
@@ -197,10 +145,46 @@ describe("toSettingsPayload", () => {
   });
 
   it("round-trips through the form without drifting", () => {
-    const p = toSettingsPayload(
-      formFromSettings({ takeProfitPct: 0.07, stopLossPct: 0.3 })
-    );
+    const p = toSettingsPayload(formFromSettings({ takeProfitPct: 0.07, stopLossPct: 0.3 }));
     expect(p.takeProfitPct).toBe(0.07);
     expect(p.stopLossPct).toBe(0.3);
+  });
+});
+
+describe("trading budget", () => {
+  it("is off by default and sends null, so the server lets the bot use the whole wallet", () => {
+    const p = toSettingsPayload(valid());
+    expect(p.tradingBudgetSol).toBeNull();
+  });
+
+  it("loads a saved budget as enabled, and no budget as disabled", () => {
+    const on = formFromSettings({ tradingBudgetSol: 1.5 });
+    expect(on.budgetEnabled).toBe(true);
+    expect(on.tradingBudgetSol).toBe(1.5);
+    const off = formFromSettings({ tradingBudgetSol: null });
+    expect(off.budgetEnabled).toBe(false);
+    expect(off.tradingBudgetSol).toBe("");
+  });
+
+  it("requires a positive amount while enabled", () => {
+    expect(validateGlobalSettings(valid({ budgetEnabled: true, tradingBudgetSol: "" })).tradingBudgetSol).toBeTruthy();
+    expect(validateGlobalSettings(valid({ budgetEnabled: true, tradingBudgetSol: 0 })).tradingBudgetSol).toBeTruthy();
+    expect(validateGlobalSettings(valid({ budgetEnabled: true, tradingBudgetSol: -1 })).tradingBudgetSol).toBeTruthy();
+    expect(validateGlobalSettings(valid({ budgetEnabled: true, tradingBudgetSol: 2e6 })).tradingBudgetSol).toBeTruthy();
+    expect(validateGlobalSettings(valid({ budgetEnabled: true, tradingBudgetSol: 1 })).tradingBudgetSol).toBeUndefined();
+  });
+
+  it("ignores the amount while disabled", () => {
+    expect(validateGlobalSettings(valid({ budgetEnabled: false, tradingBudgetSol: "" })).tradingBudgetSol).toBeUndefined();
+    expect(toSettingsPayload(valid({ budgetEnabled: false, tradingBudgetSol: 3 })).tradingBudgetSol).toBeNull();
+  });
+
+  it("sends the amount when enabled", () => {
+    expect(toSettingsPayload(valid({ budgetEnabled: true, tradingBudgetSol: 2.5 })).tradingBudgetSol).toBe(2.5);
+  });
+
+  it("round-trips through the form without losing or inventing a budget", () => {
+    expect(toSettingsPayload(formFromSettings({ tradingBudgetSol: 1.25 })).tradingBudgetSol).toBe(1.25);
+    expect(toSettingsPayload(formFromSettings({})).tradingBudgetSol).toBeNull();
   });
 });

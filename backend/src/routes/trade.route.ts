@@ -471,6 +471,30 @@ router.post("/confirm", async (req, res) => {
       custody: "self",
     });
 
+    // Keep this position's open/closed state in step with what the trade did
+    // (utils/positionState.ts). A manual BUY (re)opens it; a SELL that leaves
+    // nothing in the wallet closes it. Without the sell half, a manual
+    // position sold at a loss stayed "open" forever (its netSol stays
+    // positive) and kept showing up on the Sell page with nothing to sell.
+    // Best-effort: a failure here must never fail the confirmed trade.
+    try {
+      const holder = actualSigner || wallet;
+      if (holder) {
+        if (type === "buy") {
+          await db.updatePositionMetadata(token, holder, { remainingPct: 100 });
+        } else {
+          const { raw } = await getTokenBalance(holder, token);
+          if (/^0*$/.test(raw)) {
+            await db.updatePositionMetadata(token, holder, { remainingPct: 0 });
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.warn(
+        `Could not update position state after ${type}: ${err?.message}`,
+      );
+    }
+
     // Targeted to the signer's own wallet room, not a global broadcast —
     // a manual trade is that wallet's own private activity, not the bot's
     // public activity (see tradeFeed emits elsewhere, which stay global —
@@ -490,6 +514,88 @@ router.post("/confirm", async (req, res) => {
     });
   } catch (err: any) {
     logger.error("Confirm trade error: " + String(err));
+    return res.status(500).json({
+      success: false,
+      message: err.message || String(err),
+    });
+  }
+});
+
+/**
+ * POST /api/trade/calculate-risk
+ * Calculate trade size based on risk parameters
+ * Body: { balance, riskPercent, riskAmount }
+ */
+router.post("/calculate-risk", async (req, res) => {
+  try {
+    const { balance, riskPercent, riskAmount } = req.body;
+
+    if (!balance || typeof balance !== "number") {
+      return res.status(400).json({
+        success: false,
+        message: "Balance is required and must be a number",
+      });
+    }
+
+    let calculatedAmount = 0;
+    let calculatedPercent = 0;
+
+    // If risk amount is provided, use it directly
+    if (riskAmount && typeof riskAmount === "number" && riskAmount > 0) {
+      calculatedAmount = riskAmount;
+      calculatedPercent = (riskAmount / balance) * 100;
+    }
+    // If risk percent is provided, calculate amount from percentage
+    else if (
+      riskPercent &&
+      typeof riskPercent === "number" &&
+      riskPercent > 0
+    ) {
+      calculatedPercent = riskPercent;
+      calculatedAmount = (balance * riskPercent) / 100;
+    }
+    // Default to 1% of balance
+    else {
+      calculatedPercent = 1;
+      calculatedAmount = balance * 0.01;
+    }
+
+    // Cap at 100% of balance
+    if (calculatedAmount > balance) {
+      calculatedAmount = balance;
+      calculatedPercent = 100;
+    }
+
+    // Ensure minimum trade size (0.001 SOL)
+    if (calculatedAmount < 0.001) {
+      calculatedAmount = 0.001;
+      calculatedPercent = (0.001 / balance) * 100;
+    }
+
+    logger.info(
+      `Risk calculation: Balance=${balance.toFixed(
+        4,
+      )} SOL, Risk=${calculatedPercent.toFixed(
+        2,
+      )}%, Amount=${calculatedAmount.toFixed(4)} SOL`,
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        balance,
+        riskPercent: Number(calculatedPercent.toFixed(2)),
+        riskAmount: Number(calculatedAmount.toFixed(4)),
+        amountLamports: Math.floor(calculatedAmount * 1e9),
+        recommendation: {
+          conservative: Number((balance * 0.01).toFixed(4)), // 1%
+          moderate: Number((balance * 0.025).toFixed(4)), // 2.5%
+          aggressive: Number((balance * 0.05).toFixed(4)), // 5%
+        },
+      },
+    });
+  } catch (err: any) {
+    logger.error("Risk calculation error: " + String(err));
     return res.status(500).json({
       success: false,
       message: err.message || String(err),

@@ -7,7 +7,11 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-import express from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 import cors from "cors";
 
 import tradeRoutes from "./routes/trade.route.js";
@@ -23,7 +27,6 @@ import traderConfigRoutes from "./routes/traderConfig.route.js";
 import adminRoutes from "./routes/admin.route.js";
 import userRoutes from "./routes/user.route.js";
 import oldTokensRoute from "./routes/oldTokens.route.js";
-import socialRoute from "./routes/social.route.js";
 import userWalletRoute from "./routes/userWallet.route.js";
 
 import dbService from "./services/db.service.js";
@@ -90,7 +93,34 @@ export const createApp = () => {
   app.use("/api/config", configRoutes);
   app.use("/api/trader-config", traderConfigRoutes);
   app.use("/api/old-tokens", oldTokensRoute);
-  app.use("/api/social", socialRoute);
   app.use("/api/user-wallet", userWalletRoute);
+
+  // Unknown /api routes answer in JSON like everything else. Express's default
+  // 404 is an HTML page ("Cannot POST /api/..."), which the dashboard's fetch
+  // helper can only report as "Invalid JSON response" — hiding the real cause,
+  // most often a dashboard that is newer than the backend actually running.
+  app.use("/api", (req, res) => {
+    res.status(404).json({
+      success: false,
+      error: `No such API route: ${req.method} ${req.originalUrl} — the backend may be out of date; restart it after updating.`,
+    });
+  });
+
+  // Errors raised outside a route's own try/catch (e.g. a malformed JSON
+  // body) are also answered in JSON, not as an HTML error page.
+  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    const status = typeof err?.status === "number" ? err.status : 500;
+    res.status(status).json({
+      success: false,
+      error:
+        err?.type === "entity.parse.failed"
+          ? "Request body isn't valid JSON"
+          : status >= 500
+            ? "Internal server error"
+            : err?.message || "Request failed",
+    });
+  });
+
   return app;
 };

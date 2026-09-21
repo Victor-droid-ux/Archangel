@@ -5,6 +5,8 @@ import { Card } from "@components/ui/card";
 import { fetcher, formatNumber, formatPrice } from "@lib/utils";
 import { useParams } from "next/navigation";
 import { useWallet } from "@hooks/useWallet";
+import { copyText } from "@lib/clipboard";
+import { toast } from "react-hot-toast";
 import {
   TokenPriceChart,
   PricePoint,
@@ -27,7 +29,13 @@ interface TokenDetails {
   totalSupply?: number;
 }
 
-function ChangePill({ label, value }: { label: string; value?: number | null }) {
+function ChangePill({
+  label,
+  value,
+}: {
+  label: string;
+  value?: number | null;
+}) {
   if (value == null) {
     return (
       <span className="text-xs px-2 py-1 rounded-full bg-white/5 text-base-content/30">
@@ -119,9 +127,12 @@ export default function TokenDetailsPage() {
 
   const handleCopy = async () => {
     if (!token?.mint) return;
-    await navigator.clipboard.writeText(token.mint);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1200);
+    if (await copyText(token.mint)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } else {
+      toast.error("Couldn't copy — select the address and copy it manually.");
+    }
   };
 
   if (loading) {
@@ -181,8 +192,8 @@ export default function TokenDetailsPage() {
               {token.price
                 ? `$${formatPrice(token.price)}`
                 : token.priceSol
-                ? `${token.priceSol.toFixed(8)} SOL`
-                : "—"}
+                  ? `${token.priceSol.toFixed(8)} SOL`
+                  : "—"}
             </div>
             <div className="flex gap-1.5 mt-1.5 justify-end">
               <ChangePill label="1h" value={token.priceChange1h} />
@@ -198,8 +209,8 @@ export default function TokenDetailsPage() {
               token.marketCap
                 ? `$${formatNumber(token.marketCap)}`
                 : token.marketCapSol
-                ? `${token.marketCapSol.toFixed(2)} SOL`
-                : "—"
+                  ? `${token.marketCapSol.toFixed(2)} SOL`
+                  : "—"
             }
           />
           <StatBlock

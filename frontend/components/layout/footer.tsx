@@ -3,6 +3,7 @@
 import React from "react";
 import { Github, Twitter, BookOpen } from "lucide-react";
 import Link from "next/link";
+import { SITE_LINKS } from "@lib/constant";
 
 export default function Footer() {
   return (
@@ -19,7 +20,7 @@ export default function Footer() {
         {/* Right: Social Links */}
         <div className="flex items-center gap-5">
           <Link
-            href="https://docs.archangelbot.io"
+            href={SITE_LINKS.docs}
             target="_blank"
             rel="noopener noreferrer"
             className="hover:text-primary transition-colors flex items-center gap-1"
@@ -28,7 +29,7 @@ export default function Footer() {
             Docs
           </Link>
           <Link
-            href="https://twitter.com/archangelbot"
+            href={SITE_LINKS.twitter}
             target="_blank"
             rel="noopener noreferrer"
             className="hover:text-primary transition-colors flex items-center gap-1"
@@ -37,7 +38,7 @@ export default function Footer() {
             Twitter
           </Link>
           <Link
-            href="https://github.com/onuhvictor/archangel-bot"
+            href={SITE_LINKS.github}
             target="_blank"
             rel="noopener noreferrer"
             className="hover:text-primary transition-colors flex items-center gap-1"

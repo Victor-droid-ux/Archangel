@@ -27,8 +27,10 @@ import {
 } from "./solana.service.js";
 import { connect } from "./db.service.js";
 import dbService from "./db.service.js";
+import { isOpenPosition } from "../utils/positionState.js";
 import { getJupiterQuote, executeJupiterSwap } from "./jupiter.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
+import * as positionExitCoordinator from "./execution/positionExitCoordinator.service.js";
 import { setAutoTradeEnabled } from "./traderConfig.service.js";
 import { emitToWalletOrGlobal } from "../utils/walletSocket.js";
 import type { Server } from "socket.io";
@@ -83,7 +85,7 @@ async function getCol(): Promise<Collection<UserWallet>> {
  * call. Idempotent — safe to call every time a wallet connects.
  */
 export async function getOrCreateUserWallet(
-  ownerWalletRaw: string
+  ownerWalletRaw: string,
 ): Promise<UserWallet> {
   const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
   const c = await getCol();
@@ -103,7 +105,7 @@ export async function getOrCreateUserWallet(
     await c.insertOne(doc);
     log.info(
       { ownerWallet, hotWallet: doc.hotWalletPublicKey },
-      "Generated new custodial hot wallet"
+      "Generated new custodial hot wallet",
     );
     return doc;
   } catch (err: any) {
@@ -119,7 +121,7 @@ export async function getOrCreateUserWallet(
 }
 
 export async function getUserWallet(
-  ownerWalletRaw: string
+  ownerWalletRaw: string,
 ): Promise<UserWallet | null> {
   const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
   const c = await getCol();
@@ -131,7 +133,7 @@ export async function getUserWallet(
  * at execution time (later phase) — never returned from an API response.
  */
 export async function getUserWalletKeypair(
-  ownerWalletRaw: string
+  ownerWalletRaw: string,
 ): Promise<Keypair | null> {
   const wallet = await getUserWallet(ownerWalletRaw);
   if (!wallet) return null;
@@ -140,7 +142,7 @@ export async function getUserWalletKeypair(
 }
 
 export async function getUserWalletBalanceSol(
-  ownerWalletRaw: string
+  ownerWalletRaw: string,
 ): Promise<{ hotWalletPublicKey: string; balanceSol: number } | null> {
   const wallet = await getOrCreateUserWallet(ownerWalletRaw);
   const balanceSol = await getBalanceInSol(wallet.hotWalletPublicKey);
@@ -158,7 +160,7 @@ export async function getUserWalletBalanceSol(
  */
 export async function withdrawToOwner(
   ownerWalletRaw: string,
-  amountSol: number
+  amountSol: number,
 ): Promise<{ signature: string; amountSol: number }> {
   if (!Number.isFinite(amountSol) || amountSol <= 0) {
     throw new Error("Withdrawal amount must be a positive number");
@@ -176,10 +178,11 @@ export async function withdrawToOwner(
   }
 
   const balanceLamports = Math.round(
-    (await getBalanceInSol(wallet.hotWalletPublicKey)) * LAMPORTS_PER_SOL
+    (await getBalanceInSol(wallet.hotWalletPublicKey)) * LAMPORTS_PER_SOL,
   );
   const requestedLamports = Math.round(amountSol * LAMPORTS_PER_SOL);
-  const maxWithdrawableLamports = balanceLamports - WITHDRAWAL_FEE_RESERVE_LAMPORTS;
+  const maxWithdrawableLamports =
+    balanceLamports - WITHDRAWAL_FEE_RESERVE_LAMPORTS;
 
   if (maxWithdrawableLamports <= 0) {
     throw new Error("Balance too low to cover the network fee");
@@ -188,7 +191,7 @@ export async function withdrawToOwner(
     throw new Error(
       `Requested ${amountSol} SOL exceeds withdrawable balance of ${(
         maxWithdrawableLamports / LAMPORTS_PER_SOL
-      ).toFixed(6)} SOL (after reserving the network fee)`
+      ).toFixed(6)} SOL (after reserving the network fee)`,
     );
   }
 
@@ -198,7 +201,7 @@ export async function withdrawToOwner(
       fromPubkey: keypair.publicKey,
       toPubkey: new PublicKey(ownerWallet),
       lamports: requestedLamports,
-    })
+    }),
   );
 
   const latest = await conn.getLatestBlockhash("confirmed");
@@ -215,12 +218,12 @@ export async function withdrawToOwner(
       blockhash: latest.blockhash,
       lastValidBlockHeight: latest.lastValidBlockHeight,
     },
-    "confirmed"
+    "confirmed",
   );
 
   log.info(
     { ownerWallet, hotWallet: wallet.hotWalletPublicKey, amountSol, signature },
-    "Withdrawal completed"
+    "Withdrawal completed",
   );
 
   // Recorded directly here (not detected from chain, unlike deposits) —
@@ -248,16 +251,183 @@ export async function listAllUserWallets(): Promise<UserWallet[]> {
 }
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
-// Same floor used elsewhere (monitor.service.ts, db.service.ts) to treat a
-// near-zero remainder as fully closed rather than an attemptable sell.
-const POSITION_DUST_THRESHOLD_SOL = Number(
-  process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005
-);
-
 export interface StopAutoTradeResult {
   disabledAutoTrade: boolean;
   sold: { token: string; signature: string | null; amountSol: number }[];
   failed: { token: string; error: string }[];
+  // Records that still read as open but held nothing on-chain (already sold or
+  // lost earlier, never marked closed). They are marked closed now rather than
+  // reported as failed sells — there was nothing to sell.
+  alreadyClosed: string[];
+}
+
+export type SellPositionOutcome =
+  | {
+      status: "sold";
+      token: string;
+      signature: string | null;
+      amountSol: number;
+    }
+  | { status: "already_closed"; token: string }
+  | { status: "failed"; token: string; error: string };
+
+/**
+ * Sells ONE bot-held (custodial) position in full from the owner's trading
+ * wallet. Shared by "Sell All & Stop" (looping over every position) and the
+ * single-position Sell button, so both behave identically.
+ *
+ * It takes the same position-exit claim the monitor takes before any of ITS
+ * sells (execution/positionExitCoordinator.service.ts), so a manual sell can
+ * never race a take-profit / stop-loss exit for the same position — whichever
+ * gets the claim goes first, the other reports "already in flight".
+ */
+async function sellOneCustodialPosition(
+  ownerWallet: string,
+  pos: { token: string; avgBuyPrice?: number | undefined },
+  keypair: Keypair,
+  io: Server | undefined,
+  reason: "stop_auto_trade" | "manual_sell",
+): Promise<SellPositionOutcome> {
+  const token = pos.token;
+
+  const claimed = await positionExitCoordinator.claimPositionExit(
+    token,
+    ownerWallet,
+  );
+  if (!claimed) {
+    return {
+      status: "failed",
+      token,
+      error: "The bot is already selling this position — try again in a moment",
+    };
+  }
+
+  let sold = false;
+  try {
+    // Sell the real on-chain balance, not a DB-derived approximation —
+    // avoids leaving unsellable dust behind from any drift between the two.
+    const { raw, uiAmount } = await getTokenBalance(
+      keypair.publicKey.toBase58(),
+      token,
+    );
+    if (!raw || raw === "0") {
+      // Nothing held: the record is stale, not a failed sale. Close it so it
+      // stops being monitored, counted and offered for sale.
+      await dbService.updatePositionMetadata(token, ownerWallet, {
+        remainingPct: 0,
+      });
+      pnlTrackerService.stopTracking(token, ownerWallet);
+      return { status: "already_closed", token };
+    }
+
+    const quote = await getJupiterQuote(token, SOL_MINT, raw, 1000);
+    if (!quote?.outAmount) {
+      return { status: "failed", token, error: "No Jupiter route available" };
+    }
+
+    const swap = await executeJupiterSwap({
+      inputMint: token,
+      outputMint: SOL_MINT,
+      amount: raw,
+      userPublicKey: keypair.publicKey.toBase58(),
+      slippageBps: 1000,
+      signer: keypair,
+    });
+    if (!swap.success) {
+      return { status: "failed", token, error: swap.error || "Swap failed" };
+    }
+    sold = true;
+
+    const amountSol = Number(quote.outAmount) / 1e9;
+    // What this sale actually realized, so stats and the trade feed reflect
+    // it (this used to record the entry price and a 0% result).
+    const exitPrice =
+      uiAmount > 0 ? amountSol / uiAmount : (pos.avgBuyPrice ?? 0);
+    const pnl =
+      pos.avgBuyPrice && pos.avgBuyPrice > 0 && exitPrice > 0
+        ? exitPrice / pos.avgBuyPrice - 1
+        : 0;
+
+    const trade = await dbService.addTrade({
+      type: "sell",
+      token,
+      inputMint: token,
+      outputMint: SOL_MINT,
+      amount: Number(quote.outAmount),
+      price: exitPrice,
+      pnl,
+      wallet: ownerWallet,
+      simulated: false,
+      signature: swap.signature ?? null,
+      timestamp: new Date(),
+      custody: "custodial",
+    });
+
+    // Sold in full: mark the position closed. Without this a sale at a loss
+    // left it reading as open (netSol stays positive), so the monitor kept
+    // trying to manage — and sell — tokens that were no longer there.
+    await dbService.updatePositionMetadata(token, ownerWallet, {
+      remainingPct: 0,
+    });
+
+    pnlTrackerService.stopTracking(token, ownerWallet);
+    emitToWalletOrGlobal(io, ownerWallet, "tradeFeed", {
+      ...trade,
+      // "auto" = the bot's own trade (gets its own popup); a sale the user
+      // asked for is announced like any other manual trade.
+      auto: reason === "stop_auto_trade",
+      reason,
+    });
+
+    return {
+      status: "sold",
+      token,
+      signature: swap.signature ?? null,
+      amountSol,
+    };
+  } catch (err: any) {
+    return { status: "failed", token, error: err?.message || "Unknown error" };
+  } finally {
+    // Completed on a sale (blocks a duplicate exit), released otherwise so a
+    // retry — or the monitor — can try again straight away.
+    if (sold) {
+      await positionExitCoordinator.completePositionExit(token, ownerWallet);
+    } else {
+      await positionExitCoordinator.releasePositionExit(token, ownerWallet);
+    }
+  }
+}
+
+/**
+ * The single-position Sell button: sells one open bot position for this
+ * owner. (A self-custody/manual position lives in the user's own wallet,
+ * which only they can sign for — never the server; those use the Sell page.)
+ */
+export async function sellCustodialPosition(
+  ownerWalletRaw: string,
+  token: string,
+  io?: Server,
+): Promise<SellPositionOutcome> {
+  const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
+
+  const positions = await dbService.getPositions(ownerWallet);
+  const pos = positions.find(
+    (p) => p.token === token && p.custody === "custodial" && isOpenPosition(p),
+  );
+  if (!pos) {
+    return {
+      status: "failed",
+      token,
+      error: "No open bot position found for this token",
+    };
+  }
+
+  const keypair = await getUserWalletKeypair(ownerWallet);
+  if (!keypair) {
+    return { status: "failed", token, error: "No custodial signer available" };
+  }
+
+  return sellOneCustodialPosition(ownerWallet, pos, keypair, io, "manual_sell");
 }
 
 /**
@@ -270,7 +440,7 @@ export interface StopAutoTradeResult {
  */
 export async function stopAutoTradeAndLiquidate(
   ownerWalletRaw: string,
-  io?: Server
+  io?: Server,
 ): Promise<StopAutoTradeResult> {
   const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
 
@@ -279,98 +449,46 @@ export async function stopAutoTradeAndLiquidate(
     disabledAutoTrade: true,
     sold: [],
     failed: [],
+    alreadyClosed: [],
   };
 
   const positions = await dbService.getPositions(ownerWallet);
+  // isOpenPosition, not a bare netSol check: a position sold at a loss keeps a
+  // positive netSol forever and used to be "liquidated" again here.
   const custodialOpen = positions.filter(
-    (p) => p.custody === "custodial" && p.netSol >= POSITION_DUST_THRESHOLD_SOL
+    (p) => p.custody === "custodial" && isOpenPosition(p),
   );
   if (custodialOpen.length === 0) return result;
 
   const keypair = await getUserWalletKeypair(ownerWallet);
   if (!keypair) {
     for (const p of custodialOpen) {
-      result.failed.push({ token: p.token, error: "No custodial signer available" });
+      result.failed.push({
+        token: p.token,
+        error: "No custodial signer available",
+      });
     }
     return result;
   }
 
   for (const pos of custodialOpen) {
-    try {
-      // Sell the real on-chain balance, not a DB-derived approximation —
-      // avoids leaving unsellable dust behind from any drift between the
-      // two.
-      const { raw } = await getTokenBalance(
-        keypair.publicKey.toBase58(),
-        pos.token
-      );
-      if (!raw || raw === "0") {
-        result.failed.push({
-          token: pos.token,
-          error: "No on-chain balance found to sell",
-        });
-        continue;
-      }
-
-      const quote = await getJupiterQuote(pos.token, SOL_MINT, raw, 1000);
-      if (!quote?.outAmount) {
-        result.failed.push({
-          token: pos.token,
-          error: "No Jupiter route available",
-        });
-        continue;
-      }
-
-      const swap = await executeJupiterSwap({
-        inputMint: pos.token,
-        outputMint: SOL_MINT,
-        amount: raw,
-        userPublicKey: keypair.publicKey.toBase58(),
-        slippageBps: 1000,
-        signer: keypair,
-      });
-
-      if (!swap.success) {
-        result.failed.push({
-          token: pos.token,
-          error: swap.error || "Swap failed",
-        });
-        continue;
-      }
-
-      const amountSol = Number(quote.outAmount) / 1e9;
-      const trade = await dbService.addTrade({
-        type: "sell",
-        token: pos.token,
-        inputMint: pos.token,
-        outputMint: SOL_MINT,
-        amount: Number(quote.outAmount),
-        price: pos.avgBuyPrice ?? 0,
-        pnl: 0,
-        wallet: ownerWallet,
-        simulated: false,
-        signature: swap.signature ?? null,
-        timestamp: new Date(),
-        custody: "custodial",
-      });
-
-      pnlTrackerService.stopTracking(pos.token, ownerWallet);
-      emitToWalletOrGlobal(io, ownerWallet, "tradeFeed", {
-        ...trade,
-        auto: true,
-        reason: "stop_auto_trade",
-      });
-
+    const outcome = await sellOneCustodialPosition(
+      ownerWallet,
+      pos,
+      keypair,
+      io,
+      "stop_auto_trade",
+    );
+    if (outcome.status === "sold") {
       result.sold.push({
-        token: pos.token,
-        signature: swap.signature ?? null,
-        amountSol,
+        token: outcome.token,
+        signature: outcome.signature,
+        amountSol: outcome.amountSol,
       });
-    } catch (err: any) {
-      result.failed.push({
-        token: pos.token,
-        error: err?.message || "Unknown error",
-      });
+    } else if (outcome.status === "already_closed") {
+      result.alreadyClosed.push(outcome.token);
+    } else {
+      result.failed.push({ token: outcome.token, error: outcome.error });
     }
   }
 
@@ -385,4 +503,5 @@ export default {
   withdrawToOwner,
   listAllUserWallets,
   stopAutoTradeAndLiquidate,
+  sellCustodialPosition,
 };

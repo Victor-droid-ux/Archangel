@@ -7,7 +7,6 @@ import LiveFeed from "@components/trading/live-feed";
 import TokenTable from "@app/trading/token-table";
 import StatsPanel from "@app/trading/stats-panel";
 import ActionsBar from "@app/trading/actions-bar";
-// import { SocialFilter } from "@app/trading/social-filter"; // Disabled - backend endpoint exists (GET /api/social/twitter) but only returns hardcoded placeholder data; no real Twitter/sentiment integration exists yet, and this component's field names (count/sentiment) don't even match that stub's shape (trending/lastUpdated)
 import PerformanceChart from "@components/trading/performance-chart";
 import PortfolioPnLPanel from "@components/trading/PortfolioPnLPanel";
 import LivePnL from "@components/trading/LivePnL";
@@ -17,12 +16,8 @@ import TradeHistory from "@components/trading/trade-history";
 import { useStatsSync } from "@hooks/useStatsSync";
 import { AutoTradeReadiness } from "@components/trading/AutoTradeReadiness";
 import { RiskManagementPanel } from "@components/trading/risk-management-panel";
-import { ValidationStatus } from "@components/trading/ValidationStatus";
-import { useValidation } from "@hooks/useValidation";
-import { useConfig } from "@hooks/useConfig";
 import { useSocket } from "@hooks/useSocket";
 import { toast } from "react-hot-toast";
-import { StoredTokenCheckerStatus } from "@components/trading/StoredTokenCheckerStatus";
 import { WatchlistPanel } from "@components/trading/WatchlistPanel";
 
 // Content must never depend on this animation actually running to become
@@ -46,12 +41,6 @@ export default function TradingDashboard() {
 
   // Initialize socket connection for pool monitoring notifications
   const { lastMessage } = useSocket();
-
-  // Get selected token for validation
-  const { selectedToken } = useConfig();
-
-  // Initialize validation hook
-  const { validation } = useValidation(selectedToken);
 
   // Listen for pool monitoring events
   useEffect(() => {
@@ -128,18 +117,7 @@ export default function TradingDashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* LEFT COLUMN */}
         <motion.div {...fadeIn(0.3)} className="space-y-6">
-          {/* Validation Status Panel - NEW */}
-          {selectedToken && <ValidationStatus validation={validation} />}
-
-          {/* Stored Token Checker Status */}
-          <StoredTokenCheckerStatus />
-
           <WatchlistPanel />
-
-          {/* Social Filter temporarily disabled - backend endpoint not implemented */}
-          {/* <Card className="p-4">
-            <SocialFilter />
-          </Card> */}
         </motion.div>
 
         {/* CENTER COLUMN */}

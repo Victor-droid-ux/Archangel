@@ -2,6 +2,7 @@
 
 import React, { useRef } from "react";
 import useSWR from "swr";
+import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
 import { fetcher, formatPrice } from "@lib/utils";
 import { Loader2 } from "lucide-react";
@@ -34,6 +35,7 @@ export default function TokenTable() {
     }
   );
 
+  const router = useRouter();
   const { connected } = useSocket();
 
   /** SOCKET — realtime token refresh */
@@ -106,9 +108,7 @@ export default function TokenTable() {
                   <tr
                     key={t.mint}
                     className="border-b border-base-300 hover:bg-base-300/20 cursor-pointer"
-                    onClick={() =>
-                      (window.location.href = `/trading/${t.mint}`)
-                    }
+                    onClick={() => router.push(`/trading/${t.mint}`)}
                   >
                     <td className="py-2 px-4 font-medium">{t.symbol}</td>
 

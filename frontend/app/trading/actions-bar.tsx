@@ -97,6 +97,8 @@ export default function ActionsBar() {
         disabledAutoTrade: boolean;
         sold: { token: string }[];
         failed: { token: string; error: string }[];
+        // Records that still read as open but held nothing (cleared now).
+        alreadyClosed?: string[];
         error?: string;
       }>(`/api/user-wallet/${publicKey}/stop-auto-trade`, {
         method: "POST",
@@ -108,6 +110,13 @@ export default function ActionsBar() {
       }
 
       toast.dismiss("stop-auto-trade");
+      const cleared = res.alreadyClosed?.length ?? 0;
+      if (cleared > 0) {
+        toast(
+          `Cleared ${cleared} stale position record${cleared === 1 ? "" : "s"} that held nothing.`,
+          { duration: 6000 }
+        );
+      }
       if (res.sold.length === 0 && res.failed.length === 0) {
         toast.success(
           "Auto-trade disabled. You had no bot-bought positions to sell."

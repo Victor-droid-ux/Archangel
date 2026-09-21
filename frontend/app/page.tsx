@@ -39,12 +39,17 @@ export default function TradingPage() {
     if (lastMessage?.event !== "tradeFeed") return;
 
     const trade = lastMessage.payload;
+    // The bot's own trades already get their own popup from
+    // AccountNotifications; announcing them here as well showed every auto
+    // trade twice. This toast is for manual trades.
+    if (trade.auto) return;
     // trade.amount is lamports (tradeFeed's convention everywhere it's emitted)
     const amountSol = (trade.amount ?? 0) / 1e9;
+    const token = trade.token
+      ? `${trade.token.slice(0, 4)}…${trade.token.slice(-4)}`
+      : "token";
     toast.success(
-      `${trade.type.toUpperCase()} ${amountSol.toFixed(4)} SOL ${
-        trade.token
-      } trade received!`,
+      `${String(trade.type).toUpperCase()} ${amountSol.toFixed(4)} SOL of ${token} confirmed`,
       { duration: 3000 }
     );
   }, [lastMessage]);
@@ -86,7 +91,10 @@ export default function TradingPage() {
       </motion.div>
 
       {/* ========================== QUICK TRADE ========================== */}
-      <motion.div {...fadeIn(0.05)} className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <motion.div
+        {...fadeIn(0.05)}
+        className="grid grid-cols-1 sm:grid-cols-2 gap-4"
+      >
         <Button
           variant="secondary"
           onClick={() => {
@@ -97,6 +105,7 @@ export default function TradingPage() {
             router.push("/trading/buy");
           }}
           disabled={!connected}
+          title={connected ? undefined : "Connect your wallet first"}
           className="text-base py-4 hover:shadow-glow-success"
         >
           <TrendingUp size={18} className="text-success" />
@@ -113,6 +122,7 @@ export default function TradingPage() {
             router.push("/trading/sell");
           }}
           disabled={!connected}
+          title={connected ? undefined : "Connect your wallet first"}
           className="text-base py-4"
         >
           <TrendingDown size={18} className="text-danger" />

@@ -14,8 +14,13 @@
 //      count toward it)
 //   3. the trading wallet's balance can fund at least one position of the
 //      minimum size — the same split the backend uses (lib/positionSizing.ts)
-// A wallet whose Max Open Positions are ALL in use is still "ready": that's
-// the bot working as configured, and a slot reopens when a position closes.
+//   4. today's loss hasn't hit the server's daily loss limit
+//   5. if a trading budget is on, some of its capital is still free to trade —
+//      a budget that is fully AT WORK is fine (a slot reopens when a position
+//      closes), but one whose capital has been used up by losses needs raising
+// A wallet whose Max Open Positions (or the server's own position cap) are ALL
+// in use is still "ready": that's the bot working as configured, and a slot
+// reopens when a position closes.
 "use client";
 
 import React, { useEffect, useState } from "react";
@@ -50,6 +55,13 @@ export function AutoTradeReadiness({
     openPositions,
     minTradeSol,
     feeReserveSol,
+    dailyLossPct,
+    maxDailyLossPct,
+    serverMaxOpenPositions,
+    tradingBudgetSol,
+    realizedLossSol,
+    deployedSol,
+    protectedProfitSol,
     error: walletError,
   } = useUserWallet();
   const { config, loadError, refetch } = useTraderConfig();
@@ -122,23 +134,77 @@ export function AutoTradeReadiness({
     maxOpenPositions,
     minTradeSol,
     feeReserveSol,
+    budgetSol: tradingBudgetSol,
+    deployedSol: deployedSol ?? 0,
+    realizedLossSol: realizedLossSol ?? 0,
   });
-  const lowBalance = sizing.status === "low_balance";
-  const atCapacity = sizing.status === "at_capacity";
+  const lowBalance =
+    sizing.status === "low_balance" && sizing.limitedBy === "balance";
+  // Budget on and none of its capital free to trade: either it is all at work
+  // (normal — a slot reopens when a position closes) or losses have used it up.
+  const budgetLimited =
+    sizing.status === "low_balance" && sizing.limitedBy === "budget";
+  const budgetAtWork = budgetLimited && (deployedSol ?? 0) > 0;
+  const budgetExhausted = budgetLimited && !budgetAtWork;
+  const atServerCap =
+    (serverMaxOpenPositions ?? 0) > 0 &&
+    (openPositions ?? 0) >= (serverMaxOpenPositions ?? 0);
+  const atCapacity =
+    sizing.status === "at_capacity" || atServerCap || budgetAtWork;
+  const slotsFull =
+    atCapacity && !budgetAtWork
+      ? atServerCap
+        ? serverMaxOpenPositions
+        : maxOpenPositions
+      : null;
 
-  const ready = autoTradeEnabled && !capReached && !lowBalance;
+  // Today's loss against the server's daily limit — the bot pauses NEW buys
+  // (it keeps managing open positions) until the day rolls over.
+  const dailyLimitReached =
+    dailyLossPct != null &&
+    maxDailyLossPct != null &&
+    dailyLossPct >= maxDailyLossPct;
+
+  const ready =
+    autoTradeEnabled &&
+    !capReached &&
+    !lowBalance &&
+    !budgetExhausted &&
+    !dailyLimitReached;
+
+  // Profit the bot is keeping its hands off, when a budget is on.
+  const protectedNote =
+    tradingBudgetSol !== null && (protectedProfitSol ?? 0) > 0
+      ? ` ${formatNumber(protectedProfitSol ?? 0, 4)} SOL of profit is protected — the bot won't trade it, and you can withdraw it.`
+      : "";
 
   if (ready) {
+    // The balance may fund fewer positions than the user allows.
+    const partialNote =
+      sizing.status === "ready" &&
+      !atServerCap &&
+      sizing.slotsUsed < sizing.freeSlots
+        ? ` Your balance only funds ${sizing.slotsUsed} of the ${sizing.freeSlots} free slots at the minimum size, so you'll hold fewer than ${maxOpenPositions} positions until you top up.`
+        : "";
     const nextNote =
       sizing.status === "ready"
-        ? ` Next position ≈ ${formatNumber(sizing.buySol, 4)} SOL.`
+        ? ` Next position ≈ ${formatNumber(sizing.buySol, 4)} SOL.${partialNote}`
         : "";
+    const atCapacityText = budgetAtWork
+      ? `Auto-trade is on — your whole trading budget is at work. The bot opens a new position as soon as one closes.`
+      : `Auto-trade is on — all ${slotsFull} position slots are in use${
+          atServerCap ? " (the server's own position cap)" : ""
+        }. The bot opens a new position as soon as one closes.`;
     return compact ? (
       <span
         title={
           atCapacity
-            ? `All ${maxOpenPositions} position slots are in use — a new one opens when a position closes.`
-            : undefined
+            ? `${
+                budgetAtWork
+                  ? "Your trading budget is fully at work"
+                  : `All ${slotsFull} position slots are in use`
+              } — a new position opens when one closes.${protectedNote}`
+            : `${partialNote}${protectedNote}`.trim() || undefined
         }
         className="inline-flex items-center gap-1.5 text-xs text-green-400 bg-green-900/20 border border-green-500/30 rounded-full px-3 py-1"
       >
@@ -149,14 +215,14 @@ export function AutoTradeReadiness({
       <div className="flex items-center gap-2 text-sm text-green-400 bg-green-900/20 border border-green-500/30 rounded-lg px-4 py-3">
         <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
         {atCapacity
-          ? `Auto-trade is on — all ${maxOpenPositions} position slots are in use. The bot opens a new position as soon as one closes.`
-          : `Auto-trade is on and your wallet is funded — the bot can trade for you.${nextNote}`}
+          ? `${atCapacityText}${protectedNote}`
+          : `Auto-trade is on and your wallet is funded — the bot can trade for you.${nextNote}${protectedNote}`}
       </div>
     );
   }
 
   // Problems fixed in Trading Settings vs. by depositing SOL.
-  const needsSettings = !autoTradeEnabled || capReached;
+  const needsSettings = !autoTradeEnabled || capReached || budgetExhausted;
 
   const missing: string[] = [];
   if (lowBalance) {
@@ -167,6 +233,19 @@ export function AutoTradeReadiness({
       )} SOL (it has ${formatNumber(balanceSol, 3)} SOL) — a low balance is what stops the bot opening positions`
     );
   }
+  if (budgetExhausted) {
+    missing.push(
+      `raise your trading budget in Trading Settings${
+        sizing.status === "low_balance" && sizing.neededBudgetSol != null
+          ? ` to at least ${formatNumber(sizing.neededBudgetSol, 3)} SOL`
+          : ""
+      } — its capital is used up${
+        (realizedLossSol ?? 0) > 0
+          ? ` (${formatNumber(realizedLossSol ?? 0, 4)} SOL of the ${tradingBudgetSol} SOL budget has been lost)`
+          : ""
+      }, and the rest of your wallet is protected, so the bot won't touch it`
+    );
+  }
   if (!autoTradeEnabled) {
     missing.push("enable auto-trade in Trading Settings");
   }
@@ -175,7 +254,29 @@ export function AutoTradeReadiness({
       `raise Max Total Trades in Trading Settings (${tradesTaken} of ${maxTotalTrades} used — closed trades count too)`
     );
   }
+  if (dailyLimitReached) {
+    missing.push(
+      `wait for tomorrow: today's losses reached the daily loss limit (${formatNumber(
+        dailyLossPct ?? 0,
+        1
+      )}% of ${maxDailyLossPct}%), so the bot has paused new buys — open positions are still managed`
+    );
+  }
   const reasonText = `The bot won't trade for you yet — ${missing.join(" and ")}.`;
+
+  // Say WHAT is stopping it right on the pill, not just "not active" — a
+  // user who hit their trade limit shouldn't have to hover to find out.
+  const pillLabel = !autoTradeEnabled
+    ? "Auto-trade is off"
+    : capReached
+      ? `Trade limit reached (${tradesTaken}/${maxTotalTrades})`
+      : budgetExhausted
+        ? "Trading budget used up"
+        : dailyLimitReached
+          ? "Daily loss limit reached"
+          : lowBalance
+            ? "Low balance"
+            : "Auto-trade not active";
 
   if (compact) {
     return (
@@ -190,7 +291,7 @@ export function AutoTradeReadiness({
           title={reasonText}
           className="inline-flex items-center gap-1.5 text-xs text-yellow-400 bg-yellow-900/20 border border-yellow-500/30 rounded-full px-3 py-1 hover:bg-yellow-900/30 transition-colors"
         >
-          <AlertTriangle className="w-3.5 h-3.5" /> Auto-trade not active
+          <AlertTriangle className="w-3.5 h-3.5" /> {pillLabel}
         </button>
         {settingsOpen && (
           <TraderConfigModal

@@ -1,13 +1,21 @@
 // backend/src/routes/userWallet.route.ts
 import { Router, Request, Response } from "express";
 import { getLogger } from "../utils/logger.js";
-import userWalletService from "../services/userWallet.service.js";
+import userWalletService, {
+  sellCustodialPosition,
+} from "../services/userWallet.service.js";
 import dbService from "../services/db.service.js";
 import {
   getMaxOpenPositions,
+  getTraderConfig,
   setAutoTradeEnabled,
 } from "../services/traderConfig.service.js";
-import { minBalanceForSlots, sizingEnv } from "../utils/positionSizing.js";
+import {
+  budgetBreakdown,
+  minBalanceForSlots,
+  sizingEnv,
+} from "../utils/positionSizing.js";
+import { getRiskStatus } from "../services/riskManagement.service.js";
 import { verifyWalletAuth } from "../utils/walletAuth.js";
 
 const router = Router();
@@ -29,17 +37,66 @@ router.get("/:ownerWallet", async (req: Request, res: Response) => {
     // open another position for this wallet: how many slots the trader
     // allows, how many are in use, and the sizing floors. The split itself is
     // computed from these (utils/positionSizing.ts), on both sides.
-    const [maxOpenPositions, openPositions] = await Promise.all([
+    const [maxOpenPositions, openPositions, traderConfig] = await Promise.all([
       getMaxOpenPositions(ownerWallet!),
       dbService.getOpenPositionCount(ownerWallet!),
+      getTraderConfig(ownerWallet!),
     ]);
     const { minTradeSol, feeReserveSol } = sizingEnv();
+
+    // Trading budget: how much the bot may have at work in total (the budget
+    // less losses realized since it was set), how much is at work now, and how
+    // much cash is PROTECTED — beyond the capital the bot may use: profits and
+    // later deposits it won't touch, withdrawable any time.
+    const rawBudget = traderConfig?.globalSettings?.tradingBudgetSol;
+    const tradingBudgetSol =
+      typeof rawBudget === "number" && rawBudget > 0 ? rawBudget : null;
+    const { deployedSol, realizedLossSol } =
+      tradingBudgetSol !== null
+        ? await dbService.getBudgetState(
+            ownerWallet!,
+            traderConfig?.globalSettings?.tradingBudgetSetAt ?? 0,
+          )
+        : { deployedSol: 0, realizedLossSol: 0 };
+    const { capitalSol, protectedProfitSol } = budgetBreakdown({
+      cashSol: result?.balanceSol ?? 0,
+      feeReserveSol,
+      budgetSol: tradingBudgetSol,
+      deployedSol,
+      realizedLossSol,
+    });
+
+    // The server-side safety limits that can also stop new buys, so the
+    // dashboard can say so instead of leaving the user to guess: today's
+    // loss against the daily limit, and the optional global position cap
+    // (MAX_OPEN_POSITIONS in the server's .env; 0 = none).
+    let risk: {
+      dailyLossPct: number;
+      maxDailyLossPct: number;
+      serverMaxOpenPositions: number;
+    } | null = null;
+    try {
+      const r = await getRiskStatus(ownerWallet!, result?.hotWalletPublicKey);
+      risk = {
+        dailyLossPct: r.dailyLossPct,
+        maxDailyLossPct: r.maxDailyLossPct,
+        serverMaxOpenPositions: r.maxOpenPositions,
+      };
+    } catch (err: any) {
+      log.warn({ err: err?.message }, "Could not compute risk status");
+    }
 
     return res.json({
       success: true,
       ...result,
+      ...(risk ?? {}),
       maxOpenPositions,
       openPositions,
+      tradingBudgetSol,
+      tradingCapitalSol: tradingBudgetSol !== null ? capitalSol : null,
+      realizedLossSol,
+      deployedSol,
+      protectedProfitSol,
       minTradeSol,
       feeReserveSol,
       // Enough to open every one of the trader's slots at the minimum size.
@@ -136,6 +193,61 @@ router.post(
       return res.status(400).json({
         success: false,
         error: err.message || "Stop auto-trade failed",
+      });
+    }
+  },
+);
+
+/**
+ * POST /api/user-wallet/:ownerWallet/sell-position
+ * body: { token, walletAuthTimestamp, walletAuthSignature }
+ * Sells ONE position the bot holds for this wallet (from its trading wallet).
+ * The dashboard's Sell button on a bot-bought position. "Sell All & Stop"
+ * (stop-auto-trade above) is the sell-everything version of this.
+ */
+router.post(
+  "/:ownerWallet/sell-position",
+  async (req: Request, res: Response) => {
+    try {
+      const { ownerWallet } = req.params;
+      const { token, walletAuthTimestamp, walletAuthSignature } =
+        req.body ?? {};
+
+      if (
+        typeof token !== "string" ||
+        !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(token)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "token must be a valid token mint address",
+        });
+      }
+
+      const verifiedWallet = verifyWalletAuth({
+        wallet: ownerWallet,
+        timestamp: walletAuthTimestamp,
+        signature: walletAuthSignature,
+      });
+      if (!verifiedWallet) {
+        return res.status(401).json({
+          success: false,
+          error:
+            "Wallet signature required or invalid — sign the auth message with the connected wallet and retry.",
+        });
+      }
+
+      const io = (req.app as any).locals.io;
+      const outcome = await sellCustodialPosition(verifiedWallet, token, io);
+
+      if (outcome.status === "failed") {
+        return res.status(400).json({ success: false, error: outcome.error });
+      }
+      return res.json({ success: true, ...outcome });
+    } catch (err: any) {
+      log.error({ err: err.message }, "Failed to sell position");
+      return res.status(400).json({
+        success: false,
+        error: err.message || "Failed to sell position",
       });
     }
   },

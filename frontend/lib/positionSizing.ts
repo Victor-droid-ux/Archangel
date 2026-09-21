@@ -5,11 +5,21 @@
 // both sides — so the dashboard can say, before anything trades, what the
 // next position will be and why the bot would or wouldn't open one.
 //
-//   buy size = spendable balance / free slots      (free = max open - open now)
+//   buy size = spendable / free slots      (free = max open - open now)
 //
-// where spendable = balance - a small fee reserve. What stops the bot opening
-// another position is either every slot being in use ("at_capacity") or a
-// balance too low to fund one minimum-size position ("low_balance").
+// where spendable = the wallet's balance less a small fee reserve — or, when
+// the trader has set a TRADING BUDGET, the smaller of that and what's left of
+// the budget's capital:
+//
+//   capital     = budget - realized losses since the budget was set
+//   budget room = capital - cost of the positions currently open
+//
+// The capital only ever shrinks (a loss lowers it, a profit never raises it),
+// so profits stay outside what the bot may trade: the "protected profit".
+//
+// What stops the bot opening another position is either every slot being in
+// use ("at_capacity") or too little to fund one minimum-size position
+// ("low_balance", limited by the wallet's cash or by the budget).
 
 export interface SizingInput {
   balanceSol: number;
@@ -17,12 +27,29 @@ export interface SizingInput {
   maxOpenPositions: number;
   minTradeSol: number;
   feeReserveSol: number;
+  budgetSol?: number | null | undefined;
+  deployedSol?: number | undefined;
+  realizedLossSol?: number | undefined;
 }
 
+export type LimitedBy = "balance" | "budget";
+
 export type SizingResult =
-  | { status: "ready"; buySol: number; slotsUsed: number; freeSlots: number }
+  | {
+      status: "ready";
+      buySol: number;
+      slotsUsed: number;
+      freeSlots: number;
+      limitedBy: LimitedBy;
+    }
   | { status: "at_capacity"; openPositions: number; maxOpenPositions: number }
-  | { status: "low_balance"; spendableSol: number; neededSol: number };
+  | {
+      status: "low_balance";
+      spendableSol: number;
+      neededSol: number;
+      limitedBy: LimitedBy;
+      neededBudgetSol?: number;
+    };
 
 /** Balance needed to open `slots` positions at the minimum size. */
 export function minBalanceForSlots(
@@ -31,6 +58,54 @@ export function minBalanceForSlots(
   feeReserveSol: number
 ): number {
   return feeReserveSol + Math.max(0, slots) * minTradeSol;
+}
+
+function usableBudget(budgetSol: number | null | undefined): number | null {
+  return typeof budgetSol === "number" &&
+    Number.isFinite(budgetSol) &&
+    budgetSol > 0
+    ? budgetSol
+    : null;
+}
+
+/**
+ * Where a wallet's money stands against its trading budget. `protectedProfitSol`
+ * is cash the bot may not touch — beyond the capital it may use and the fee
+ * reserve — i.e. what can be withdrawn without cutting into the budget.
+ */
+export function budgetBreakdown(input: {
+  cashSol: number;
+  feeReserveSol: number;
+  budgetSol: number | null | undefined;
+  deployedSol: number;
+  realizedLossSol?: number | undefined;
+}): { capitalSol: number; budgetRoomSol: number; protectedProfitSol: number } {
+  const budget = usableBudget(input.budgetSol);
+  if (budget === null) {
+    return {
+      capitalSol: Infinity,
+      budgetRoomSol: Infinity,
+      protectedProfitSol: 0,
+    };
+  }
+  const capitalSol = Math.max(
+    0,
+    budget - Math.max(0, input.realizedLossSol ?? 0)
+  );
+  const budgetRoomSol = Math.max(
+    0,
+    capitalSol - Math.max(0, input.deployedSol)
+  );
+  const cashSpendable = Math.max(
+    0,
+    (Number.isFinite(input.cashSol) ? input.cashSol : 0) -
+      Math.max(input.feeReserveSol, 0)
+  );
+  return {
+    capitalSol,
+    budgetRoomSol,
+    protectedProfitSol: Math.max(0, cashSpendable - budgetRoomSol),
+  };
 }
 
 export function computePositionSize(input: SizingInput): SizingResult {
@@ -43,10 +118,21 @@ export function computePositionSize(input: SizingInput): SizingResult {
     return { status: "at_capacity", openPositions, maxOpenPositions };
   }
 
-  const spendableSol = Math.max(
+  const cashSpendable = Math.max(
     0,
     (Number.isFinite(balanceSol) ? balanceSol : 0) - feeReserveSol
   );
+  const budget = usableBudget(input.budgetSol);
+  const deployedSol = Math.max(0, input.deployedSol ?? 0);
+  const realizedLossSol = Math.max(0, input.realizedLossSol ?? 0);
+  const capital =
+    budget === null ? Infinity : Math.max(0, budget - realizedLossSol);
+  const budgetRoom =
+    budget === null ? Infinity : Math.max(0, capital - deployedSol);
+  const spendableSol = Math.min(cashSpendable, budgetRoom);
+  const limitedBy: LimitedBy =
+    budgetRoom < cashSpendable ? "budget" : "balance";
+
   // The epsilon stops 0.03 / 0.01 = 2.9999999999999996 costing a whole slot.
   const affordableSlots =
     minTradeSol > 0 ? Math.floor(spendableSol / minTradeSol + 1e-9) : freeSlots;
@@ -57,6 +143,10 @@ export function computePositionSize(input: SizingInput): SizingResult {
       status: "low_balance",
       spendableSol,
       neededSol: minBalanceForSlots(1, minTradeSol, feeReserveSol),
+      limitedBy,
+      ...(limitedBy === "budget" && budget !== null
+        ? { neededBudgetSol: deployedSol + realizedLossSol + minTradeSol }
+        : {}),
     };
   }
 
@@ -65,6 +155,7 @@ export function computePositionSize(input: SizingInput): SizingResult {
     buySol: spendableSol / slotsUsed,
     slotsUsed,
     freeSlots,
+    limitedBy,
   };
 }
 
@@ -79,19 +170,34 @@ export function describeSizing(
   if (result.status === "ready") {
     const partial =
       result.slotsUsed < result.freeSlots
-        ? ` (the balance only funds ${result.slotsUsed} of ${result.freeSlots} free slots at the minimum size)`
+        ? ` (${
+            result.limitedBy === "budget" ? "the trading budget" : "the balance"
+          } only funds ${result.slotsUsed} of ${result.freeSlots} free slots at the minimum size)`
         : "";
     return {
       tone: "ok",
-      text: `≈ ${fmt(result.buySol)} SOL per position from your ${
-        balanceSol != null ? fmt(balanceSol) : "current"
-      } SOL balance${partial}.`,
+      text:
+        result.limitedBy === "budget"
+          ? `≈ ${fmt(result.buySol)} SOL per position from your trading budget${partial}.`
+          : `≈ ${fmt(result.buySol)} SOL per position from your ${
+              balanceSol != null ? fmt(balanceSol) : "current"
+            } SOL balance${partial}.`,
     };
   }
   if (result.status === "at_capacity") {
     return {
       tone: "info",
       text: `All ${result.maxOpenPositions} slots are in use right now — a new position opens when one closes.`,
+    };
+  }
+  if (result.limitedBy === "budget") {
+    return {
+      tone: "info",
+      text: `Your trading budget is fully at work — a new position opens when one closes${
+        result.neededBudgetSol != null
+          ? `, or raise the budget to at least ${fmt(result.neededBudgetSol)} SOL`
+          : ""
+      }. The rest of your wallet is protected.`,
     };
   }
   return {

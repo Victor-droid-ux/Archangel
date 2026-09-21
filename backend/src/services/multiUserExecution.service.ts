@@ -293,21 +293,30 @@ export async function runPipelineForAllEligibleWallets(
       // read the same stale balance/count concurrently. This one waits its
       // turn and sizes against what's actually left afterward — which is what
       // makes the "balance / free slots" split come out even.
-      const result = await withWalletLock(walletContext.ownerWallet, () =>
-        runPipelineFn(tokenMint, lpSol, walletContext),
+      const result = await withWalletLock(
+        walletContext.ownerWallet,
+        async () => {
+          const r = await runPipelineFn(tokenMint, lpSol, walletContext);
+          // The position's metadata is written INSIDE the lock, before the next
+          // queued buy sizes itself. remainingPct is what marks a position open
+          // (utils/positionState.ts): written after the lock was released, a
+          // re-bought token still carried its old "closed" marker for a moment
+          // and the next buy didn't count it — one position too many.
+          if (r.success && r.executionResult) {
+            await dbService.updatePositionMetadata(
+              tokenMint,
+              walletContext.ownerWallet,
+              {
+                tpPct: config.takeProfitPct,
+                slPct: config.stopLossPct,
+                firstTrancheEntry: Date.now(),
+                remainingPct: 100,
+              },
+            );
+          }
+          return r;
+        },
       );
-      if (result.success && result.executionResult) {
-        await dbService.updatePositionMetadata(
-          tokenMint,
-          walletContext.ownerWallet,
-          {
-            tpPct: config.takeProfitPct,
-            slPct: config.stopLossPct,
-            firstTrancheEntry: Date.now(),
-            remainingPct: 100,
-          },
-        );
-      }
       results.push({ ownerWallet: walletContext.ownerWallet, result });
     } catch (err: any) {
       LOG.error(

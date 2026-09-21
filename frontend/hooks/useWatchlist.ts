@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetcher } from "@lib/utils";
 import { useSocket } from "@hooks/useSocket";
+import { useWallet } from "@hooks/useWallet";
 
 export interface WatchlistPriceAlert {
   targetPrice: number;
@@ -22,15 +23,24 @@ export interface WatchlistToken {
   notes?: string;
 }
 
+// Each connected wallet has its OWN watchlist: every request carries the wallet
+// as `userId`. Without it the list was one shared table for all visitors —
+// anyone could see, change or delete anyone else's tokens and price alerts.
 export function useWatchlist() {
   const [tokens, setTokens] = useState<WatchlistToken[]>([]);
   const [loading, setLoading] = useState(true);
   const { lastMessage } = useSocket();
+  const { publicKey: wallet } = useWallet();
 
   const load = useCallback(async () => {
+    if (!wallet) {
+      setTokens([]);
+      setLoading(false);
+      return;
+    }
     try {
       const res = await fetcher<{ success: boolean; tokens: WatchlistToken[] }>(
-        "/api/watchlist"
+        `/api/watchlist?userId=${encodeURIComponent(wallet)}`
       );
       if (res?.success) setTokens(res.tokens || []);
     } catch (err) {
@@ -38,9 +48,12 @@ export function useWatchlist() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [wallet]);
 
   useEffect(() => {
+    // Drop the previous wallet's list the moment the wallet changes.
+    setTokens([]);
+    setLoading(true);
     load();
   }, [load]);
 
@@ -63,31 +76,31 @@ export function useWatchlist() {
         "/api/watchlist",
         {
           method: "POST",
-          body: JSON.stringify({ mint, symbol, name }),
+          body: JSON.stringify({ mint, symbol, name, userId: wallet }),
         }
       );
       if (res?.success) await load();
       return res;
     },
-    [load]
+    [load, wallet]
   );
 
   const removeToken = useCallback(
     async (mint: string) => {
       const res = await fetcher<{ success: boolean }>(
-        `/api/watchlist/${mint}`,
+        `/api/watchlist/${mint}?userId=${encodeURIComponent(wallet ?? "")}`,
         { method: "DELETE" }
       );
       if (res?.success) await load();
       return res;
     },
-    [load]
+    [load, wallet]
   );
 
   const setPriceAlert = useCallback(
     async (mint: string, targetPrice: number, condition: "above" | "below") => {
       const res = await fetcher<{ success: boolean }>(
-        `/api/watchlist/${mint}/alert`,
+        `/api/watchlist/${mint}/alert?userId=${encodeURIComponent(wallet ?? "")}`,
         {
           method: "PATCH",
           body: JSON.stringify({ targetPrice, condition }),
@@ -96,10 +109,18 @@ export function useWatchlist() {
       if (res?.success) await load();
       return res;
     },
-    [load]
+    [load, wallet]
   );
 
-  return { tokens, loading, addToken, removeToken, setPriceAlert, refresh: load };
+  return {
+    tokens,
+    loading,
+    connected: !!wallet,
+    addToken,
+    removeToken,
+    setPriceAlert,
+    refresh: load,
+  };
 }
 
 export default useWatchlist;

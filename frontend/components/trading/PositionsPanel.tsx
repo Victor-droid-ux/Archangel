@@ -8,6 +8,7 @@ import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
 import { fetcher, formatNumber, formatPrice } from "@lib/utils";
 import { useSocket } from "@hooks/useSocket";
 import { useTrailingStop } from "@hooks/useTrailingStop";
+import { useSellBotPosition } from "@hooks/useSellBotPosition";
 import { TrancheProgress } from "@components/trading/TrancheProgress";
 import {
   Loader2,
@@ -81,6 +82,10 @@ export const PositionsPanel: React.FC = () => {
     return () => clearInterval(t);
   }, [loadPositions]);
 
+  // Sell button for positions the bot holds (a manual position is sold from
+  // your own wallet on the Sell page instead).
+  const { sell, selling } = useSellBotPosition(loadPositions);
+
   // 🔥 Handle live updates
   useEffect(() => {
     if (!lastMessage) return;
@@ -105,7 +110,7 @@ export const PositionsPanel: React.FC = () => {
       </CardHeader>
 
       <CardContent>
-        {loading ? (
+        {loading && positions.length === 0 ? (
           <div className="flex items-center gap-2 py-4">
             <Loader2 className="animate-spin" />
             <span className="text-sm text-gray-400">Loading positions...</span>
@@ -124,6 +129,7 @@ export const PositionsPanel: React.FC = () => {
                   <th className="py-2 text-right">Price</th>
                   <th className="py-2 text-right">Unrealized PnL</th>
                   <th className="py-2 text-right">Trailing Stop</th>
+                  <th className="py-2 text-right"></th>
                 </tr>
               </thead>
 
@@ -200,12 +206,45 @@ export const PositionsPanel: React.FC = () => {
                             <span className="text-gray-600">Not armed</span>
                           )}
                         </td>
+
+                        <td
+                          className="py-2 text-right"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {p.custody === "self" ? (
+                            <Link
+                              href="/trading/sell"
+                              className="text-xs px-2 py-1 rounded border border-base-300 hover:border-primary hover:text-primary transition"
+                              title="Manual positions are sold from your own wallet on the Sell page"
+                            >
+                              Sell
+                            </Link>
+                          ) : (
+                            <button
+                              onClick={() =>
+                                sell(
+                                  p.token,
+                                  `${p.token.slice(0, 4)}…${p.token.slice(-4)}`
+                                )
+                              }
+                              disabled={selling !== null}
+                              className="text-xs px-2 py-1 rounded border border-red-500/40 text-red-400 hover:bg-red-500/10 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                              title="Sell this whole position now"
+                            >
+                              {selling === p.token ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                "Sell"
+                              )}
+                            </button>
+                          )}
+                        </td>
                       </tr>
 
                       {isExpanded && (
                         <tr className="border-b border-base-300">
                           <td></td>
-                          <td colSpan={6} className="pb-3 pt-1">
+                          <td colSpan={7} className="pb-3 pt-1">
                             <TrancheProgress
                               token={p.token}
                               firstTrancheEntry={p.firstTrancheEntry}

@@ -39,6 +39,20 @@ export const ENV = {
     "https://api.mainnet-beta.solana.com",
 };
 
+// External links shown in the navbar and footer — ONE definition each. Docs
+// used to be written two different ways (the navbar pointed at the GitBook
+// site, the footer at docs.archangelbot.io), so which one a visitor got
+// depended on where they clicked. Override any of them at build time with
+// NEXT_PUBLIC_DOCS_URL / NEXT_PUBLIC_TWITTER_URL / NEXT_PUBLIC_GITHUB_URL.
+export const SITE_LINKS = {
+  docs: process.env.NEXT_PUBLIC_DOCS_URL || "https://archangel.gitbook.io/docs",
+  twitter:
+    process.env.NEXT_PUBLIC_TWITTER_URL || "https://twitter.com/archangelbot",
+  github:
+    process.env.NEXT_PUBLIC_GITHUB_URL ||
+    "https://github.com/onuhvictor/archangel-bot",
+};
+
 // DEFAULT_CONFIG and API_ROUTES used to live here — removed. Neither was
 // imported anywhere (useConfig.ts's useTradingConfigStore is the real
 // source of trading defaults, and every API call goes through fetcher()/

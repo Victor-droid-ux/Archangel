@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { computePositionSize, minBalanceForSlots } from "../positionSizing";
+import {
+  budgetBreakdown,
+  computePositionSize,
+  minBalanceForSlots,
+} from "../positionSizing";
 
 const base = { minTradeSol: 0.01, feeReserveSol: 0 };
 
@@ -114,5 +118,101 @@ describe("describeSizing", () => {
     const d = describeSizing(r, 0.01);
     expect(d?.tone).toBe("warn");
     expect(d?.text).toContain("0.02 SOL");
+  });
+});
+
+describe("trading budget (must match the backend rule)", () => {
+  const b = { minTradeSol: 0.01, feeReserveSol: 0 };
+
+  it("splits the budget, not the whole wallet, across the slots", () => {
+    const r = computePositionSize({
+      ...b,
+      balanceSol: 5,
+      openPositions: 0,
+      maxOpenPositions: 5,
+      budgetSol: 1,
+      deployedSol: 0,
+    });
+    if (r.status !== "ready") throw new Error("expected ready");
+    expect(r.buySol).toBeCloseTo(0.2, 9);
+    expect(r.limitedBy).toBe("budget");
+  });
+
+  it("a loss lowers the capital and is not refilled from protected profit", () => {
+    const r = computePositionSize({
+      ...b,
+      balanceSol: 0.74,
+      openPositions: 4,
+      maxOpenPositions: 5,
+      budgetSol: 1,
+      deployedSol: 0.8,
+      realizedLossSol: 0.06,
+    });
+    if (r.status !== "ready") throw new Error("expected ready");
+    expect(r.buySol).toBeCloseTo(0.14, 9);
+  });
+
+  it("reports the budget as the limit once it is all at work", () => {
+    const r = computePositionSize({
+      ...b,
+      balanceSol: 10,
+      openPositions: 4,
+      maxOpenPositions: 5,
+      budgetSol: 1,
+      deployedSol: 1,
+    });
+    expect(r.status).toBe("low_balance");
+    if (r.status === "low_balance") {
+      expect(r.limitedBy).toBe("budget");
+      expect(r.neededBudgetSol).toBeCloseTo(1.01, 9);
+    }
+  });
+
+  it("ignores an unusable budget", () => {
+    for (const budgetSol of [null, undefined, 0, -1, NaN]) {
+      const r = computePositionSize({
+        ...b,
+        balanceSol: 10,
+        openPositions: 0,
+        maxOpenPositions: 5,
+        budgetSol,
+      });
+      if (r.status !== "ready") throw new Error("expected ready");
+      expect(r.buySol).toBe(2);
+    }
+  });
+
+  it("budgetBreakdown: protected profit is the cash beyond the capital's room", () => {
+    const r = budgetBreakdown({
+      cashSol: 2,
+      feeReserveSol: 0,
+      budgetSol: 1,
+      deployedSol: 0.5,
+      realizedLossSol: 0.2,
+    });
+    expect(r.capitalSol).toBeCloseTo(0.8, 9);
+    expect(r.protectedProfitSol).toBeCloseTo(1.7, 9);
+    expect(
+      budgetBreakdown({
+        cashSol: 5,
+        feeReserveSol: 0.01,
+        budgetSol: null,
+        deployedSol: 0,
+      }).protectedProfitSol
+    ).toBe(0);
+  });
+
+  it("describes a fully-used budget as information, and protects the rest", () => {
+    const r = computePositionSize({
+      ...b,
+      balanceSol: 10,
+      openPositions: 2,
+      maxOpenPositions: 5,
+      budgetSol: 1,
+      deployedSol: 1,
+    });
+    const d = describeSizing(r, 10);
+    expect(d?.tone).toBe("info");
+    expect(d?.text).toContain("protected");
   });
 });

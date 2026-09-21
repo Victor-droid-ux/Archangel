@@ -4,6 +4,12 @@ import { MongoClient, Db, Collection } from "mongodb";
 import { getLogger } from "../utils/logger.js";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import {
+  POSITION_DUST_THRESHOLD_SOL,
+  deployedSolOf,
+  isOpenPosition,
+  realizedLossSolSince,
+} from "../utils/positionState.js";
 
 dotenv.config();
 
@@ -701,11 +707,10 @@ export async function getTrades(
   return tradesCol!.find(filter).sort({ timestamp: -1 }).limit(limit).toArray();
 }
 
-// Same floor used by monitor.service.ts to decide a position is economically
-// closed despite floating-point residue leaving netSol at a tiny nonzero value.
-const POSITION_DUST_THRESHOLD_SOL = Number(
-  process.env.POSITION_DUST_THRESHOLD_SOL ?? 0.0005,
-);
+// The dust floor and the "is this position open?" rule live in
+// utils/positionState.ts, shared with the monitor, the buy pipeline and the
+// dashboard so they can't disagree (a position sold at a loss used to read as
+// open forever — see that file).
 
 const EMPTY_STATS = {
   portfolioValue: 0,
@@ -739,9 +744,7 @@ export async function getStats(viewerWallet?: string) {
     getPositions(viewerWallet),
     getPortfolioPnL(viewerWallet),
   ]);
-  const openTrades = positions.filter(
-    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL,
-  ).length;
+  const openTrades = positions.filter((p) => isOpenPosition(p)).length;
   return {
     portfolioValue: pnl.openPositionsValue,
     totalProfitSol: pnl.totalPnlSol,
@@ -770,6 +773,10 @@ export type Position = {
   // holdings (different signer, different location on-chain), not one.
   custody: "self" | "custodial" | null;
   netSol: number;
+  // Total SOL spent buying this position (see getDeployedSol).
+  boughtSol?: number;
+  // When the position was last sold from (see getBudgetState).
+  lastSellAt?: Date | null;
   avgBuyPrice?: number;
   highestPnlPct?: number;
   trailingActivated?: boolean;
@@ -862,6 +869,12 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
           firstBuyAt: {
             $min: { $cond: [{ $eq: ["$type", "buy"] }, "$timestamp", null] },
           },
+          // When the position was last sold from — a closed position's close
+          // time, which a trading budget uses to count only losses realized
+          // after the budget was set.
+          lastSellAt: {
+            $max: { $cond: [{ $eq: ["$type", "sell"] }, "$timestamp", null] },
+          },
         },
       },
       {
@@ -870,6 +883,10 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
           wallet: "$_id.wallet",
           custody: { $ifNull: ["$_id.custody", null] },
           netSol: { $divide: [{ $subtract: ["$bought", "$sold"] }, 1e9] },
+          // Total SOL spent buying this position — what a trading budget
+          // counts as "at work" (netSol drops with every sale's proceeds, so
+          // it understates the cost still tied up after a partial sale).
+          boughtSol: { $divide: ["$bought", 1e9] },
           avgBuyPrice: {
             $cond: [
               { $gt: ["$buyTokenQty", 0] },
@@ -878,6 +895,7 @@ export async function getPositions(viewerWallet?: string): Promise<Position[]> {
             ],
           },
           firstBuyAt: 1,
+          lastSellAt: 1,
           _id: 0,
         },
       },
@@ -936,9 +954,62 @@ export async function getOpenPositionCount(
   ownerWallet: string,
 ): Promise<number> {
   const positions = await getPositions(ownerWallet);
-  return positions.filter(
-    (p) => p.custody !== "self" && p.netSol >= POSITION_DUST_THRESHOLD_SOL,
-  ).length;
+  return positions.filter((p) => p.custody !== "self" && isOpenPosition(p))
+    .length;
+}
+
+/**
+ * SOL currently at work in the bot's open positions for this owner: what it
+ * cost to buy the part of each position that is still held. This is the number
+ * a trading budget is measured against (utils/positionSizing.ts).
+ */
+export async function getDeployedSol(ownerWallet: string): Promise<number> {
+  return deployedSolOf(await getPositions(ownerWallet));
+}
+
+/**
+ * Everything a trading budget needs from the ledger in one read: the SOL at
+ * work in open positions, and the SOL lost on positions closed since the
+ * budget was set (which permanently lowers the capital the bot may trade with).
+ */
+export async function getBudgetState(
+  ownerWallet: string,
+  budgetSetAtMs: number,
+): Promise<{ deployedSol: number; realizedLossSol: number }> {
+  const positions = await getPositions(ownerWallet);
+  return {
+    deployedSol: deployedSolOf(positions),
+    realizedLossSol: realizedLossSolSince(positions, budgetSetAtMs),
+  };
+}
+
+/**
+ * PERMANENTLY deletes the trade history and monitoring record of the given
+ * tokens for ONE wallet. There is no undo, and it changes realized P&L, win
+ * rate and the lifetime trade count for that wallet — used only by
+ * scripts/positions-cleanup.ts, which shows exactly what it will remove and
+ * needs an explicit --yes.
+ */
+export async function purgePositionHistory(
+  wallet: string,
+  tokens: string[],
+): Promise<{ tradesDeleted: number; metadataDeleted: number }> {
+  if (!db) await connect();
+  if (!wallet || tokens.length === 0) {
+    return { tradesDeleted: 0, metadataDeleted: 0 };
+  }
+  const trades = await tradesCol!.deleteMany({
+    wallet,
+    token: { $in: tokens },
+  });
+  const meta = await positionMetadataCol!.deleteMany({
+    wallet,
+    token: { $in: tokens },
+  });
+  return {
+    tradesDeleted: trades.deletedCount,
+    metadataDeleted: meta.deletedCount,
+  };
 }
 
 export async function updatePositionMetadata(
@@ -975,9 +1046,7 @@ export async function updateStats(updates: Partial<StatsDoc>) {
   // does, or the frontend can receive a stale/zero count that a `?? prev`
   // merge won't catch since 0 is not null/undefined.
   const positions = await getPositions();
-  const openTrades = positions.filter(
-    (p) => p.netSol >= POSITION_DUST_THRESHOLD_SOL,
-  ).length;
+  const openTrades = positions.filter((p) => isOpenPosition(p)).length;
   return { ...out!, openTrades };
 }
 
@@ -1100,7 +1169,11 @@ export async function getPortfolioPnL(
   let openPositionsValue = 0;
 
   for (const pos of positions) {
-    openPositionsValue += pos.netSol;
+    // Only positions still open: summing every position's netSol let closed
+    // ones distort this — profitable exits are negative, losing exits stay
+    // positive — so it read as roughly (total returned - total invested)
+    // instead of what is actually still deployed.
+    if (isOpenPosition(pos)) openPositionsValue += pos.netSol;
     // Unrealized P&L would require current prices - placeholder for now
   }
 
@@ -1457,6 +1530,9 @@ export default {
   getStats,
   getPositions,
   getOpenPositionCount,
+  getDeployedSol,
+  getBudgetState,
+  purgePositionHistory,
   recoverPositionCostBasis,
   updateStats,
   updatePositionMetadata,

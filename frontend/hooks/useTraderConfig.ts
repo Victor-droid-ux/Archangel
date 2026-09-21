@@ -20,6 +20,11 @@ export interface TraderConfig {
     // How many positions the bot may hold at once; the trading wallet's
     // balance is split across them. A count, not a SOL amount.
     maxOpenPositions?: number;
+    // The most SOL the bot may have at work; anything beyond it in the trading
+    // wallet is protected. null/absent = no budget. tradingBudgetSetAt is
+    // stamped by the server (only losses after it lower the budget's capital).
+    tradingBudgetSol?: number | null;
+    tradingBudgetSetAt?: number;
     // null explicitly clears a previously-set cap (unlimited); undefined
     // just means "not included in this update".
     maxTotalTrades?: number | null;

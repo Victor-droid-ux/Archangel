@@ -3,6 +3,7 @@ import dbService from "../services/db.service.js";
 import { getQuoteImpliedPriceSol } from "../services/jupiter.service.js";
 import { getOnChainMintSupply } from "../services/tokenSafetyChecks.service.js";
 import { getLogger } from "../utils/logger.js";
+import { isOpenPosition } from "../utils/positionState.js";
 
 const router = Router();
 const log = getLogger("positions.route");
@@ -21,7 +22,13 @@ router.get("/", async (req, res) => {
     if (!wallet) {
       return res.json({ success: true, positions: [] });
     }
-    const positions = await dbService.getPositions(wallet);
+    // Open positions only. This used to return every position ever held —
+    // including ones sold long ago — and did a supply lookup plus a Jupiter
+    // quote for EACH of them on every dashboard refresh (a steady source of
+    // rate-limit errors), then showed them as rows.
+    const positions = (await dbService.getPositions(wallet)).filter((p) =>
+      isOpenPosition(p),
+    );
     if (!positions.length) {
       return res.json({ success: true, positions: [] });
     }

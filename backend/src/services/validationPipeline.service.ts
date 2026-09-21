@@ -13,7 +13,7 @@ import {
 import { PublicKey, Keypair } from "@solana/web3.js";
 import dbService from "./db.service.js";
 import { canExecuteTrade } from "./riskManagement.service.js";
-import { getEffectiveConfig } from "./traderConfig.service.js";
+import { getEffectiveConfig, getTraderConfig } from "./traderConfig.service.js";
 import { computePositionSize, sizingEnv } from "../utils/positionSizing.js";
 
 /**
@@ -400,12 +400,54 @@ class ValidationPipelineService {
     ]);
     const { minTradeSol, feeReserveSol } = sizingEnv();
 
+    // Max Total Trades — re-checked HERE, under the wallet lock. The fan-out
+    // (multiUserExecution.getEligibleWallets) also checks it, but that runs
+    // BEFORE the lock: when several candidates arrive together they all see
+    // the same "trades so far", all pass, then buy one after another — which
+    // is how a wallet capped at 2 ended up with more. Here each buy sees the
+    // trades recorded by the ones before it.
+    const traderConfig = await getTraderConfig(walletContext.ownerWallet);
+    const maxTotalTrades = traderConfig?.globalSettings?.maxTotalTrades;
+    if (maxTotalTrades != null && maxTotalTrades > 0) {
+      const tradesTaken = await dbService.getTotalTradesCount(
+        walletContext.ownerWallet,
+      );
+      if (tradesTaken >= maxTotalTrades) {
+        return {
+          passed: false,
+          result: {
+            passed: false,
+            stage: 0,
+            stageName: "Max Total Trades",
+            reason: `Max Total Trades reached (${tradesTaken} of ${maxTotalTrades} used) — raise it in Trading Settings`,
+            details: { tradesTaken, maxTotalTrades },
+          },
+        };
+      }
+    }
+
+    // Trading budget: when set, the bot may only have this much at work, so
+    // profits and anything deposited beyond it are never traded.
+    const rawBudget = traderConfig?.globalSettings?.tradingBudgetSol;
+    const budgetSol =
+      typeof rawBudget === "number" && rawBudget > 0 ? rawBudget : null;
+    const { deployedSol, realizedLossSol } =
+      budgetSol !== null
+        ? await dbService.getBudgetState(
+            walletContext.ownerWallet,
+            traderConfig?.globalSettings?.tradingBudgetSetAt ?? 0,
+          )
+        : { deployedSol: 0, realizedLossSol: 0 };
+
     const sizing = computePositionSize({
       balanceSol: walletBalance,
       openPositions,
       maxOpenPositions: config.maxOpenPositions,
       minTradeSol,
       feeReserveSol,
+      budgetSol,
+      deployedSol,
+      realizedLossSol,
     });
 
     if (!sizing.ok) {
@@ -415,6 +457,9 @@ class ValidationPipelineService {
         maxOpenPositions: config.maxOpenPositions,
         minTradeSol,
         feeReserveSol,
+        budgetSol,
+        deployedSol,
+        realizedLossSol,
       };
       if (sizing.code === "AT_CAPACITY") {
         return {
@@ -426,6 +471,29 @@ class ValidationPipelineService {
             reason:
               `All ${sizing.maxOpenPositions} position slots are in use ` +
               `(${sizing.openPositions} open) — a new position opens when one closes`,
+            details,
+          },
+        };
+      }
+      if (sizing.limitedBy === "budget") {
+        // The wallet has cash, but the trader's budget has none left: it is
+        // all at work in open positions (or the budget is below one position).
+        return {
+          passed: false,
+          result: {
+            passed: false,
+            stage: 0,
+            stageName: "Trading Budget",
+            reason:
+              `Trading budget used up: ${deployedSol.toFixed(4)} SOL is at work in open positions` +
+              (realizedLossSol > 0
+                ? ` and ${realizedLossSol.toFixed(4)} SOL of the ${budgetSol?.toFixed(4)} SOL budget has been lost`
+                : ` of the ${budgetSol?.toFixed(4)} SOL budget`) +
+              ` — the rest of the wallet is protected and won't be traded. ` +
+              `A new position opens when one closes, or raise the budget` +
+              (sizing.neededBudgetSol != null
+                ? ` to at least ${sizing.neededBudgetSol.toFixed(3)} SOL`
+                : ""),
             details,
           },
         };

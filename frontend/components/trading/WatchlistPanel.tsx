@@ -10,7 +10,7 @@ import { toast } from "react-hot-toast";
 import { Star, Trash2, Bell, Loader2 } from "lucide-react";
 
 export function WatchlistPanel() {
-  const { tokens, loading, addToken, removeToken, setPriceAlert } =
+  const { tokens, loading, connected, addToken, removeToken, setPriceAlert } =
     useWatchlist();
   const [mintInput, setMintInput] = useState("");
   const [symbolInput, setSymbolInput] = useState("");
@@ -104,13 +104,19 @@ export function WatchlistPanel() {
             />
             <Button
               onClick={handleAdd}
-              disabled={adding || !mintInput.trim()}
+              disabled={!connected || adding || !mintInput.trim()}
               className="flex-shrink-0"
             >
               {adding ? <Loader2 className="h-4 w-4 animate-spin" /> : "Add"}
             </Button>
           </div>
         </div>
+
+        {!connected && (
+          <div className="text-xs text-yellow-400">
+            Connect your wallet — your watchlist is private to it.
+          </div>
+        )}
 
         {/* List */}
         {loading ? (

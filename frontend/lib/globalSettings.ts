@@ -29,6 +29,14 @@ export interface GlobalSettingsForm {
    * SOL amount.
    */
   maxOpenPositions: number;
+  /**
+   * Trading budget: when on, the bot may only have this much SOL at work, and
+   * everything else in the trading wallet (profits, later deposits) is
+   * protected and never traded. Off = the bot may use the whole wallet.
+   */
+  budgetEnabled: boolean;
+  /** SOL; only meaningful while budgetEnabled. "" = not entered yet. */
+  tradingBudgetSol: number | "";
   /** "" = unlimited. */
   maxTotalTrades: number | "";
 }
@@ -45,12 +53,15 @@ export const DEFAULT_GLOBAL_SETTINGS_FORM: GlobalSettingsForm = {
   autoTradeEnabled: false,
   // Matches the backend's default when a wallet has never chosen one.
   maxOpenPositions: 5,
+  budgetEnabled: false,
+  tradingBudgetSol: "",
   maxTotalTrades: "",
 };
 
 export const MAX_LAUNCH_AGE_SECONDS = 30 * 24 * 3600;
 export const MAX_TOTAL_TRADES_LIMIT = 100000;
 export const MAX_OPEN_POSITIONS_LIMIT = 50;
+export const MAX_TRADING_BUDGET_SOL = 1_000_000;
 // The backend checks a token's launch age once, a few seconds to ~40s after
 // the pool appears, and never comes back to it. A minimum age above this
 // therefore skips almost every token.
@@ -77,6 +88,12 @@ export function formFromSettings(
     minSecondsSinceLaunch: g?.minSecondsSinceLaunch ?? "",
     autoTradeEnabled: g?.autoTradeEnabled ?? false,
     maxOpenPositions: g?.maxOpenPositions ?? d.maxOpenPositions,
+    budgetEnabled:
+      typeof g?.tradingBudgetSol === "number" && g.tradingBudgetSol > 0,
+    tradingBudgetSol:
+      typeof g?.tradingBudgetSol === "number" && g.tradingBudgetSol > 0
+        ? g.tradingBudgetSol
+        : "",
     maxTotalTrades: g?.maxTotalTrades ?? "",
   };
 }
@@ -134,6 +151,19 @@ export function validateGlobalSettings(
     errors.maxOpenPositions = `Enter a whole number from 1 to ${MAX_OPEN_POSITIONS_LIMIT}`;
   }
 
+  if (f.budgetEnabled) {
+    const v = f.tradingBudgetSol;
+    if (
+      v === "" ||
+      !Number.isFinite(Number(v)) ||
+      Number(v) <= 0 ||
+      Number(v) > MAX_TRADING_BUDGET_SOL
+    ) {
+      errors.tradingBudgetSol =
+        "Enter how much SOL the bot may trade with (more than 0)";
+    }
+  }
+
   if (f.maxTotalTrades !== "") {
     const v = f.maxTotalTrades;
     if (!Number.isFinite(v) || !Number.isInteger(v) || v <= 0) {
@@ -168,6 +198,12 @@ export function toSettingsPayload(f: GlobalSettingsForm): GlobalSettings {
       f.minSecondsSinceLaunch === "" ? 0 : Number(f.minSecondsSinceLaunch),
     autoTradeEnabled: f.autoTradeEnabled,
     maxOpenPositions: f.maxOpenPositions,
+    // null turns the budget off (the server then lets the bot use the whole
+    // wallet again); when on, the server stamps when it was set.
+    tradingBudgetSol:
+      f.budgetEnabled && f.tradingBudgetSol !== ""
+        ? Number(f.tradingBudgetSol)
+        : null,
     // null explicitly clears a previously-set cap (unlimited).
     maxTotalTrades: f.maxTotalTrades === "" ? null : f.maxTotalTrades,
   };

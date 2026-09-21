@@ -7,6 +7,7 @@ import { useTraderConfig } from "@hooks/useTraderConfig";
 import { useSolPrice } from "@hooks/useSolPrice";
 import { useUserWallet } from "@hooks/useUserWallet";
 import { computePositionSize, describeSizing } from "@lib/positionSizing";
+import { TradingBudgetControl } from "@components/trading/TradingBudgetControl";
 import {
   DEFAULT_GLOBAL_SETTINGS_FORM,
   formFromSettings,
@@ -36,8 +37,17 @@ const INPUT_CLASS =
 export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
   const { config, updateGlobalSettings, loading, loadError, refetch } =
     useTraderConfig();
-  const { balanceSol, openPositions, minTradeSol, feeReserveSol } =
-    useUserWallet();
+  const {
+    balanceSol,
+    openPositions,
+    minTradeSol,
+    feeReserveSol,
+    tradingBudgetSol: savedBudget,
+    tradingCapitalSol,
+    realizedLossSol,
+    deployedSol,
+    protectedProfitSol,
+  } = useUserWallet();
   const solPriceUsd = useSolPrice();
 
   const [formData, setFormData] = useState<GlobalSettingsForm>(
@@ -79,6 +89,14 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
   const errors = validateGlobalSettings(formData);
   const launchWarning = launchAgeWarning(formData);
 
+  // The budget as currently typed (null when off or not a usable number).
+  const budgetForPreview =
+    formData.budgetEnabled &&
+    formData.tradingBudgetSol !== "" &&
+    Number(formData.tradingBudgetSol) > 0
+      ? Number(formData.tradingBudgetSol)
+      : null;
+
   // What the split means for the wallet as it is right now.
   const sizingNote =
     !errors.maxOpenPositions &&
@@ -92,6 +110,12 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
             maxOpenPositions: formData.maxOpenPositions,
             minTradeSol,
             feeReserveSol,
+            budgetSol: budgetForPreview,
+            deployedSol: deployedSol ?? 0,
+            realizedLossSol:
+              budgetForPreview !== null && budgetForPreview === savedBudget
+                ? (realizedLossSol ?? 0)
+                : 0,
           }),
           balanceSol
         )
@@ -361,6 +385,29 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
                       )}
                     </>
                   )}
+                </div>
+
+                <div className="col-span-2">
+                  <TradingBudgetControl
+                    enabled={formData.budgetEnabled}
+                    amount={formData.tradingBudgetSol}
+                    onChange={(next) => {
+                      setField("budgetEnabled", next.enabled);
+                      setField("tradingBudgetSol", next.amount);
+                    }}
+                    error={errors.tradingBudgetSol}
+                    balanceSol={balanceSol}
+                    maxOpenPositions={
+                      Number.isInteger(formData.maxOpenPositions)
+                        ? formData.maxOpenPositions
+                        : 1
+                    }
+                    savedBudgetSol={savedBudget}
+                    capitalSol={tradingCapitalSol}
+                    realizedLossSol={realizedLossSol}
+                    deployedSol={deployedSol}
+                    protectedProfitSol={protectedProfitSol}
+                  />
                 </div>
 
                 <div>

@@ -42,7 +42,14 @@ export const fetcher = async <T = any>(
   try {
     json = await res.json();
   } catch {
-    throw new Error(`❌ Invalid JSON response from ${finalUrl}`);
+    // Not JSON: usually an HTML error page — most often a 404 from a backend
+    // that predates this dashboard (the route doesn't exist there yet), or a
+    // proxy/gateway error page while the backend is down or restarting.
+    throw new Error(
+      `❌ Invalid JSON response from ${finalUrl} (HTTP ${res.status}${
+        res.statusText ? ` ${res.statusText}` : ""
+      }) — the backend may be out of date, restarting or unreachable`
+    );
   }
 
   if (!res.ok || json?.success === false) {

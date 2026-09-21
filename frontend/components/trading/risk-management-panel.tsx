@@ -9,6 +9,7 @@ import { useTraderConfig } from "@hooks/useTraderConfig";
 import { useSolPrice } from "@hooks/useSolPrice";
 import { useUserWallet } from "@hooks/useUserWallet";
 import { computePositionSize, describeSizing } from "@lib/positionSizing";
+import { TradingBudgetControl } from "@components/trading/TradingBudgetControl";
 import {
   DEFAULT_GLOBAL_SETTINGS_FORM,
   formFromSettings,
@@ -31,8 +32,17 @@ export const RiskManagementPanel: React.FC = () => {
   // The bot trades from this custodial wallet, NOT the wallet connected to
   // the dashboard — so its balance is the one that decides what a buy looks
   // like. (The panel used to use the connected wallet's balance here.)
-  const { balanceSol, openPositions, minTradeSol, feeReserveSol } =
-    useUserWallet();
+  const {
+    balanceSol,
+    openPositions,
+    minTradeSol,
+    feeReserveSol,
+    tradingBudgetSol: savedBudget,
+    tradingCapitalSol,
+    realizedLossSol,
+    deployedSol,
+    protectedProfitSol,
+  } = useUserWallet();
   const solPriceUsd = useSolPrice();
 
   const [formData, setFormData] = useState<GlobalSettingsForm>(
@@ -72,6 +82,14 @@ export const RiskManagementPanel: React.FC = () => {
   const launchWarning = launchAgeWarning(formData);
   const loaded = config != null;
 
+  // The budget as currently typed (null when off or not a usable number).
+  const budgetForPreview =
+    formData.budgetEnabled &&
+    formData.tradingBudgetSol !== "" &&
+    Number(formData.tradingBudgetSol) > 0
+      ? Number(formData.tradingBudgetSol)
+      : null;
+
   // What the split means for the wallet as it is right now.
   const sizing =
     !errors.maxOpenPositions &&
@@ -84,6 +102,14 @@ export const RiskManagementPanel: React.FC = () => {
           maxOpenPositions: formData.maxOpenPositions,
           minTradeSol,
           feeReserveSol,
+          budgetSol: budgetForPreview,
+          deployedSol: deployedSol ?? 0,
+          // Losses already realized only count toward the SAVED budget; a
+          // different amount typed here starts a fresh tally.
+          realizedLossSol:
+            budgetForPreview !== null && budgetForPreview === savedBudget
+              ? (realizedLossSol ?? 0)
+              : 0,
         })
       : null;
   const sizingNote = describeSizing(sizing, balanceSol);
@@ -319,6 +345,28 @@ export const RiskManagementPanel: React.FC = () => {
             />
           </div>
         </div>
+
+        {/* Trading budget: protect profits by capping what the bot may trade */}
+        <TradingBudgetControl
+          enabled={formData.budgetEnabled}
+          amount={formData.tradingBudgetSol}
+          onChange={(next) => {
+            setField("budgetEnabled", next.enabled);
+            setField("tradingBudgetSol", next.amount);
+          }}
+          error={errors.tradingBudgetSol}
+          balanceSol={balanceSol}
+          maxOpenPositions={
+            Number.isInteger(formData.maxOpenPositions)
+              ? formData.maxOpenPositions
+              : 1
+          }
+          savedBudgetSol={savedBudget}
+          capitalSol={tradingCapitalSol}
+          realizedLossSol={realizedLossSol}
+          deployedSol={deployedSol}
+          protectedProfitSol={protectedProfitSol}
+        />
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {/* What a buy will actually be */}

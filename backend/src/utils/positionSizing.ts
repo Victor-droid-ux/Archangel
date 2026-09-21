@@ -24,6 +24,25 @@
 // uses fewer slots (bigger positions) rather than refusing to trade: 0.04 SOL
 // with a 0.01 SOL minimum and 0.01 SOL reserve opens up to three 0.01 SOL
 // positions, not zero.
+//
+// TRADING BUDGET (optional). A trader can cap what the bot may have at work:
+// the money it spends is then also limited to
+//
+//     budget room = budget - cost of the positions currently open
+//
+// so the budget is split across the slots exactly like the balance is, and
+// anything the wallet holds beyond it — profits from closed positions, later
+// deposits — is never touched by the bot. That leftover is the "protected
+// profit" (see budgetBreakdown): still in the trading wallet, still the
+// trader's, withdrawable at any time.
+//
+// The budget is a ceiling, and it only ever SHRINKS: a realized loss lowers the
+// capital the bot may trade with, but a profit never raises it. Without that,
+// the bot would refill a losing position's budget from the profit pool and a
+// drawdown would eat profits already made — the very thing the budget is for.
+//
+//     capital     = budget - realized losses since the budget was set
+//     budget room = capital - cost of the positions currently open
 
 export const DEFAULT_MAX_OPEN_POSITIONS = 5;
 export const MAX_OPEN_POSITIONS_LIMIT = 50;
@@ -34,7 +53,16 @@ export interface SizingInput {
   maxOpenPositions: number;
   minTradeSol: number;
   feeReserveSol: number;
+  /** Trading budget in SOL; null/undefined = no budget (use the whole balance). */
+  budgetSol?: number | null | undefined;
+  /** Cost of the positions open right now. Only used together with a budget. */
+  deployedSol?: number | undefined;
+  /** SOL lost on positions closed since the budget was set (see positionState). */
+  realizedLossSol?: number | undefined;
 }
+
+/** What is capping the size: the wallet's cash, or the trading budget. */
+export type LimitedBy = "balance" | "budget";
 
 export type SizingResult =
   | {
@@ -44,6 +72,7 @@ export type SizingResult =
       slotsUsed: number;
       freeSlots: number;
       spendableSol: number;
+      limitedBy: LimitedBy;
     }
   | {
       ok: false;
@@ -58,6 +87,9 @@ export type SizingResult =
       spendableSol: number;
       /** Total balance at which one more position becomes possible. */
       neededSol: number;
+      limitedBy: LimitedBy;
+      /** With a budget that is the limit: the budget at which one more fits. */
+      neededBudgetSol?: number;
     };
 
 /** Runtime knobs; read at call time so tests and env changes are honored. */
@@ -102,6 +134,60 @@ export function minBalanceForSlots(
   return feeReserveSol + Math.max(0, slots) * minTradeSol;
 }
 
+function usableBudget(budgetSol: number | null | undefined): number | null {
+  return typeof budgetSol === "number" &&
+    Number.isFinite(budgetSol) &&
+    budgetSol > 0
+    ? budgetSol
+    : null;
+}
+
+/**
+ * Where a wallet's money stands against its trading budget. `protectedProfitSol`
+ * is what the bot may not touch: cash beyond the budget room and the fee
+ * reserve — what the trader can withdraw without cutting into the budget.
+ * Both are 0-ish/irrelevant when there is no budget.
+ */
+export function budgetBreakdown(input: {
+  cashSol: number;
+  feeReserveSol: number;
+  budgetSol: number | null | undefined;
+  deployedSol: number;
+  realizedLossSol?: number | undefined;
+}): {
+  /** The budget less realized losses: what the bot may have at work in total. */
+  capitalSol: number;
+  budgetRoomSol: number;
+  protectedProfitSol: number;
+} {
+  const budget = usableBudget(input.budgetSol);
+  if (budget === null) {
+    return {
+      capitalSol: Infinity,
+      budgetRoomSol: Infinity,
+      protectedProfitSol: 0,
+    };
+  }
+  const capitalSol = Math.max(
+    0,
+    budget - Math.max(0, input.realizedLossSol ?? 0),
+  );
+  const budgetRoomSol = Math.max(
+    0,
+    capitalSol - Math.max(0, input.deployedSol),
+  );
+  const cashSpendable = Math.max(
+    0,
+    (Number.isFinite(input.cashSol) ? input.cashSol : 0) -
+      Math.max(input.feeReserveSol, 0),
+  );
+  return {
+    capitalSol,
+    budgetRoomSol,
+    protectedProfitSol: Math.max(0, cashSpendable - budgetRoomSol),
+  };
+}
+
 export function computePositionSize(input: SizingInput): SizingResult {
   const { balanceSol, openPositions, maxOpenPositions } = input;
   const minTradeSol = Math.max(input.minTradeSol, 0);
@@ -112,10 +198,23 @@ export function computePositionSize(input: SizingInput): SizingResult {
     return { ok: false, code: "AT_CAPACITY", openPositions, maxOpenPositions };
   }
 
-  const spendableSol = Math.max(
+  const cashSpendable = Math.max(
     0,
     (Number.isFinite(balanceSol) ? balanceSol : 0) - feeReserveSol,
   );
+  const budget = usableBudget(input.budgetSol);
+  const deployedSol = Math.max(0, input.deployedSol ?? 0);
+  const realizedLossSol = Math.max(0, input.realizedLossSol ?? 0);
+  // With a budget, the bot may spend only what's left of the capital (budget
+  // less realized losses, less what's at work) — never more than the wallet
+  // actually holds either.
+  const capital =
+    budget === null ? Infinity : Math.max(0, budget - realizedLossSol);
+  const budgetRoom =
+    budget === null ? Infinity : Math.max(0, capital - deployedSol);
+  const spendableSol = Math.min(cashSpendable, budgetRoom);
+  const limitedBy: LimitedBy =
+    budgetRoom < cashSpendable ? "budget" : "balance";
 
   // How many minimum-size positions the money can actually fund. The epsilon
   // stops 0.03 / 0.01 = 2.9999999999999996 from costing a whole slot.
@@ -130,6 +229,10 @@ export function computePositionSize(input: SizingInput): SizingResult {
       freeSlots,
       spendableSol,
       neededSol: minBalanceForSlots(1, minTradeSol, feeReserveSol),
+      limitedBy,
+      ...(limitedBy === "budget" && budget !== null
+        ? { neededBudgetSol: deployedSol + realizedLossSol + minTradeSol }
+        : {}),
     };
   }
 
@@ -139,5 +242,6 @@ export function computePositionSize(input: SizingInput): SizingResult {
     slotsUsed,
     freeSlots,
     spendableSol,
+    limitedBy,
   };
 }

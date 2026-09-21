@@ -163,6 +163,25 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
       delete (settings as Record<string, unknown>).maxTradeAmountSol;
     }
 
+    // Trading budget — SOL the bot may have at work; null turns it off.
+    if (settings && "tradingBudgetSol" in settings) {
+      const v = settings.tradingBudgetSol;
+      if (
+        v !== null &&
+        v !== undefined &&
+        (typeof v !== "number" ||
+          !Number.isFinite(v) ||
+          v <= 0 ||
+          v > 1_000_000)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "tradingBudgetSol must be a positive amount of SOL, or null to turn the budget off",
+        });
+      }
+    }
+
     // Max Open Positions — a count of simultaneous positions, not an amount.
     if (settings && "maxOpenPositions" in settings) {
       const v = settings.maxOpenPositions;
@@ -213,6 +232,26 @@ router.patch("/:walletAddress/global", async (req: Request, res: Response) => {
           success: false,
           error: "maxTotalTrades cannot exceed 100000",
         });
+      }
+    }
+
+    // When the trading budget was set/changed — decided HERE, never taken from
+    // the client. Only losses realized after this moment reduce the budget's
+    // capital (utils/positionSizing.ts), so re-saving the same number keeps
+    // the running tally, while entering a different amount starts fresh.
+    {
+      const s = settings as Record<string, unknown>;
+      const newBudget =
+        typeof s.tradingBudgetSol === "number" ? s.tradingBudgetSol : null;
+      delete s.tradingBudgetSetAt; // whatever the client sent
+      if (newBudget !== null) {
+        const existing = (await getTraderConfig(walletAddress))?.globalSettings;
+        const unchanged =
+          existing?.tradingBudgetSol === newBudget &&
+          typeof existing?.tradingBudgetSetAt === "number";
+        s.tradingBudgetSetAt = unchanged
+          ? existing!.tradingBudgetSetAt
+          : Date.now();
       }
     }
 

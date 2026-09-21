@@ -4,15 +4,9 @@ import React, { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardTitle, CardContent } from "@components/ui/card";
 import { fetcher, formatNumber, formatPrice } from "@lib/utils";
-import { useSocket } from "@hooks/useSocket";
-import { useJupiterEvents } from "@hooks/useJupiterEvents";
-import {
-  Loader2,
-  CheckCircle,
-  XCircle,
-  TrendingUp,
-  ShoppingCart,
-} from "lucide-react";
+import { useSocketEvent } from "@hooks/useSocketEvent";
+import { useCandidateEvents } from "@hooks/useCandidateEvents";
+import { Loader2, CheckCircle, XCircle, Ban, ShoppingCart } from "lucide-react";
 
 type TokenItem = {
   symbol: string;
@@ -34,20 +28,18 @@ export const TokenDiscovery: React.FC = () => {
   const [tokens, setTokens] = useState<TokenItem[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const { lastMessage, connected } = useSocket();
+  // Live pipeline activity — from the backend's candidate:* events (see
+  // hooks/useCandidateEvents.ts). This used to listen for jupiter:* events that
+  // are no longer sent, so the feed and both lists were always empty.
   const {
-    validationsPassed,
-    validationsFailed,
-    pipelineFailed,
-    pipelineSuccess,
-    latestValidated,
-    latestPipelineSuccess,
-    latestPipelineFailed,
-  } = useJupiterEvents();
-
-  // Manual buys skip all validation, so any token that failed auto-buy
-  // criteria is still available for the user to buy at their own discretion.
-  const manualBuyTokens = validationsFailed;
+    connected,
+    approved,
+    passedOn,
+    latestBought,
+    latestSkipped,
+    latestApproved,
+    latestPassedOn,
+  } = useCandidateEvents();
 
   const loadTokens = useCallback(async () => {
     try {
@@ -69,16 +61,10 @@ export const TokenDiscovery: React.FC = () => {
     return () => clearInterval(interval);
   }, [loadTokens]);
 
-  // 🔄 Live updates from websocket
-  useEffect(() => {
-    if (!lastMessage) return;
-
-    if (lastMessage.event !== "token_prices") return;
-    const payload = lastMessage.payload;
-    if (!Array.isArray(payload?.tokens)) return;
-
-    setTokens(payload.tokens);
-  }, [lastMessage]);
+  // 🔄 Live price updates from websocket
+  useSocketEvent<{ tokens?: TokenItem[] }>("token_prices", (payload) => {
+    if (Array.isArray(payload?.tokens)) setTokens(payload.tokens);
+  });
 
   return (
     <Card className="bg-base-200 rounded-xl shadow p-4 flex flex-col max-h-[900px]">
@@ -97,109 +83,142 @@ export const TokenDiscovery: React.FC = () => {
       <CardContent className="overflow-y-auto flex-1 pr-2">
         {/* Live Activity Feed */}
         <div className="mb-4 space-y-2 max-h-[300px] overflow-y-auto pr-2">
-          {/* Show latest pipeline success (validation pipeline passed + bought) */}
-          {latestPipelineSuccess && (
+          {!latestBought &&
+            !latestSkipped &&
+            !latestApproved &&
+            !latestPassedOn && (
+              <div className="text-xs text-gray-500 py-2">
+                Waiting for new tokens — what the bot does with each one shows
+                up here as it happens.
+              </div>
+            )}
+
+          {/* The bot bought a token for this wallet */}
+          {latestBought && (
             <div className="flex items-center gap-2 p-2 bg-emerald-500/10 border border-emerald-500/20 rounded text-xs">
               <CheckCircle className="w-4 h-4 text-emerald-400" />
-              <span className="text-emerald-400">🚀 Pipeline Success:</span>
+              <span className="text-emerald-400">🚀 Bought:</span>
               <code className="text-gray-300">
-                {latestPipelineSuccess.mint.slice(0, 8)}...
+                {latestBought.mint.slice(0, 8)}...
               </code>
               <span className="text-gray-400">
                 (
-                {latestPipelineSuccess.tokensReceived != null
-                  ? latestPipelineSuccess.tokensReceived.toFixed(0)
+                {latestBought.tokensReceived != null
+                  ? latestBought.tokensReceived.toFixed(0)
                   : "?"}{" "}
                 tokens @{" "}
-                {latestPipelineSuccess.actualPrice != null
-                  ? latestPipelineSuccess.actualPrice.toFixed(6)
+                {latestBought.actualPrice != null
+                  ? latestBought.actualPrice.toFixed(6)
                   : "?"}{" "}
                 SOL)
               </span>
-              <a
-                href={`https://solscan.io/tx/${latestPipelineSuccess.signature}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-emerald-400 hover:underline"
-              >
-                Tx
-              </a>
+              {latestBought.signature && (
+                <a
+                  href={`https://solscan.io/tx/${latestBought.signature}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-emerald-400 hover:underline"
+                >
+                  Tx
+                </a>
+              )}
             </div>
           )}
 
-          {/* Show latest pipeline failed */}
-          {latestPipelineFailed && (
+          {/* The bot wanted a token but this wallet couldn't take it */}
+          {latestSkipped && (
             <div className="flex items-center gap-2 p-2 bg-red-500/10 border border-red-500/20 rounded text-xs">
               <XCircle className="w-4 h-4 text-red-400" />
-              <span className="text-red-400">
-                ❌ Stage {latestPipelineFailed.failedStage} Failed:
-              </span>
+              <span className="text-red-400">⏭️ Skipped for you:</span>
               <code className="text-gray-300">
-                {latestPipelineFailed.mint.slice(0, 8)}...
+                {latestSkipped.mint.slice(0, 8)}...
               </code>
               <span className="text-orange-300 text-xs">
-                {latestPipelineFailed.failedStageName} -{" "}
-                {latestPipelineFailed.reason}
+                {latestSkipped.failedStageName
+                  ? `${latestSkipped.failedStageName} - `
+                  : ""}
+                {latestSkipped.reason}
               </span>
             </div>
           )}
 
-          {/* Show latest validation passed (auto-buy eligible) */}
-          {latestValidated && (
+          {/* A token passed every safety filter */}
+          {latestApproved && (
             <div className="flex items-center gap-2 p-2 bg-green-500/10 border border-green-500/20 rounded text-xs">
               <CheckCircle className="w-4 h-4 text-green-400" />
-              <span className="text-green-400">✅ Auto-Buy Eligible:</span>
+              <span className="text-green-400">✅ Passed all filters:</span>
               <code className="text-gray-300">
-                {latestValidated.mint.slice(0, 8)}...
+                {latestApproved.mint.slice(0, 8)}...
               </code>
             </div>
           )}
 
-          {/* Show latest validation failure (still available for manual buy) */}
-          {validationsFailed[0] && (
+          {/* The bot passed on a token */}
+          {latestPassedOn && (
             <div className="flex items-center gap-2 p-2 bg-orange-500/10 border border-orange-500/20 rounded text-xs">
-              <TrendingUp className="w-4 h-4 text-orange-400" />
-              <span className="text-orange-400">📊 Manual Buy Available:</span>
+              <Ban className="w-4 h-4 text-orange-400" />
+              <span className="text-orange-400">🚫 Passed on:</span>
               <code className="text-gray-300">
-                {validationsFailed[0].mint.slice(0, 8)}...
+                {latestPassedOn.mint.slice(0, 8)}...
               </code>
               <span className="text-xs text-orange-300">
-                - {validationsFailed[0].reason}
+                - {latestPassedOn.reason}
               </span>
             </div>
           )}
         </div>
 
-        {/* Tokens that failed the bot's own validation are listed for
-            visibility (why the bot passed on them) but are intentionally
-            not buyable from here — the manual Buy flow (/trading/buy) only
-            ever offers tokens that cleared the same safety checks the bot
-            itself requires, on purpose (see trade.route.ts's buy-time
-            re-validation). A "buy anyway" path here used to exist but
-            always signed with the operator's own wallet regardless of who
-            was connected — a real fund-misattribution bug, not a shortcut
-            worth keeping. */}
-        {manualBuyTokens.length > 0 && (
+        {/* Tokens that cleared every safety filter. The bot buys these for
+            wallets that have auto-trade on; anyone can also buy one by hand
+            (the buy re-checks safety at purchase time). */}
+        {approved.length > 0 && (
           <div className="mb-4">
-            <h3 className="text-sm font-semibold text-orange-400 mb-2 flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-green-400 mb-2 flex items-center gap-2">
               <ShoppingCart className="w-4 h-4" />
-              Failed Auto-Buy Validation ({manualBuyTokens.length})
+              Passed all filters ({approved.length})
             </h3>
             <div className="space-y-2 max-h-[250px] overflow-y-auto pr-2">
-              {manualBuyTokens.slice(0, 20).map((token) => (
+              {approved.slice(0, 20).map((token) => (
                 <div
                   key={token.mint}
-                  className="flex items-center justify-between p-3 bg-orange-500/5 border border-orange-500/20 rounded"
+                  className="flex items-center justify-between p-3 bg-green-500/5 border border-green-500/20 rounded"
                 >
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2">
-                      <code className="text-sm font-mono text-gray-300">
-                        {token.mint.slice(0, 12)}...
-                      </code>
-                    </div>
-                    <div className="text-xs text-orange-300 mt-1">
-                      {token.reason}
-                    </div>
+                  <code className="text-sm font-mono text-gray-300">
+                    {token.mint.slice(0, 12)}...
+                  </code>
+                  <button
+                    onClick={() =>
+                      router.push(`/trading/buy?mint=${token.mint}`)
+                    }
+                    className="text-xs px-3 py-1 rounded bg-primary text-white hover:opacity-90 transition"
+                  >
+                    Buy
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Tokens the bot passed on — listed so you can see WHY, and not
+            buyable from here: they failed the bot's own safety criteria. */}
+        {passedOn.length > 0 && (
+          <div className="mb-4">
+            <h3 className="text-sm font-semibold text-orange-400 mb-2 flex items-center gap-2">
+              <Ban className="w-4 h-4" />
+              Passed on ({passedOn.length})
+            </h3>
+            <div className="space-y-2 max-h-[250px] overflow-y-auto pr-2">
+              {passedOn.slice(0, 20).map((token) => (
+                <div
+                  key={token.mint}
+                  className="p-3 bg-orange-500/5 border border-orange-500/20 rounded"
+                >
+                  <code className="text-sm font-mono text-gray-300">
+                    {token.mint.slice(0, 12)}...
+                  </code>
+                  <div className="text-xs text-orange-300 mt-1">
+                    {token.reason}
                   </div>
                 </div>
               ))}

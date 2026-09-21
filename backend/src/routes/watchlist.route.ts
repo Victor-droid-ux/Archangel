@@ -6,6 +6,23 @@ import { getLogger } from "../utils/logger.js";
 const router = Router();
 const log = getLogger("watchlist.route");
 
+// The dashboard passes the connected wallet as `userId`, and each wallet has
+// its own private list. An event for a wallet goes only to that wallet's
+// socket room; without a userId (legacy shared entries) it still goes to
+// everyone, as before. This used to broadcast EVERY change to EVERY client,
+// and the dashboard never sent a userId, so all users shared one list — anyone
+// could see, alter or delete anyone else's tokens and alerts.
+function broadcast(
+  io: any,
+  userId: string | undefined,
+  event: string,
+  payload: unknown,
+) {
+  if (!io) return;
+  if (userId) io.to(userId).emit(event, payload);
+  else io.emit(event, payload);
+}
+
 /**
  * GET /api/watchlist
  * Get all watchlist tokens for the user
@@ -13,7 +30,9 @@ const log = getLogger("watchlist.route");
 router.get("/", async (req: Request, res: Response) => {
   try {
     const userId = req.query.userId as string | undefined;
-    const tokens = await dbService.getWatchlist(userId);
+    const all = await dbService.getWatchlist(userId);
+    // No userId -> only the legacy shared entries, never other wallets' lists.
+    const tokens = userId ? all : all.filter((t) => !t.userId);
     res.json({ success: true, tokens });
   } catch (err: any) {
     log.error({ err: err.message }, "Failed to get watchlist");
@@ -49,11 +68,11 @@ router.post("/", async (req: Request, res: Response) => {
       return res.status(400).json(result);
     }
 
-    // Broadcast watchlist update to all clients
+    // Tell this wallet's own tabs (not everyone) that its list changed
     const io = (req.app as any).locals.io;
     if (io) {
       const watchlist = await dbService.getWatchlist(userId);
-      io.emit("watchlist:update", watchlist);
+      broadcast(io, userId, "watchlist:update", watchlist);
     }
 
     res.json(result);
@@ -80,7 +99,7 @@ router.delete("/:mint", async (req: Request, res: Response) => {
 
     const result = await dbService.removeFromWatchlist(
       mint,
-      userId || undefined
+      userId || undefined,
     );
     if (!result.success) {
       return res
@@ -88,11 +107,11 @@ router.delete("/:mint", async (req: Request, res: Response) => {
         .json({ success: false, error: "Token not found in watchlist" });
     }
 
-    // Broadcast watchlist update to all clients
+    // Tell this wallet's own tabs (not everyone) that its list changed
     const io = (req.app as any).locals.io;
     if (io) {
       const watchlist = await dbService.getWatchlist(userId);
-      io.emit("watchlist:update", watchlist);
+      broadcast(io, userId, "watchlist:update", watchlist);
     }
 
     res.json(result);
@@ -142,7 +161,7 @@ router.patch("/:mint/alert", async (req: Request, res: Response) => {
     const result = await dbService.updateWatchlistAlert(
       mint,
       priceAlert,
-      userId || undefined
+      userId || undefined,
     );
 
     if (!result.success) {
@@ -151,10 +170,10 @@ router.patch("/:mint/alert", async (req: Request, res: Response) => {
         .json({ success: false, error: "Token not found in watchlist" });
     }
 
-    // Broadcast price alert update to all clients
+    // Tell this wallet's own tabs (not everyone) about the new alert
     const io = (req.app as any).locals.io;
     if (io) {
-      io.emit("priceAlert:set", {
+      broadcast(io, userId, "priceAlert:set", {
         mint,
         userId,
         priceAlert,

@@ -40,14 +40,20 @@ function BuyPageInner() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<BuyCandidate | null>(null);
   const [amountSol, setAmountSol] = useState(0.1);
+  // A token reached by link (e.g. from Old Tokens) that isn't on the bot's
+  // list is safety-checked on the spot instead of being turned away.
+  const [checking, setChecking] = useState(false);
+  const [rejection, setRejection] = useState<string | null>(null);
+  const [offList, setOffList] = useState(false);
 
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
-        const res = await fetcher<{ success: boolean; candidates: BuyCandidate[] }>(
-          "/api/trade/manual-buy-candidates?limit=40"
-        );
+        const res = await fetcher<{
+          success: boolean;
+          candidates: BuyCandidate[];
+        }>("/api/trade/manual-buy-candidates?limit=40");
         if (!mounted || !res?.success) return;
         const list = res.candidates || [];
         setCandidates(list);
@@ -56,11 +62,72 @@ function BuyPageInner() {
         // making them find it again in the list.
         if (preselectMint) {
           const match = list.find((c) => c.mint === preselectMint);
-          if (match) setSelected(match);
-          else
-            toast.error(
-              "That token isn't currently in the bot's validated list — pick another below."
-            );
+          if (match) {
+            setSelected(match);
+          } else {
+            // Not on the bot's list. That list is only a convenience — the
+            // buy itself re-validates at purchase time — so check THIS token
+            // now: if it passes, let the user buy it; if not, say why.
+            setChecking(true);
+            try {
+              const res = await fetcher<{
+                success: boolean;
+                validation: {
+                  approved: boolean;
+                  reason: string;
+                  jupiterMetrics?: {
+                    liquiditySOL?: number;
+                    liquidityUSD?: number;
+                    mcapUSD?: number;
+                    poolAddress?: string;
+                  };
+                };
+              }>("/api/trade/validate", {
+                method: "POST",
+                body: JSON.stringify({ tokenMint: preselectMint }),
+              });
+              if (!mounted) return;
+              const v = res?.validation;
+              if (v?.approved) {
+                let symbol = truncateAddress(preselectMint);
+                let name = "";
+                try {
+                  // Best effort: known tokens carry a real symbol and name.
+                  const d = await fetcher<{
+                    success: boolean;
+                    token?: { symbol?: string; name?: string };
+                  }>(`/api/old-tokens/${preselectMint}`);
+                  if (d?.token?.symbol && d.token.symbol !== "UNKNOWN") {
+                    symbol = d.token.symbol;
+                  }
+                  name = d?.token?.name ?? "";
+                } catch {
+                  // no extra info — the address is shown instead
+                }
+                setOffList(true);
+                setSelected({
+                  mint: preselectMint,
+                  symbol,
+                  name,
+                  liquidityUSD: v.jupiterMetrics?.liquidityUSD ?? 0,
+                  liquiditySOL: v.jupiterMetrics?.liquiditySOL ?? 0,
+                  marketCapUSD: v.jupiterMetrics?.mcapUSD ?? 0,
+                  poolAddress: v.jupiterMetrics?.poolAddress ?? null,
+                  tradableAt: null,
+                });
+              } else {
+                setRejection(v?.reason || "It did not pass the safety check.");
+              }
+            } catch (err: any) {
+              if (mounted) {
+                setRejection(
+                  err?.message || "Couldn't check this token right now."
+                );
+              }
+            } finally {
+              if (mounted) setChecking(false);
+            }
+          }
         }
       } catch (err) {
         console.error("Failed to load buy candidates:", err);
@@ -78,8 +145,7 @@ function BuyPageInner() {
     if (connected) refreshBalance();
   }, [connected, refreshBalance]);
 
-  const insufficientBalance =
-    connected && amountSol + FEE_BUFFER_SOL > balance;
+  const insufficientBalance = connected && amountSol + FEE_BUFFER_SOL > balance;
 
   const handleBuy = async () => {
     if (!connected) {
@@ -93,11 +159,14 @@ function BuyPageInner() {
     }
     // Checked here (not just left to fail on-chain) so the error is a clear
     // "you don't have enough SOL" instead of an opaque wallet/RPC rejection.
-    await refreshBalance();
-    if (amountSol + FEE_BUFFER_SOL > balance) {
+    // Decide on the balance just read, not the one captured when this
+    // handler was created (state doesn't update inside a running closure).
+    const fresh = await refreshBalance();
+    const available = fresh ?? balance;
+    if (amountSol + FEE_BUFFER_SOL > available) {
       toast.error(
         `Insufficient balance: you have ${formatNumber(
-          balance,
+          available,
           4
         )} SOL, need ~${formatNumber(amountSol + FEE_BUFFER_SOL, 4)} SOL (including network fees).`
       );
@@ -142,10 +211,23 @@ function BuyPageInner() {
                 {truncateAddress(selected.mint)}
               </p>
             </div>
-            <Button variant="outline" onClick={() => setSelected(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setSelected(null);
+                setOffList(false);
+              }}
+            >
               Back to list
             </Button>
           </div>
+
+          {offList && (
+            <p className="text-xs text-yellow-400">
+              This token isn&apos;t on the bot&apos;s list — it was
+              safety-checked just now, and is checked again when you buy.
+            </p>
+          )}
 
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="bg-base-300/40 rounded-lg p-3">
@@ -164,7 +246,9 @@ function BuyPageInner() {
 
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
-              <label className="text-sm font-medium">Amount to spend (SOL)</label>
+              <label className="text-sm font-medium">
+                Amount to spend (SOL)
+              </label>
               {connected && (
                 <span className="text-xs text-gray-500">
                   Wallet balance: {formatNumber(balance, 4)} SOL
@@ -203,9 +287,24 @@ function BuyPageInner() {
             )}
           </Button>
           <p className="text-xs text-gray-500">
-            Signed and paid for by your own connected wallet — the tokens
-            land in your wallet, not the bot&apos;s.
+            Signed and paid for by your own connected wallet — the tokens land
+            in your wallet, not the bot&apos;s.
           </p>
+        </Card>
+      ) : checking ? (
+        <div className="flex items-center gap-2 py-10 justify-center text-gray-400">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          Checking this token&apos;s safety...
+        </div>
+      ) : rejection ? (
+        <Card className="p-6 space-y-3 bg-base-200 border border-red-500/30">
+          <h2 className="text-lg font-semibold text-red-400">
+            This token didn&apos;t pass the safety check
+          </h2>
+          <p className="text-sm text-gray-300">{rejection}</p>
+          <Button variant="outline" onClick={() => setRejection(null)}>
+            Back to list
+          </Button>
         </Card>
       ) : loading ? (
         <div className="flex items-center gap-2 py-10 justify-center text-gray-400">

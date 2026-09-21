@@ -21,6 +21,20 @@ interface UserWalletResponse {
   // keeps back for network fees / token-account rent.
   minTradeSol?: number;
   feeReserveSol?: number;
+  // Server-side safety limits that can also stop new buys: today's loss
+  // against the daily limit (percent of the wallet's value), and the optional
+  // global position cap from the server's .env (0 = none).
+  dailyLossPct?: number;
+  maxDailyLossPct?: number;
+  serverMaxOpenPositions?: number;
+  // Trading budget (null = off). capital = budget less losses realized since it
+  // was set; deployed = SOL at work in open positions; protectedProfit = cash
+  // beyond the capital the bot may use (withdrawable without touching it).
+  tradingBudgetSol?: number | null;
+  tradingCapitalSol?: number | null;
+  realizedLossSol?: number;
+  deployedSol?: number;
+  protectedProfitSol?: number;
   error?: string;
 }
 
@@ -32,6 +46,14 @@ interface UserWalletState {
   openPositions: number | null;
   minTradeSol: number | null;
   feeReserveSol: number | null;
+  dailyLossPct: number | null;
+  maxDailyLossPct: number | null;
+  serverMaxOpenPositions: number | null;
+  tradingBudgetSol: number | null;
+  tradingCapitalSol: number | null;
+  realizedLossSol: number | null;
+  deployedSol: number | null;
+  protectedProfitSol: number | null;
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
@@ -84,6 +106,14 @@ export function useUserWallet(): UserWalletState {
     openPositions: ok?.openPositions ?? null,
     minTradeSol: ok?.minTradeSol ?? null,
     feeReserveSol: ok?.feeReserveSol ?? null,
+    dailyLossPct: ok?.dailyLossPct ?? null,
+    maxDailyLossPct: ok?.maxDailyLossPct ?? null,
+    serverMaxOpenPositions: ok?.serverMaxOpenPositions ?? null,
+    tradingBudgetSol: ok?.tradingBudgetSol ?? null,
+    tradingCapitalSol: ok?.tradingCapitalSol ?? null,
+    realizedLossSol: ok?.realizedLossSol ?? null,
+    deployedSol: ok?.deployedSol ?? null,
+    protectedProfitSol: ok?.protectedProfitSol ?? null,
     loading: isLoading,
     error: ok ? null : message,
     refresh,

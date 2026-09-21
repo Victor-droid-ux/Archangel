@@ -4,9 +4,15 @@ import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card } from "@components/ui/card";
 import { Button } from "@components/ui/button";
-import { fetcher, formatNumber, formatPrice, truncateAddress } from "@lib/utils";
+import {
+  fetcher,
+  formatNumber,
+  formatPrice,
+  truncateAddress,
+} from "@lib/utils";
 import { useWallet } from "@hooks/useWallet";
 import { useTrade } from "@hooks/useTrade";
+import { useSellBotPosition } from "@hooks/useSellBotPosition";
 import { ArrowLeft, Loader2, TrendingDown } from "lucide-react";
 import { toast } from "react-hot-toast";
 
@@ -33,6 +39,8 @@ export default function SellPage() {
   const { executeTrade, loading: submitting } = useTrade();
 
   const [positions, setPositions] = useState<SellablePosition[]>([]);
+  // Positions the bot holds for this wallet (in its trading wallet).
+  const [botPositions, setBotPositions] = useState<SellablePosition[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<SellablePosition | null>(null);
   const [balance, setBalance] = useState<TokenBalance | null>(null);
@@ -41,23 +49,27 @@ export default function SellPage() {
   const loadPositions = useCallback(async () => {
     if (!publicKey) {
       setPositions([]);
+      setBotPositions([]);
       setLoading(false);
       return;
     }
     setLoading(true);
     try {
-      const res = await fetcher<{ success: boolean; positions: SellablePosition[] }>(
-        `/api/positions?wallet=${encodeURIComponent(publicKey)}`
-      );
+      const res = await fetcher<{
+        success: boolean;
+        positions: SellablePosition[];
+      }>(`/api/positions?wallet=${encodeURIComponent(publicKey)}`);
       if (res?.success) {
-        // Only positions this wallet can actually sign for itself — a
-        // custodial (bot-bought) position needs the server's key, not
-        // yours; use "Stop Auto Trade" on the dashboard for those instead.
+        const all = res.positions || [];
+        // Positions this wallet can sign for itself are sold from your own
+        // wallet (below); a bot-bought position sits in the bot's trading
+        // wallet, so the server sells it for you (the Sell button).
         setPositions(
-          (res.positions || []).filter(
+          all.filter(
             (p) => p.custody === "self" && p.netSol >= DUST_THRESHOLD_SOL
           )
         );
+        setBotPositions(all.filter((p) => p.custody !== "self"));
       }
     } catch (err) {
       console.error("Failed to load positions:", err);
@@ -70,6 +82,9 @@ export default function SellPage() {
   useEffect(() => {
     loadPositions();
   }, [loadPositions]);
+
+  const { sell: sellBotPosition, selling: sellingBot } =
+    useSellBotPosition(loadPositions);
 
   const selectPosition = async (p: SellablePosition) => {
     setSelected(p);
@@ -129,7 +144,8 @@ export default function SellPage() {
                 {truncateAddress(selected.token)}
               </h2>
               <p className="text-xs text-gray-500">
-                Avg buy price: {selected.avgBuyPrice ? formatPrice(selected.avgBuyPrice) : "—"}{" "}
+                Avg buy price:{" "}
+                {selected.avgBuyPrice ? formatPrice(selected.avgBuyPrice) : "—"}{" "}
                 SOL
               </p>
             </div>
@@ -185,24 +201,79 @@ export default function SellPage() {
           <Loader2 className="h-5 w-5 animate-spin" />
           Loading your positions...
         </div>
-      ) : positions.length === 0 ? (
+      ) : positions.length === 0 && botPositions.length === 0 ? (
         <div className="text-center py-10 text-gray-400">
-          You don&apos;t have any manually-bought positions to sell.
+          You don&apos;t have any open positions to sell.
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {positions.map((p) => (
-            <button
-              key={p.token}
-              onClick={() => selectPosition(p)}
-              className="text-left bg-base-200 border border-base-300 rounded-xl p-4 hover:border-primary transition-colors"
-            >
-              <div className="font-mono text-sm">{truncateAddress(p.token)}</div>
-              <div className="mt-2 text-xs text-gray-400">
-                Cost basis: {formatNumber(p.netSol, 4)} SOL
+        <div className="space-y-8">
+          {positions.length > 0 && (
+            <section className="space-y-3">
+              <h2 className="text-sm font-semibold text-gray-300">
+                Your own positions
+              </h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {positions.map((p) => (
+                  <button
+                    key={p.token}
+                    onClick={() => selectPosition(p)}
+                    className="text-left bg-base-200 border border-base-300 rounded-xl p-4 hover:border-primary transition-colors"
+                  >
+                    <div className="font-mono text-sm">
+                      {truncateAddress(p.token)}
+                    </div>
+                    <div className="mt-2 text-xs text-gray-400">
+                      Cost basis: {formatNumber(p.netSol, 4)} SOL
+                    </div>
+                  </button>
+                ))}
               </div>
-            </button>
-          ))}
+            </section>
+          )}
+
+          {botPositions.length > 0 && (
+            <section className="space-y-3">
+              <h2 className="text-sm font-semibold text-gray-300">
+                Bot-bought positions
+              </h2>
+              <p className="text-xs text-gray-500">
+                The bot holds these in its trading wallet. Selling one sells it
+                in full at the current market price and pays the SOL back into
+                that wallet.
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {botPositions.map((p) => (
+                  <div
+                    key={p.token}
+                    className="bg-base-200 border border-base-300 rounded-xl p-4 space-y-3"
+                  >
+                    <div>
+                      <div className="font-mono text-sm">
+                        {truncateAddress(p.token)}
+                      </div>
+                      <div className="mt-1 text-xs text-gray-400">
+                        Cost basis: {formatNumber(p.netSol, 4)} SOL
+                      </div>
+                    </div>
+                    <Button
+                      variant="danger"
+                      className="w-full"
+                      disabled={sellingBot !== null}
+                      onClick={() =>
+                        sellBotPosition(p.token, truncateAddress(p.token))
+                      }
+                    >
+                      {sellingBot === p.token ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        "Sell entire position"
+                      )}
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
         </div>
       )}
     </div>

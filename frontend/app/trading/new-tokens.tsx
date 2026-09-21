@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useState, useRef } from "react";
+import { useRouter } from "next/navigation";
 import {
   Sparkles,
   ArrowUpRight,
@@ -34,6 +35,7 @@ interface Token {
 }
 
 export const NewTokens = () => {
+  const router = useRouter();
   const [tokens, setTokens] = useState<Token[]>([]);
   const prev = useRef<Record<string, Token>>({});
   const [flash, setFlash] = useState<Record<string, "up" | "down">>({});
@@ -100,7 +102,7 @@ export const NewTokens = () => {
                 <tr
                   key={t.mint}
                   className="border-b border-base-300 hover:bg-base-300/20 cursor-pointer"
-                  onClick={() => (window.location.href = `/trading/${t.mint}`)}
+                  onClick={() => router.push(`/trading/${t.mint}`)}
                   tabIndex={0}
                   role="button"
                   aria-label={`View details for ${t.symbol}`}

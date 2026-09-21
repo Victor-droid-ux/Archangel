@@ -7,6 +7,7 @@ import { usePathname } from "next/navigation";
 import { Menu, X } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { SITE_LINKS } from "@lib/constant";
 
 const Navbar = () => {
   const pathname = usePathname();
@@ -30,7 +31,7 @@ const Navbar = () => {
     { name: "Old Tokens", path: "/trading/old-tokens" },
     { name: "Portfolio", path: "/portfolio" },
     { name: "Settings", path: "/settings" },
-    { name: "Docs", path: "https://archangel.gitbook.io/docs" },
+    { name: "Docs", path: SITE_LINKS.docs },
   ];
 
   // /trading/old-tokens starts with "/trading", so naive prefix-matching

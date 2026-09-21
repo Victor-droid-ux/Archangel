@@ -35,7 +35,10 @@ export interface WalletState {
   balance: number;
   connectWallet: () => Promise<void>;
   disconnectWallet: () => Promise<void>;
-  refreshBalance: () => Promise<void>;
+  // Resolves the freshly read balance (SOL), or null if it couldn't be read —
+  // so a caller that must decide RIGHT NOW (e.g. "can I afford this buy?")
+  // doesn't have to trust the state it captured before the refresh.
+  refreshBalance: () => Promise<number | null>;
 }
 
 const noop = async () => {};
@@ -45,7 +48,7 @@ const WalletDataContext = createContext<WalletState>({
   balance: 0,
   connectWallet: noop,
   disconnectWallet: noop,
-  refreshBalance: noop,
+  refreshBalance: async () => null,
 });
 
 const BALANCE_POLL_MS = 10_000;
@@ -99,22 +102,24 @@ export const WalletDataProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   }, [solanaWallet]);
 
-  const refreshBalance = useCallback(async () => {
+  const refreshBalance = useCallback(async (): Promise<number | null> => {
     const owner = solanaWallet.publicKey;
-    if (!owner || !solanaWallet.connected) return;
+    if (!owner || !solanaWallet.connected) return null;
 
     let lastError: unknown = null;
     for (const connection of connections) {
       try {
         const lamports = await connection.getBalance(owner);
-        setBalance(lamports / 1e9);
-        return;
+        const sol = lamports / 1e9;
+        setBalance(sol);
+        return sol;
       } catch (err) {
         lastError = err; // rate-limited or down: try the next endpoint
       }
     }
     console.error("❌ Failed to refresh balance on all endpoints:", lastError);
     // Keep the last known balance rather than showing 0 for a blip.
+    return null;
   }, [solanaWallet.publicKey, solanaWallet.connected, connections]);
 
   // Balance: refresh on connect, then poll — once for the whole app.
