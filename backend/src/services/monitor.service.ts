@@ -46,8 +46,10 @@ const SELL_BACKOFF_MAX_INTERVAL_MS = 60_000;
 const SELL_NOTIFY_EVERY_N_BACKED_OFF_ATTEMPTS = 12;
 
 /** True if this position is in backoff cooldown and this tick should skip
- * attempting a sell for it entirely (no Jupiter call, no log spam). */
-function isSellInBackoffCooldown(pos: {
+ * attempting a sell for it entirely (no Jupiter call, no log spam). Exported
+ * for scripts/exit-check.ts so a dry run reports the same cooldown the live
+ * monitor is honoring, instead of a hand-rolled approximation. */
+export function isSellInBackoffCooldown(pos: {
   sellFailureCount?: number;
   lastSellAttemptAt?: Date | string | null;
 }): boolean {
@@ -103,19 +105,21 @@ const log = getLogger("monitor");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 // Global default TP/SL (percent *as decimal*; 0.1 = 10%)
-const DEFAULT_TP_PCT = Number(process.env.TP_PCT ?? 0.1);
+// Exported (with the constants below) so scripts/exit-check.ts's dry-run
+// evaluates a position against the EXACT same numbers this file trades on.
+export const DEFAULT_TP_PCT = Number(process.env.TP_PCT ?? 0.1);
 // 30% default — meaningfully wider than the ~2.4-2.7% round-trip price-impact
 // "noise floor" measured on these thin/fresh pools, and in line with typical
 // sniper-bot SL sizing for freshly-launched tokens.
-const DEFAULT_SL_PCT = Number(process.env.SL_PCT ?? 0.3);
+export const DEFAULT_SL_PCT = Number(process.env.SL_PCT ?? 0.3);
 
 // Tiered profit-taking: sell a fixed slice of the remaining position each time
 // PnL crosses one of these thresholds, locking in gains progressively rather
 // than all-or-nothing at a single TP.
-const TIER1_PROFIT_PCT = Number(process.env.TIER1_PROFIT_PCT ?? 0.4);
-const TIER2_PROFIT_PCT = Number(process.env.TIER2_PROFIT_PCT ?? 0.8);
-const TIER3_PROFIT_PCT = Number(process.env.TIER3_PROFIT_PCT ?? 1.5);
-const TIER_SELL_PCT = Number(process.env.TIER_SELL_PCT ?? 30);
+export const TIER1_PROFIT_PCT = Number(process.env.TIER1_PROFIT_PCT ?? 0.4);
+export const TIER2_PROFIT_PCT = Number(process.env.TIER2_PROFIT_PCT ?? 0.8);
+export const TIER3_PROFIT_PCT = Number(process.env.TIER3_PROFIT_PCT ?? 1.5);
+export const TIER_SELL_PCT = Number(process.env.TIER_SELL_PCT ?? 30);
 
 // Use Helius RPC for monitoring token balances and position tracking
 const SOLANA_RPC =
@@ -162,10 +166,10 @@ export function resolveExitCause(
   return null;
 }
 
-const TRAILING_ACTIVATION_PCT = Number(
+export const TRAILING_ACTIVATION_PCT = Number(
   process.env.TRAILING_ACTIVATION_PCT ?? 0.15,
 );
-const TRAILING_STOP_PCT = Number(process.env.TRAILING_STOP_PCT ?? 0.05);
+export const TRAILING_STOP_PCT = Number(process.env.TRAILING_STOP_PCT ?? 0.05);
 
 /* ------------------------------------------------------------------
    MINT DECIMALS CACHE
@@ -173,7 +177,10 @@ const TRAILING_STOP_PCT = Number(process.env.TRAILING_STOP_PCT ?? 0.05);
 
 const mintDecimalsCache = new Map<string, number>();
 
-async function getMintDecimals(mint: string): Promise<number | null> {
+// Exported for scripts/exit-check.ts — the same cache, the same RPC call the
+// live monitor uses, so a dry run never disagrees with production over a
+// stale or wrong decimals value.
+export async function getMintDecimals(mint: string): Promise<number | null> {
   if (mintDecimalsCache.has(mint)) {
     return mintDecimalsCache.get(mint)!;
   }
@@ -661,6 +668,16 @@ export function startPositionMonitor(
                     simulated: false,
                     signature: tieredSwap.signature ?? null,
                     timestamp: new Date(),
+                    // Missing here (unlike the emergency-exit trade record
+                    // above, which already sets this) let a tiered partial
+                    // sell be aggregated as a SEPARATE synthetic position
+                    // (db.service.ts's Position groups by {token, wallet,
+                    // custody}), instead of reducing the real custodial
+                    // position's netSol — corrupting realized P&L and the
+                    // trading budget's "capital at work" figure for every
+                    // tiered sell, even though the on-chain sale itself
+                    // still happened correctly.
+                    custody: "custodial" as const,
                   };
 
                   await dbService.addTrade(tieredTrade);
@@ -906,6 +923,12 @@ export function startPositionMonitor(
               simulated: !useRealSwap,
               signature: swapRes.signature ?? null,
               timestamp: new Date(),
+              // Same fix as the tiered-sell trade record above: without this,
+              // this trade groups as a separate synthetic position instead of
+              // closing out the real custodial one's cost basis, corrupting
+              // realized P&L and the trading budget's capital tracking (the
+              // sale still executes correctly on-chain either way).
+              custody: "custodial" as const,
             };
 
             // Update position metadata to mark as fully exited

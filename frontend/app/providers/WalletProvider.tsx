@@ -1,11 +1,13 @@
 "use client";
 
-import React, { useMemo } from "react";
+import React, { useCallback, useMemo } from "react";
 import {
   ConnectionProvider,
   WalletProvider,
 } from "@solana/wallet-adapter-react";
 import { WalletAdapterNetwork } from "@solana/wallet-adapter-base";
+import type { WalletError } from "@solana/wallet-adapter-base";
+import { toast } from "react-hot-toast";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 import { clusterApiUrl } from "@solana/web3.js";
 
@@ -42,9 +44,34 @@ export function SolanaWalletProvider({
   // every Standard Wallet the browser has injected.
   const wallets = useMemo(() => [], []);
 
+  // WITHOUT this, a failed connection is swallowed: the library only logs it
+  // to the console, and — this is the part that produces "stuck on
+  // Connecting..." — a FAILED autoConnect on page load (the classic cause is
+  // the site's permission having been revoked or the extension reinstalled,
+  // while this browser still remembers a wallet name to reconnect to) can
+  // leave that stale wallet name in place, so the very next click just
+  // retries the same broken autoConnect instead of opening the picker fresh.
+  // This surfaces the error and clears that stale name so the next click
+  // starts clean. It also means unrelated causes (locked extension, multiple
+  // conflicting wallet extensions, an old cached build) now show a toast
+  // instead of a silent hang — narrowing down which one it actually is.
+  const onError = useCallback((error: WalletError) => {
+    console.error("Wallet error:", error);
+    toast.error(
+      error?.message
+        ? `Wallet: ${error.message}`
+        : "Couldn't connect to your wallet — try again, or reload the page."
+    );
+    try {
+      window.localStorage.removeItem("walletName");
+    } catch {
+      // localStorage unavailable — nothing more to do
+    }
+  }, []);
+
   return (
     <ConnectionProvider endpoint={endpoint}>
-      <WalletProvider wallets={wallets} autoConnect>
+      <WalletProvider wallets={wallets} autoConnect onError={onError}>
         <WalletModalProvider>{children}</WalletModalProvider>
       </WalletProvider>
     </ConnectionProvider>

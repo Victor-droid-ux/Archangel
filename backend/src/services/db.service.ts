@@ -669,6 +669,21 @@ export async function releasePositionExit(
 }
 
 /**
+ * Read-only lookup of the current sell-exit claim for one position, for
+ * scripts/exit-check.ts. Never writes anything — just reports whether a sell
+ * is currently claimed, by which process, and when that lease expires (a
+ * claim past its leaseUntil is reclaimable by the next sell attempt; see
+ * claimPositionExit above).
+ */
+export async function getPositionExitClaimState(
+  token: string,
+  wallet: string,
+): Promise<PositionExitClaim | null> {
+  if (!db) await connect();
+  return positionExitClaimsCol!.findOne({ token, wallet });
+}
+
+/**
  * How many trades this wallet has ever taken — counts distinct tokens
  * bought, not raw buy-fill rows: a multi-fill buy (e.g. historical 2-tranche
  * buys from before the pipeline consolidation) can record more than one
@@ -1532,6 +1547,7 @@ export default {
   getOpenPositionCount,
   getDeployedSol,
   getBudgetState,
+  getPositionExitClaimState,
   purgePositionHistory,
   recoverPositionCostBasis,
   updateStats,
