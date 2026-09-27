@@ -27,7 +27,10 @@ import {
 } from "./solana.service.js";
 import { connect } from "./db.service.js";
 import dbService from "./db.service.js";
-import { isOpenPosition } from "../utils/positionState.js";
+import {
+  isBotManagedOpenPosition,
+  isOpenPosition,
+} from "../utils/positionState.js";
 import { getJupiterQuote, executeJupiterSwap } from "./jupiter.service.js";
 import pnlTrackerService from "./pnlTracker.service.js";
 import * as positionExitCoordinator from "./execution/positionExitCoordinator.service.js";
@@ -85,7 +88,7 @@ async function getCol(): Promise<Collection<UserWallet>> {
  * call. Idempotent — safe to call every time a wallet connects.
  */
 export async function getOrCreateUserWallet(
-  ownerWalletRaw: string,
+  ownerWalletRaw: string
 ): Promise<UserWallet> {
   const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
   const c = await getCol();
@@ -105,7 +108,7 @@ export async function getOrCreateUserWallet(
     await c.insertOne(doc);
     log.info(
       { ownerWallet, hotWallet: doc.hotWalletPublicKey },
-      "Generated new custodial hot wallet",
+      "Generated new custodial hot wallet"
     );
     return doc;
   } catch (err: any) {
@@ -121,7 +124,7 @@ export async function getOrCreateUserWallet(
 }
 
 export async function getUserWallet(
-  ownerWalletRaw: string,
+  ownerWalletRaw: string
 ): Promise<UserWallet | null> {
   const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
   const c = await getCol();
@@ -133,7 +136,7 @@ export async function getUserWallet(
  * at execution time (later phase) — never returned from an API response.
  */
 export async function getUserWalletKeypair(
-  ownerWalletRaw: string,
+  ownerWalletRaw: string
 ): Promise<Keypair | null> {
   const wallet = await getUserWallet(ownerWalletRaw);
   if (!wallet) return null;
@@ -142,7 +145,7 @@ export async function getUserWalletKeypair(
 }
 
 export async function getUserWalletBalanceSol(
-  ownerWalletRaw: string,
+  ownerWalletRaw: string
 ): Promise<{ hotWalletPublicKey: string; balanceSol: number } | null> {
   const wallet = await getOrCreateUserWallet(ownerWalletRaw);
   const balanceSol = await getBalanceInSol(wallet.hotWalletPublicKey);
@@ -160,7 +163,7 @@ export async function getUserWalletBalanceSol(
  */
 export async function withdrawToOwner(
   ownerWalletRaw: string,
-  amountSol: number,
+  amountSol: number
 ): Promise<{ signature: string; amountSol: number }> {
   if (!Number.isFinite(amountSol) || amountSol <= 0) {
     throw new Error("Withdrawal amount must be a positive number");
@@ -178,11 +181,10 @@ export async function withdrawToOwner(
   }
 
   const balanceLamports = Math.round(
-    (await getBalanceInSol(wallet.hotWalletPublicKey)) * LAMPORTS_PER_SOL,
+    (await getBalanceInSol(wallet.hotWalletPublicKey)) * LAMPORTS_PER_SOL
   );
   const requestedLamports = Math.round(amountSol * LAMPORTS_PER_SOL);
-  const maxWithdrawableLamports =
-    balanceLamports - WITHDRAWAL_FEE_RESERVE_LAMPORTS;
+  const maxWithdrawableLamports = balanceLamports - WITHDRAWAL_FEE_RESERVE_LAMPORTS;
 
   if (maxWithdrawableLamports <= 0) {
     throw new Error("Balance too low to cover the network fee");
@@ -191,7 +193,7 @@ export async function withdrawToOwner(
     throw new Error(
       `Requested ${amountSol} SOL exceeds withdrawable balance of ${(
         maxWithdrawableLamports / LAMPORTS_PER_SOL
-      ).toFixed(6)} SOL (after reserving the network fee)`,
+      ).toFixed(6)} SOL (after reserving the network fee)`
     );
   }
 
@@ -201,7 +203,7 @@ export async function withdrawToOwner(
       fromPubkey: keypair.publicKey,
       toPubkey: new PublicKey(ownerWallet),
       lamports: requestedLamports,
-    }),
+    })
   );
 
   const latest = await conn.getLatestBlockhash("confirmed");
@@ -218,12 +220,12 @@ export async function withdrawToOwner(
       blockhash: latest.blockhash,
       lastValidBlockHeight: latest.lastValidBlockHeight,
     },
-    "confirmed",
+    "confirmed"
   );
 
   log.info(
     { ownerWallet, hotWallet: wallet.hotWalletPublicKey, amountSol, signature },
-    "Withdrawal completed",
+    "Withdrawal completed"
   );
 
   // Recorded directly here (not detected from chain, unlike deposits) —
@@ -262,12 +264,7 @@ export interface StopAutoTradeResult {
 }
 
 export type SellPositionOutcome =
-  | {
-      status: "sold";
-      token: string;
-      signature: string | null;
-      amountSol: number;
-    }
+  | { status: "sold"; token: string; signature: string | null; amountSol: number }
   | { status: "already_closed"; token: string }
   | { status: "failed"; token: string; error: string };
 
@@ -286,13 +283,13 @@ async function sellOneCustodialPosition(
   pos: { token: string; avgBuyPrice?: number | undefined },
   keypair: Keypair,
   io: Server | undefined,
-  reason: "stop_auto_trade" | "manual_sell",
+  reason: "stop_auto_trade" | "manual_sell"
 ): Promise<SellPositionOutcome> {
   const token = pos.token;
 
   const claimed = await positionExitCoordinator.claimPositionExit(
     token,
-    ownerWallet,
+    ownerWallet
   );
   if (!claimed) {
     return {
@@ -308,7 +305,7 @@ async function sellOneCustodialPosition(
     // avoids leaving unsellable dust behind from any drift between the two.
     const { raw, uiAmount } = await getTokenBalance(
       keypair.publicKey.toBase58(),
-      token,
+      token
     );
     if (!raw || raw === "0") {
       // Nothing held: the record is stale, not a failed sale. Close it so it
@@ -341,8 +338,7 @@ async function sellOneCustodialPosition(
     const amountSol = Number(quote.outAmount) / 1e9;
     // What this sale actually realized, so stats and the trade feed reflect
     // it (this used to record the entry price and a 0% result).
-    const exitPrice =
-      uiAmount > 0 ? amountSol / uiAmount : (pos.avgBuyPrice ?? 0);
+    const exitPrice = uiAmount > 0 ? amountSol / uiAmount : (pos.avgBuyPrice ?? 0);
     const pnl =
       pos.avgBuyPrice && pos.avgBuyPrice > 0 && exitPrice > 0
         ? exitPrice / pos.avgBuyPrice - 1
@@ -406,13 +402,20 @@ async function sellOneCustodialPosition(
 export async function sellCustodialPosition(
   ownerWalletRaw: string,
   token: string,
-  io?: Server,
+  io?: Server
 ): Promise<SellPositionOutcome> {
   const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
 
   const positions = await dbService.getPositions(ownerWallet);
+  // custody !== "self" — the SAME test isBotManagedOpenPosition uses, and
+  // that the monitor's own auto-sell loop and the Positions panel's decision
+  // to show a Sell button both use. This used to require custody === exactly
+  // "custodial", which excluded legacy positions bought before that field
+  // existed (custody is null/undefined for those, per db.service.ts's
+  // Position type) — every other part of the app already treated them as the
+  // bot's, so the Sell button appeared for them but calling it always failed.
   const pos = positions.find(
-    (p) => p.token === token && p.custody === "custodial" && isOpenPosition(p),
+    (p) => p.token === token && isBotManagedOpenPosition(p)
   );
   if (!pos) {
     return {
@@ -440,7 +443,7 @@ export async function sellCustodialPosition(
  */
 export async function stopAutoTradeAndLiquidate(
   ownerWalletRaw: string,
-  io?: Server,
+  io?: Server
 ): Promise<StopAutoTradeResult> {
   const ownerWallet = normalizeWalletAddress(ownerWalletRaw);
 
@@ -453,20 +456,22 @@ export async function stopAutoTradeAndLiquidate(
   };
 
   const positions = await dbService.getPositions(ownerWallet);
-  // isOpenPosition, not a bare netSol check: a position sold at a loss keeps a
-  // positive netSol forever and used to be "liquidated" again here.
-  const custodialOpen = positions.filter(
-    (p) => p.custody === "custodial" && isOpenPosition(p),
-  );
+  // Same fix as sellCustodialPosition above: custody !== "self", not
+  // === "custodial", so legacy positions bought before custody was tracked
+  // are still liquidated here instead of being silently left running with
+  // auto-trade turned off.
+  //
+  // Wrapped in an arrow rather than passed directly — see the identical note
+  // in monitor.service.ts's tick(): Array.filter's (element, index, array)
+  // callback shape would otherwise feed the array INDEX into this function's
+  // `dust` parameter, corrupting the check for every position past the first.
+  const custodialOpen = positions.filter((p) => isBotManagedOpenPosition(p));
   if (custodialOpen.length === 0) return result;
 
   const keypair = await getUserWalletKeypair(ownerWallet);
   if (!keypair) {
     for (const p of custodialOpen) {
-      result.failed.push({
-        token: p.token,
-        error: "No custodial signer available",
-      });
+      result.failed.push({ token: p.token, error: "No custodial signer available" });
     }
     return result;
   }
@@ -477,7 +482,7 @@ export async function stopAutoTradeAndLiquidate(
       pos,
       keypair,
       io,
-      "stop_auto_trade",
+      "stop_auto_trade"
     );
     if (outcome.status === "sold") {
       result.sold.push({

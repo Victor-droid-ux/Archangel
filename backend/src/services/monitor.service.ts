@@ -230,9 +230,18 @@ export function startPositionMonitor(
       // Only positions that are still open and bot-managed. A position sold
       // at a loss used to stay in this list forever (its netSol stays
       // positive), getting re-examined — and logged — every tick.
+      //
+      // MUST be a wrapping arrow, not `.filter(isBotManagedOpenPosition)`:
+      // Array.filter calls its callback with (element, index, array), and
+      // isBotManagedOpenPosition's second parameter is a dust THRESHOLD in
+      // SOL — passing the function directly fed it the array index (0, 1,
+      // 2, ...) as that threshold. Every position past the first then needed
+      // netSol >= 1 SOL (index 1), >= 2 SOL (index 2), and so on just to
+      // still be monitored, so any wallet with more than one open position
+      // had all but the first silently dropped from auto-sell checks.
       const positions: MonitorPosition[] = (
         await dbService.getPositions()
-      ).filter(isBotManagedOpenPosition);
+      ).filter((p) => isBotManagedOpenPosition(p));
 
       for (const pos of positions) {
         try {

@@ -37,10 +37,18 @@ export function isOpenPosition(
  * user's own: the bot neither monitors nor sells them, and they don't use one
  * of its position slots.
  */
+// Takes ONE argument on purpose: Array.filter calls its callback with
+// (element, index, array), and this used to take a second `dust` parameter —
+// which meant `.filter(isBotManagedOpenPosition)` silently fed the array
+// INDEX in as a multi-SOL dust threshold, dropping every position past the
+// first from being counted as open. Pass a custom threshold as
+// isBotManagedOpenPosition(p, { dust }) if a caller genuinely needs one
+// (none currently do); this shape can never be miscalled via .filter/.map.
 export function isBotManagedOpenPosition(
   p: PositionLike,
-  dust: number = POSITION_DUST_THRESHOLD_SOL,
+  opts: { dust?: number } = {},
 ): boolean {
+  const dust = opts.dust ?? POSITION_DUST_THRESHOLD_SOL;
   return p.custody !== "self" && isOpenPosition(p, dust);
 }
 
@@ -80,7 +88,7 @@ export function deployedSolOf(
   dust: number = POSITION_DUST_THRESHOLD_SOL,
 ): number {
   return positions
-    .filter((p) => isBotManagedOpenPosition(p, dust))
+    .filter((p) => isBotManagedOpenPosition(p, { dust }))
     .reduce((sum, p) => {
       const bought = p.boughtSol ?? Math.max(p.netSol, 0);
       const held =
