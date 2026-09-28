@@ -181,6 +181,30 @@ export function hasErrors(errors: GlobalSettingsErrors): boolean {
   return Object.values(errors).some(Boolean);
 }
 
+// Below this a stop loss sits inside the normal price noise of a new token:
+// just buying and then selling through a thin pool costs a few percent in
+// price impact and fees, before the price has moved at all.
+export const TIGHT_STOP_LOSS_PCT = 2;
+
+/**
+ * Non-blocking warning for a stop loss so tight it will fire on noise, and
+ * whose actual exit will land well beyond it. (A typo like 0.5 for 50 is the
+ * usual reason someone ends up here — the field is in percent.)
+ */
+export function stopLossWarning(f: GlobalSettingsForm): string | null {
+  const v = f.stopLossPct;
+  if (!Number.isFinite(v) || v <= 0 || v >= TIGHT_STOP_LOSS_PCT) return null;
+  return `A ${v}% stop loss is inside the normal price noise of new tokens — it can trigger almost immediately, and the actual sale will usually land well below -${v}%. The field is in percent (30 means -30%).`;
+}
+
+/**
+ * How the exit levels really behave — shown next to them so a sale that
+ * doesn't land exactly on the level isn't a surprise. Take profit and stop
+ * loss are market orders triggered by a price check, not limit orders.
+ */
+export const EXIT_FILL_NOTE =
+  "Checked about every 5 seconds and sold at market: the actual fill can differ from these levels (price movement between checks, slippage, thin liquidity).";
+
 /** A non-blocking warning: valid, but very likely not what the user wants. */
 export function launchAgeWarning(f: GlobalSettingsForm): string | null {
   if (f.minSecondsSinceLaunch === "") return null;

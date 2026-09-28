@@ -117,6 +117,10 @@ export const useTrade = () => {
           amountLamports,
           wallet: publicKey,
         }),
+        // The backend broadcasts your signed transaction and waits for the
+        // chain to confirm it — routinely longer than the 30s default when
+        // Solana is busy, which reported a still-landing trade as failed.
+        timeoutMs: 90_000,
       });
 
       if (!confirmRes?.success) {

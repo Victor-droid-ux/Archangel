@@ -49,7 +49,15 @@ export function useSellBotPosition(onDone?: () => void) {
         const auth = await signWalletAuth(signMessage, publicKey);
         const res = await fetcher<SellResponse>(
           `/api/user-wallet/${publicKey}/sell-position`,
-          { method: "POST", body: JSON.stringify({ token, ...auth }) }
+          {
+            method: "POST",
+            body: JSON.stringify({ token, ...auth }),
+            // A sale is a real on-chain swap: quote, send, then wait for
+            // confirmation. Solana confirmation alone can pass the 30s default
+            // under congestion, which made a sale that was still going through
+            // look like "Request timed out".
+            timeoutMs: 90_000,
+          }
         );
         if (!res?.success)
           throw new Error(res?.error || "Couldn't sell this position");
@@ -70,7 +78,16 @@ export function useSellBotPosition(onDone?: () => void) {
         onDone?.();
         return true;
       } catch (err: any) {
-        toast.error(err?.message || "Couldn't sell this position");
+        // A timeout doesn't mean the sale failed — the server may still be
+        // finishing it. Say so, and refresh, instead of leaving the row as-is.
+        const timedOut = /timed out/i.test(err?.message ?? "");
+        toast.error(
+          timedOut
+            ? "This is taking longer than usual. The sale may still complete — check your positions in a minute before trying again."
+            : err?.message || "Couldn't sell this position",
+          { duration: timedOut ? 8000 : 4000 }
+        );
+        if (timedOut) onDone?.();
         return false;
       } finally {
         setSelling(null);

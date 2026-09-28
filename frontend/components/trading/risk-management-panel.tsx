@@ -15,6 +15,8 @@ import {
   formFromSettings,
   hasErrors,
   launchAgeWarning,
+  stopLossWarning,
+  EXIT_FILL_NOTE,
   toSettingsPayload,
   validateGlobalSettings,
   type GlobalSettingsForm,
@@ -80,6 +82,7 @@ export const RiskManagementPanel: React.FC = () => {
 
   const errors = validateGlobalSettings(formData);
   const launchWarning = launchAgeWarning(formData);
+  const slWarning = stopLossWarning(formData);
   const loaded = config != null;
 
   // The budget as currently typed (null when off or not a usable number).
@@ -259,12 +262,19 @@ export const RiskManagementPanel: React.FC = () => {
                 max="100"
                 step="0.5"
               />
-              {errors.stopLossPct && (
+              {errors.stopLossPct ? (
                 <p className="text-xs text-red-500 mt-0.5">
                   {errors.stopLossPct}
                 </p>
+              ) : (
+                slWarning && (
+                  <p className="text-xs text-yellow-400 mt-0.5">{slWarning}</p>
+                )
               )}
             </div>
+            <p className="col-span-2 text-[11px] leading-snug text-gray-500">
+              {EXIT_FILL_NOTE}
+            </p>
           </div>
         </div>
 

@@ -87,9 +87,10 @@ export default function ActionsBar() {
     if (!confirmed) return;
 
     setStopping(true);
-    toast.loading("Stopping auto-trade and selling bot-bought positions...", {
-      id: "stop-auto-trade",
-    });
+    toast.loading(
+      "Stopping auto-trade and selling bot-bought positions... this can take a few minutes if you hold several.",
+      { id: "stop-auto-trade" }
+    );
     try {
       const auth = await signWalletAuth(signMessage, publicKey);
       const res = await fetcher<{
@@ -103,6 +104,11 @@ export default function ActionsBar() {
       }>(`/api/user-wallet/${publicKey}/stop-auto-trade`, {
         method: "POST",
         body: JSON.stringify(auth),
+        // Sells the positions ONE AFTER ANOTHER within a single request, each
+        // a real on-chain swap plus confirmation — so the total grows with
+        // how many you hold. The 30s default cut this off mid-way for any
+        // wallet with more than a position or two.
+        timeoutMs: 300_000,
       });
 
       if (!res?.success) {

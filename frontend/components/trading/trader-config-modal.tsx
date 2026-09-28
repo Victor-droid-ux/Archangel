@@ -13,6 +13,8 @@ import {
   formFromSettings,
   hasErrors,
   launchAgeWarning,
+  stopLossWarning,
+  EXIT_FILL_NOTE,
   toSettingsPayload,
   validateGlobalSettings,
   type GlobalSettingsForm,
@@ -88,6 +90,7 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
 
   const errors = validateGlobalSettings(formData);
   const launchWarning = launchAgeWarning(formData);
+  const slWarning = stopLossWarning(formData);
 
   // The budget as currently typed (null when off or not a usable number).
   const budgetForPreview =
@@ -293,8 +296,12 @@ export function TraderConfigModal({ isOpen, onClose }: TraderConfigModalProps) {
                       Exit at -{formData.stopLossPct}% loss
                     </p>
                   )}
+                  {slWarning && !errors.stopLossPct && (
+                    <p className="text-xs text-yellow-400 mt-1">{slWarning}</p>
+                  )}
                 </div>
               </div>
+              <p className="text-xs text-gray-500">{EXIT_FILL_NOTE}</p>
             </div>
 
             {/* Other Settings */}

@@ -3,34 +3,50 @@
  *  🧠 Unified Fetcher Utility
  * ==========================================================
  */
+// A read (settings, balances, position lists) is either fast or genuinely
+// broken; 30s is plenty and failing fast is the right default. An endpoint
+// that submits or confirms an on-chain transaction is a different animal —
+// Solana confirmation alone can take well past 30s under congestion, before
+// the backend has even started building the transaction — so those callers
+// pass a longer `timeoutMs` explicitly (see useSellBotPosition.ts,
+// actions-bar.tsx, useTrade.ts). Aborting here only stops the BROWSER from
+// waiting; the backend keeps working and the trade can still complete or
+// fail on its own — a timeout is not a cancellation.
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 export const fetcher = async <T = any>(
   url: string,
-  options: RequestInit = {}
+  options: RequestInit & { timeoutMs?: number } = {}
 ): Promise<T> => {
   const BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
 
   const finalUrl = url.startsWith("http") ? url : `${BASE}${url}`;
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...fetchOptions } = options;
 
-  // Timeout protection (30 seconds for slow API responses)
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30_000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   let res: Response;
 
   try {
     res = await fetch(finalUrl, {
-      ...options,
+      ...fetchOptions,
       signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
-        ...(options.headers || {}),
+        ...(fetchOptions.headers || {}),
       },
     });
   } catch (err: any) {
     clearTimeout(timeout);
 
     if (err?.name === "AbortError") {
-      throw new Error(`⏳ Request timed out: ${finalUrl}`);
+      // The browser gave up waiting — the backend may well still finish (or
+      // already have). Made explicit here so callers that hit this on a
+      // trade-execution endpoint know not to assume it failed outright.
+      throw new Error(
+        `⏳ Request timed out after ${Math.round(timeoutMs / 1000)}s: ${finalUrl} — the backend may still be processing this; check before retrying.`
+      );
     }
 
     throw new Error(`🌐 Network error: ${err?.message || "Unknown error"}`);
@@ -42,14 +58,7 @@ export const fetcher = async <T = any>(
   try {
     json = await res.json();
   } catch {
-    // Not JSON: usually an HTML error page — most often a 404 from a backend
-    // that predates this dashboard (the route doesn't exist there yet), or a
-    // proxy/gateway error page while the backend is down or restarting.
-    throw new Error(
-      `❌ Invalid JSON response from ${finalUrl} (HTTP ${res.status}${
-        res.statusText ? ` ${res.statusText}` : ""
-      }) — the backend may be out of date, restarting or unreachable`
-    );
+    throw new Error(`❌ Invalid JSON response from ${finalUrl}`);
   }
 
   if (!res.ok || json?.success === false) {
@@ -68,10 +77,15 @@ export const fetcher = async <T = any>(
 /**
  * 📌 POST helper
  */
-export const post = async <T = any>(url: string, body: any): Promise<T> =>
+export const post = async <T = any>(
+  url: string,
+  body: any,
+  opts: { timeoutMs?: number } = {}
+): Promise<T> =>
   fetcher<T>(url, {
     method: "POST",
     body: JSON.stringify(body),
+    ...opts,
   });
 
 /**
